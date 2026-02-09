@@ -1,0 +1,14 @@
+# Core
+hyperliquid-python-sdk
+pydantic
+pyyaml
+python-dotenv
+aiosqlite
+structlog
+
+# File watching
+watchdog
+
+# Testing
+pytest
+pytest-asyncio

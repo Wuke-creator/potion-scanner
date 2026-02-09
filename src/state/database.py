@@ -1,0 +1,1 @@
+"""SQLite trade state persistence."""
