@@ -15,6 +15,17 @@ class UpdateParseError(Exception):
 # ---------------------------------------------------------------------------
 
 @dataclass
+class TpHit:
+    """A single take-profit target hit (e.g. TP1, TP2)."""
+
+    pair: str
+    trade_id: int
+    tp_number: int       # which TP was hit (1, 2, or 3)
+    profit_pct: float
+    period: str          # e.g. "23 Minutes"
+
+
+@dataclass
 class AllTpHit:
     """All take-profit targets reached."""
 
@@ -99,6 +110,31 @@ def _extract_trade_id(text: str) -> int | None:
 # ---------------------------------------------------------------------------
 # Per-type parsers
 # ---------------------------------------------------------------------------
+
+def parse_tp_hit(raw: str) -> TpHit:
+    text = _clean(raw)
+
+    pair = _extract_pair(text)
+    trade_id = _extract_trade_id(text)
+    if not pair or trade_id is None:
+        raise UpdateParseError("TP_HIT: could not extract pair/trade_id")
+
+    m = re.search(r"TP TARGET (\d) HIT", text, re.IGNORECASE)
+    if not m:
+        raise UpdateParseError("TP_HIT: could not extract TP number")
+    tp_number = int(m.group(1))
+
+    m = re.search(r"PROFIT[:\s]+([\d.]+)%", text, re.IGNORECASE)
+    if not m:
+        raise UpdateParseError("TP_HIT: could not extract profit %")
+    profit_pct = float(m.group(1))
+
+    m = re.search(r"PERIOD[:\s]+(.+)", text, re.IGNORECASE)
+    period = m.group(1).strip() if m else ""
+
+    return TpHit(pair=pair, trade_id=trade_id, tp_number=tp_number,
+                 profit_pct=profit_pct, period=period)
+
 
 def parse_all_tp_hit(raw: str) -> AllTpHit:
     text = _clean(raw)

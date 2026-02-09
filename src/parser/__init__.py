@@ -7,6 +7,7 @@ from .update_parser import (
     ManualUpdate,
     Preparation,
     StopHit,
+    TpHit,
     TradeClosed,
     UpdateParseError,
     parse_all_tp_hit,
@@ -15,6 +16,7 @@ from .update_parser import (
     parse_manual_update,
     parse_preparation,
     parse_stop_hit,
+    parse_tp_hit,
     parse_trade_closed,
 )
 
@@ -28,6 +30,7 @@ __all__ = [
     "Preparation",
     "SignalParseError",
     "StopHit",
+    "TpHit",
     "TradeClosed",
     "UpdateParseError",
     "classify",
@@ -38,5 +41,6 @@ __all__ = [
     "parse_preparation",
     "parse_signal",
     "parse_stop_hit",
+    "parse_tp_hit",
     "parse_trade_closed",
 ]

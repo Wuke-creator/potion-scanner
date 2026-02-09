@@ -1,0 +1,7 @@
+Trade #1255 Incoming...
+
+PAIR: ETH/USDT
+SIDE: SHORT
+LEVERAGE 27x
+
+(Prepare, dont place it yet)

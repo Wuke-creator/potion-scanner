@@ -8,6 +8,7 @@ class MessageType(Enum):
     """All known Potion Perps message types."""
 
     SIGNAL_ALERT = "signal_alert"
+    TP_HIT = "tp_hit"
     ALL_TP_HIT = "all_tp_hit"
     BREAKEVEN = "breakeven"
     STOP_HIT = "stop_hit"
@@ -54,6 +55,9 @@ def classify(raw_message: str) -> MessageType:
     # --- Lifecycle events (specific keywords) ---
     if "ALL TAKE-PROFIT TARGETS HIT" in text:
         return MessageType.ALL_TP_HIT
+
+    if re.search(r"TP TARGET \d HIT", text):
+        return MessageType.TP_HIT
 
     if "BREAK EVEN HIT" in text:
         return MessageType.BREAKEVEN
