@@ -1,0 +1,8 @@
+Trade #1286 Incoming...
+
+PAIR: ZK/USDT
+SIDE: SHORT
+ENTRY: `0.02153`
+LEVERAGE 14x
+
+(Prepare, dont place it yet)

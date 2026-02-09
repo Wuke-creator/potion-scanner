@@ -1,0 +1,3 @@
+PAIR: RENDER/USDT #1265 CANCELED
+
+Trade got posted with significant delay in this fast moving market. Price was already above the TP2 at the time of sharing

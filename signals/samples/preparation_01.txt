@@ -1,6 +1,8 @@
 Trade #1284 Incoming...
+
 PAIR: BCH/USDT
 SIDE: SHORT
-ENTRY: 515
+ENTRY: `515`
 LEVERAGE 27x
+
 (Prepare, dont place it yet)
