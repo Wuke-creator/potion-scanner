@@ -68,7 +68,7 @@ def classify(raw_message: str) -> MessageType:
     if "TRADE CLOSED OUT" in text:
         return MessageType.TRADE_CLOSED
 
-    if re.search(r"CANCEL[LED]", text):
+    if re.search(r"\bCANCEL", text):
         return MessageType.CANCELED
 
     # --- Preparation (has "Incoming..." and "Prepare") ---

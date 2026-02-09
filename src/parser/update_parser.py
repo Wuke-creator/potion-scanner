@@ -193,10 +193,19 @@ def parse_canceled(raw: str) -> Canceled:
         raise UpdateParseError("CANCELED: could not extract trade_id")
 
     pair = _extract_pair(text)
+    # Fallback: "CANCEL DOT/USDT #1249 ..." format (no PAIR: prefix)
+    if not pair:
+        m = re.search(r"CANCEL\w*\s+(\S+/\S+)", text, re.IGNORECASE)
+        if m:
+            pair = m.group(1).upper()
 
-    # Everything after the first line is the reason
-    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
-    reason = " ".join(lines[1:]) if len(lines) > 1 else ""
+    # Reason: parenthesized text, or everything after the first line
+    m = re.search(r"\(([^)]+)\)", text)
+    if m:
+        reason = m.group(1).strip()
+    else:
+        lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+        reason = " ".join(lines[1:]) if len(lines) > 1 else ""
 
     return Canceled(trade_id=trade_id, pair=pair, reason=reason)
 
