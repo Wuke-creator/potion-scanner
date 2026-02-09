@@ -25,31 +25,41 @@ class HyperliquidClient:
 
     def __init__(
         self,
-        wallet_address: str,
+        account_address: str,
         private_key: str,
         network: str = "testnet",
     ):
         """
         Args:
-            wallet_address: 0x-prefixed wallet address.
-            private_key: 0x-prefixed private key for signing.
+            account_address: 0x-prefixed master account address (used for queries).
+            private_key: 0x-prefixed API wallet private key (used for signing).
             network: 'testnet' or 'mainnet'.
+
+        Note:
+            Hyperliquid separates signing (API wallet) from account ownership
+            (master address). Queries must use the master account address.
+            The API wallet only signs transactions on its behalf.
         """
         if network not in NETWORK_URLS:
             raise ValueError(f"Unknown network '{network}'. Use 'testnet' or 'mainnet'.")
 
-        self._wallet_address = wallet_address
+        self._account_address = account_address
         self._network = network
         self._base_url = NETWORK_URLS[network]
 
         self._wallet = eth_account.Account.from_key(private_key)
         self._info = Info(base_url=self._base_url, skip_ws=True)
-        self._exchange = Exchange(wallet=self._wallet, base_url=self._base_url)
+        self._exchange = Exchange(
+            wallet=self._wallet,
+            base_url=self._base_url,
+            account_address=account_address,
+        )
 
         logger.info(
-            "HyperliquidClient initialized: network=%s wallet=%s",
+            "HyperliquidClient initialized: network=%s account=%s api_wallet=%s",
             network,
-            wallet_address,
+            account_address,
+            self._wallet.address,
         )
 
     @property
@@ -57,8 +67,14 @@ class HyperliquidClient:
         return self._network
 
     @property
-    def wallet_address(self) -> str:
-        return self._wallet_address
+    def account_address(self) -> str:
+        """Master account address (used for queries)."""
+        return self._account_address
+
+    @property
+    def api_wallet_address(self) -> str:
+        """API wallet address (used for signing)."""
+        return self._wallet.address
 
     @property
     def info(self) -> Info:
@@ -76,7 +92,7 @@ class HyperliquidClient:
 
     def get_account_state(self) -> dict[str, Any]:
         """Return full account state (positions, margin summary, withdrawable)."""
-        return self._info.user_state(self._wallet_address)
+        return self._info.user_state(self._account_address)
 
     def get_balance(self) -> dict[str, str]:
         """Return account value, margin used, and withdrawable balance."""
@@ -109,7 +125,7 @@ class HyperliquidClient:
 
     def get_open_orders(self) -> list[dict[str, Any]]:
         """Return all open orders."""
-        return self._info.open_orders(self._wallet_address)
+        return self._info.open_orders(self._account_address)
 
     def get_all_mids(self) -> dict[str, str]:
         """Return current mid prices for all traded assets."""
