@@ -94,15 +94,44 @@ class HyperliquidClient:
         """Return full account state (positions, margin summary, withdrawable)."""
         return self._info.user_state(self._account_address)
 
+    def get_spot_balances(self) -> list[dict[str, str]]:
+        """Return non-zero spot token balances (includes USDC under portfolio margin)."""
+        state = self._info.spot_user_state(self._account_address)
+        balances = []
+        for b in state.get("balances", []):
+            total = float(b.get("total", 0))
+            if total != 0:
+                balances.append({
+                    "coin": b.get("coin"),
+                    "total": b.get("total"),
+                    "hold": b.get("hold"),
+                })
+        return balances
+
     def get_balance(self) -> dict[str, str]:
-        """Return account value, margin used, and withdrawable balance."""
-        state = self.get_account_state()
-        summary = state.get("crossMarginSummary", {})
+        """Return unified account summary.
+
+        Under portfolio margin, USDC lives in the spot clearinghouse
+        but is available for perps trading. This method returns both the
+        perps margin summary and the spot USDC balance for a complete picture.
+        """
+        perp_state = self.get_account_state()
+        summary = perp_state.get("marginSummary", {})
+
+        # Spot USDC balance (where funds actually sit under portfolio margin)
+        spot_balances = self.get_spot_balances()
+        usdc_balance = "0"
+        for b in spot_balances:
+            if b["coin"] == "USDC":
+                usdc_balance = b["total"]
+                break
+
         return {
+            "usdc_balance": usdc_balance,
             "account_value": summary.get("accountValue", "0"),
             "total_margin_used": summary.get("totalMarginUsed", "0"),
             "total_position_value": summary.get("totalNtlPos", "0"),
-            "withdrawable": state.get("withdrawable", "0"),
+            "withdrawable": perp_state.get("withdrawable", "0"),
         }
 
     def get_open_positions(self) -> list[dict[str, Any]]:
