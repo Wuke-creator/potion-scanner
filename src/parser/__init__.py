@@ -1,10 +1,42 @@
 from .classifier import MessageType, classify
 from .signal_parser import ParsedSignal, SignalParseError, parse_signal
+from .update_parser import (
+    AllTpHit,
+    Breakeven,
+    Canceled,
+    ManualUpdate,
+    Preparation,
+    StopHit,
+    TradeClosed,
+    UpdateParseError,
+    parse_all_tp_hit,
+    parse_breakeven,
+    parse_canceled,
+    parse_manual_update,
+    parse_preparation,
+    parse_stop_hit,
+    parse_trade_closed,
+)
 
 __all__ = [
+    "AllTpHit",
+    "Breakeven",
+    "Canceled",
+    "ManualUpdate",
     "MessageType",
     "ParsedSignal",
+    "Preparation",
     "SignalParseError",
+    "StopHit",
+    "TradeClosed",
+    "UpdateParseError",
     "classify",
+    "parse_all_tp_hit",
+    "parse_breakeven",
+    "parse_canceled",
+    "parse_manual_update",
+    "parse_preparation",
     "parse_signal",
+    "parse_stop_hit",
+    "parse_trade_closed",
 ]
