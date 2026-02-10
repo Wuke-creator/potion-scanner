@@ -6,15 +6,52 @@ Converts a ParsedSignal into Hyperliquid SDK order parameters:
   - Take-profit orders (trigger, reduce-only, split across TP1/TP2/TP3)
 
 The SDK handles nonce, signing, and wire format conversion internally.
+
+Hyperliquid constraints discovered during testnet testing:
+  - Minimum order value is $10
+  - Sizes must be rounded (floor) to avoid float_to_wire precision errors
+  - SL/TP trigger orders must be submitted individually after entry fills
+    (positionTpsl grouping only accepts 1 SL + 1 TP, not multiple TPs)
 """
 
 import logging
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
+from typing import Any
 
 from src.parser.signal_parser import ParsedSignal, Side
 from src.utils.symbol_mapper import potion_to_hyperliquid
 
 logger = logging.getLogger(__name__)
+
+# Hyperliquid minimum order value in USD
+MIN_ORDER_VALUE_USD = 10.0
+
+# Default size decimal precision per price tier
+# Lower-priced coins need more decimals, higher-priced need fewer
+_SZ_DECIMALS_BY_PRICE = [
+    (0.001, 0),       # sub-penny coins: whole units
+    (0.1, 0),         # penny coins: whole units
+    (1.0, 1),         # dollar coins: 1 decimal
+    (10.0, 2),        # ~$10 coins: 2 decimals
+    (100.0, 3),       # ~$100 coins: 3 decimals
+    (1000.0, 4),      # ~$1000 coins: 4 decimals
+    (float("inf"), 5), # expensive coins: 5 decimals
+]
+
+
+def _sz_decimals(price: float) -> int:
+    """Determine appropriate size decimal precision based on coin price."""
+    for threshold, decimals in _SZ_DECIMALS_BY_PRICE:
+        if price < threshold:
+            return decimals
+    return 5
+
+
+def _floor_to(value: float, decimals: int) -> float:
+    """Floor a float to N decimal places (avoids rounding up)."""
+    factor = 10 ** decimals
+    return math.floor(value * factor) / factor
 
 
 @dataclass
@@ -33,8 +70,8 @@ class OrderParams:
 class TradeOrderSet:
     """Complete set of orders for one trade signal.
 
-    Includes the entry order, stop-loss, and take-profit orders.
-    These are submitted together via bulk_orders with grouping='normalTpsl'.
+    Entry is submitted first. Once filled, SL and TP orders are
+    submitted individually as standalone trigger orders.
     """
 
     coin: str
@@ -64,6 +101,9 @@ def build_orders(
 
     Returns:
         TradeOrderSet with entry, SL, and TP orders ready for submission.
+
+    Raises:
+        ValueError: If position_size_usd is below the $10 minimum or tp_split is invalid.
     """
     if tp_split is None:
         tp_split = [0.33, 0.33, 0.34]
@@ -71,14 +111,26 @@ def build_orders(
     if len(tp_split) != 3 or abs(sum(tp_split) - 1.0) > 0.01:
         raise ValueError(f"tp_split must have 3 values summing to 1.0, got {tp_split}")
 
+    if position_size_usd < MIN_ORDER_VALUE_USD:
+        raise ValueError(
+            f"Position size ${position_size_usd:.2f} is below Hyperliquid "
+            f"minimum of ${MIN_ORDER_VALUE_USD:.2f}"
+        )
+
     # --- Resolve coin name and direction ---
     coin = potion_to_hyperliquid(signal.pair)
     is_long = signal.side == Side.LONG
     leverage = min(signal.leverage, max_leverage) if max_leverage else signal.leverage
 
-    # --- Calculate position size in coin units ---
-    # size = USD allocation / entry price
-    sz = position_size_usd / signal.entry
+    # --- Calculate and round position size ---
+    decimals = _sz_decimals(signal.entry)
+    sz = _floor_to(position_size_usd / signal.entry, decimals)
+
+    if sz <= 0:
+        raise ValueError(
+            f"Position size rounds to 0 at {decimals} decimals "
+            f"(${position_size_usd} / ${signal.entry})"
+        )
 
     # --- Entry order (limit GTC) ---
     entry = OrderParams(
@@ -93,9 +145,9 @@ def build_orders(
     # --- Stop-loss order (trigger, market, reduce-only) ---
     stop_loss = OrderParams(
         coin=coin,
-        is_buy=not is_long,  # opposite side to close
+        is_buy=not is_long,
         sz=sz,
-        limit_px=signal.stop_loss,  # SDK uses limit_px for trigger orders too
+        limit_px=signal.stop_loss,
         order_type={
             "trigger": {
                 "triggerPx": signal.stop_loss,
@@ -109,8 +161,15 @@ def build_orders(
     # --- Take-profit orders (trigger, market, reduce-only, split sizes) ---
     tp_prices = [signal.tp1, signal.tp2, signal.tp3]
     take_profits = []
+    allocated = 0.0
     for i, (tp_price, fraction) in enumerate(zip(tp_prices, tp_split)):
-        tp_sz = sz * fraction
+        if i < len(tp_split) - 1:
+            tp_sz = _floor_to(sz * fraction, decimals)
+            allocated += tp_sz
+        else:
+            # Last TP gets the remainder to ensure sizes sum exactly to entry
+            tp_sz = _floor_to(sz - allocated, decimals)
+
         take_profits.append(
             OrderParams(
                 coin=coin,
@@ -139,7 +198,7 @@ def build_orders(
     )
 
     logger.info(
-        "Built order set: %s #%d %s %s %.4f @ %.6f (lev=%dx, SL=%.6f, TP=[%.6f, %.6f, %.6f])",
+        "Built order set: %s #%d %s %s %s @ %s (lev=%dx, SL=%s, TP=[%s, %s, %s])",
         coin,
         signal.trade_id,
         signal.side.value,
@@ -157,7 +216,7 @@ def build_orders(
 
 
 def order_params_to_sdk_request(params: OrderParams) -> dict:
-    """Convert an OrderParams to the dict format expected by Exchange.bulk_orders().
+    """Convert an OrderParams to the dict format expected by Exchange.order().
 
     This is the OrderRequest TypedDict the SDK expects:
         {"coin": str, "is_buy": bool, "sz": float, "limit_px": float,
