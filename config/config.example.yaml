@@ -13,13 +13,32 @@ input:
 exchange:
   network: testnet                 # testnet | mainnet
 
-# --- Trading strategy ---
+# --- Strategy presets ---
+# A "strategy" is just 3 settings: TP management, SL management, position sizing.
+# Define your own presets here, or use built-ins: runner, conservative, tp2_exit,
+# tp3_hold, breakeven_filter, small_runner.
+#
+# User-defined presets override built-ins with the same name.
+strategy_presets:
+  my_strategy:                     # your custom preset
+    tp_split: [0.5, 0.3, 0.2]     # % of position to close at TP1, TP2, TP3
+    move_sl_to_breakeven_after: tp1  # tp1 | tp2 | never
+    size_pct: 1.5                  # % of account balance per trade
+
+# Built-in presets (no need to redefine unless you want to override):
+#   runner:           tp_split [0.33, 0.33, 0.34], BE after TP1, 2% size
+#   conservative:     tp_split [1.0, 0, 0],        no BE move,   2% size
+#   tp2_exit:         tp_split [0.5, 0.5, 0],      BE after TP1, 2% size
+#   tp3_hold:         tp_split [0, 0, 1.0],         BE after TP1, 2% size
+#   breakeven_filter: tp_split [0.33, 0.33, 0.34], BE after TP1, 1.5% size
+#   small_runner:     tp_split [0.33, 0.33, 0.34], BE after TP1, 0.5% size
+
+# --- Strategy selection ---
 strategy:
-  active: strategy_1               # which strategy to use (1-7)
-  tp_split: [0.33, 0.33, 0.34]    # fraction of position closed at TP1, TP2, TP3
+  active_preset: runner            # which preset to use (built-in or custom)
+  auto_execute: false              # true = execute immediately, false = wait for confirmation
   max_leverage: 20                 # cap leverage regardless of signal
-  default_size_pct: 2.0            # % of account balance per trade
-  size_by_risk:                    # override size_pct by risk level
+  size_by_risk:                    # override preset size_pct per risk level
     LOW: 4.0
     MEDIUM: 2.0
     HIGH: 1.0

@@ -2,7 +2,7 @@
 
 Loads settings from two sources:
   1. .env file — secrets (Hyperliquid credentials, Discord token)
-  2. config.yaml — all non-secret settings (strategy, risk, logging, etc.)
+  2. config.yaml — all non-secret settings (strategy presets, risk, logging, etc.)
 
 Returns a typed Config dataclass with validated fields.
 
@@ -50,16 +50,65 @@ class InputConfig:
 
 
 @dataclass
-class StrategyConfig:
-    """Trading strategy parameters."""
+class StrategyPreset:
+    """A named bundle of trade management parameters.
 
-    active: str = "strategy_1"
+    This is the core abstraction: a "strategy" is just a combination of
+    TP management, SL management, and position sizing. Users can define
+    their own presets or use built-in ones.
+    """
+
     tp_split: list[float] = field(default_factory=lambda: [0.33, 0.33, 0.34])
+    move_sl_to_breakeven_after: str = "tp1"  # "tp1" | "tp2" | "never"
+    size_pct: float = 2.0                     # % of account balance per trade
+
+
+# Built-in presets matching the 7 backtested approaches
+BUILTIN_PRESETS: dict[str, StrategyPreset] = {
+    "runner": StrategyPreset(
+        tp_split=[0.33, 0.33, 0.34],
+        move_sl_to_breakeven_after="tp1",
+        size_pct=2.0,
+    ),
+    "conservative": StrategyPreset(
+        tp_split=[1.0, 0.0, 0.0],
+        move_sl_to_breakeven_after="never",
+        size_pct=2.0,
+    ),
+    "tp2_exit": StrategyPreset(
+        tp_split=[0.5, 0.5, 0.0],
+        move_sl_to_breakeven_after="tp1",
+        size_pct=2.0,
+    ),
+    "tp3_hold": StrategyPreset(
+        tp_split=[0.0, 0.0, 1.0],
+        move_sl_to_breakeven_after="tp1",
+        size_pct=2.0,
+    ),
+    "breakeven_filter": StrategyPreset(
+        tp_split=[0.33, 0.33, 0.34],
+        move_sl_to_breakeven_after="tp1",
+        size_pct=1.5,
+    ),
+    "small_runner": StrategyPreset(
+        tp_split=[0.33, 0.33, 0.34],
+        move_sl_to_breakeven_after="tp1",
+        size_pct=0.5,
+    ),
+}
+
+
+@dataclass
+class StrategyConfig:
+    """Strategy selection and overrides."""
+
+    active_preset: str = "runner"
+    auto_execute: bool = False
     max_leverage: int = 20
-    default_size_pct: float = 2.0
     size_by_risk: dict[str, float] = field(
         default_factory=lambda: {"LOW": 4.0, "MEDIUM": 2.0, "HIGH": 1.0}
     )
+    presets: dict[str, StrategyPreset] = field(default_factory=dict)
 
 
 @dataclass
@@ -108,6 +157,24 @@ class Config:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
 
+    def get_active_preset(self) -> StrategyPreset:
+        """Resolve the currently active strategy preset.
+
+        Looks up in user-defined presets first, then falls back to built-ins.
+
+        Raises:
+            ConfigError: If the active preset name is not found.
+        """
+        name = self.strategy.active_preset
+        if name in self.strategy.presets:
+            return self.strategy.presets[name]
+        if name in BUILTIN_PRESETS:
+            return BUILTIN_PRESETS[name]
+        raise ConfigError(
+            f"Strategy preset '{name}' not found. "
+            f"Available: {sorted(set(BUILTIN_PRESETS) | set(self.strategy.presets))}"
+        )
+
 
 # ------------------------------------------------------------------
 # Loader
@@ -121,6 +188,20 @@ def _deep_update(base: dict, overrides: dict) -> dict:
         else:
             base[key] = value
     return base
+
+
+def _build_presets(raw: dict) -> dict[str, StrategyPreset]:
+    """Build StrategyPreset instances from the YAML strategy_presets section."""
+    presets = {}
+    for name, params in raw.items():
+        if not isinstance(params, dict):
+            continue
+        presets[name] = StrategyPreset(
+            tp_split=params.get("tp_split", [0.33, 0.33, 0.34]),
+            move_sl_to_breakeven_after=params.get("move_sl_to_breakeven_after", "tp1"),
+            size_pct=params.get("size_pct", 2.0),
+        )
+    return presets
 
 
 def load_config(
@@ -159,6 +240,19 @@ def load_config(
     else:
         logger.warning("No config file at %s — using defaults", yaml_path)
 
+    # --- Build presets (user-defined from YAML + built-ins) ---
+    user_presets = _build_presets(yaml_data.get("strategy_presets", {}))
+
+    # --- Build strategy config ---
+    strategy_yaml = yaml_data.get("strategy", {})
+    strategy_config = StrategyConfig(
+        active_preset=strategy_yaml.get("active_preset", "runner"),
+        auto_execute=strategy_yaml.get("auto_execute", False),
+        max_leverage=strategy_yaml.get("max_leverage", 20),
+        size_by_risk=strategy_yaml.get("size_by_risk", {"LOW": 4.0, "MEDIUM": 2.0, "HIGH": 1.0}),
+        presets=user_presets,
+    )
+
     # --- Build Config from YAML + env ---
     exchange_yaml = yaml_data.get("exchange", {})
     config = Config(
@@ -169,7 +263,7 @@ def load_config(
             api_secret=os.getenv("HL_API_SECRET", ""),
         ),
         input=_build_dataclass(InputConfig, yaml_data.get("input", {})),
-        strategy=_build_dataclass(StrategyConfig, yaml_data.get("strategy", {})),
+        strategy=strategy_config,
         risk=_build_dataclass(RiskConfig, yaml_data.get("risk", {})),
         database=_build_dataclass(DatabaseConfig, yaml_data.get("database", {})),
         logging=_build_dataclass(LoggingConfig, yaml_data.get("logging", {})),
@@ -183,11 +277,11 @@ def load_config(
     _validate(config)
 
     logger.info(
-        "Config loaded: network=%s, strategy=%s, max_leverage=%d, max_positions=%d",
+        "Config loaded: network=%s, preset=%s, auto_execute=%s, max_leverage=%d",
         config.exchange.network,
-        config.strategy.active,
+        config.strategy.active_preset,
+        config.strategy.auto_execute,
         config.strategy.max_leverage,
-        config.risk.max_open_positions,
     )
 
     return config
@@ -212,14 +306,32 @@ def _validate(config: Config) -> None:
     if config.exchange.network not in ("testnet", "mainnet"):
         errors.append(f"exchange.network must be 'testnet' or 'mainnet', got '{config.exchange.network}'")
 
-    # Strategy
-    tp = config.strategy.tp_split
-    if len(tp) != 3 or abs(sum(tp) - 1.0) > 0.01:
-        errors.append(f"strategy.tp_split must have 3 values summing to 1.0, got {tp}")
+    # Strategy — validate the active preset exists and its params
+    try:
+        preset = config.get_active_preset()
+        tp = preset.tp_split
+        if len(tp) != 3 or abs(sum(tp) - 1.0) > 0.01:
+            errors.append(f"Active preset tp_split must have 3 values summing to 1.0, got {tp}")
+        if preset.move_sl_to_breakeven_after not in ("tp1", "tp2", "never"):
+            errors.append(
+                f"move_sl_to_breakeven_after must be 'tp1', 'tp2', or 'never', "
+                f"got '{preset.move_sl_to_breakeven_after}'"
+            )
+        if preset.size_pct <= 0:
+            errors.append(f"Preset size_pct must be > 0, got {preset.size_pct}")
+    except ConfigError as e:
+        errors.append(str(e))
+
     if config.strategy.max_leverage < 1:
         errors.append(f"strategy.max_leverage must be >= 1, got {config.strategy.max_leverage}")
-    if config.strategy.default_size_pct <= 0:
-        errors.append(f"strategy.default_size_pct must be > 0, got {config.strategy.default_size_pct}")
+
+    # Validate all user-defined presets too
+    for name, preset in config.strategy.presets.items():
+        tp = preset.tp_split
+        if len(tp) != 3 or abs(sum(tp) - 1.0) > 0.01:
+            errors.append(f"Preset '{name}' tp_split must have 3 values summing to 1.0, got {tp}")
+        if preset.move_sl_to_breakeven_after not in ("tp1", "tp2", "never"):
+            errors.append(f"Preset '{name}' move_sl_to_breakeven_after invalid: '{preset.move_sl_to_breakeven_after}'")
 
     # Risk
     if config.risk.max_open_positions < 1:

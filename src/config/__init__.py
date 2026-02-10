@@ -1,4 +1,5 @@
 from src.config.settings import (
+    BUILTIN_PRESETS,
     Config,
     ConfigError,
     DatabaseConfig,
@@ -8,5 +9,6 @@ from src.config.settings import (
     LoggingConfig,
     RiskConfig,
     StrategyConfig,
+    StrategyPreset,
     load_config,
 )
