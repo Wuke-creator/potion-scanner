@@ -257,7 +257,7 @@ print(c.get_balance())
 | 1.10 | Basic execution: entry + SL + TP1 on testnet | Done — validated on testnet |
 | 1.11 | SQLite state persistence | Done — trades + orders tables, multi-user isolated |
 | 1.12 | Config system + .env | Done — YAML + .env, typed dataclasses, validated |
-| 1.13 | Unit tests for parser | Next |
+| 1.13 | Unit tests for parser | Done — 68 tests, all 28 samples covered |
 
 ### Phase 2: Strategy Engine & Full Lifecycle
 Position sizing, all 7 strategies, multi-TP management, SL updates, trade cancellation, symbol mapping, risk controls.
@@ -308,6 +308,11 @@ Strategy 1 dominates — will be the default. All 7 will be selectable via confi
 ## Changelog
 
 *This README is a living document updated every few pushes.*
+
+**2026-02-10 — Task 1.13 complete**
+- 68 unit tests covering classifier, signal parser, and all update parsers
+- Every one of the 28 real signal samples has field-level assertions
+- Edge cases: missing fields, Discord markdown, headerless signals, error handling
 
 **2026-02-10 — Tasks 1.11–1.12 complete**
 - SQLite state persistence: trades + orders tables with composite PK (user_id, trade_id)
