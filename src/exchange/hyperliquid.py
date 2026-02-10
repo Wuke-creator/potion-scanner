@@ -159,3 +159,18 @@ class HyperliquidClient:
     def get_all_mids(self) -> dict[str, str]:
         """Return current mid prices for all traded assets."""
         return self._info.all_mids()
+
+    def get_asset_meta(self) -> dict[str, dict]:
+        """Return per-coin metadata from the exchange, cached for the session.
+
+        Returns:
+            Dict keyed by coin name, e.g.:
+            {"ETH": {"szDecimals": 4, "maxLeverage": 25}, ...}
+        """
+        if not hasattr(self, "_asset_meta_cache"):
+            raw = self._info.meta()
+            self._asset_meta_cache = {
+                asset["name"]: asset for asset in raw["universe"]
+            }
+            logger.info("Cached metadata for %d assets", len(self._asset_meta_cache))
+        return self._asset_meta_cache

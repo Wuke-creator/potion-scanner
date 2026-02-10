@@ -8,15 +8,16 @@ Converts a ParsedSignal into Hyperliquid SDK order parameters:
 The SDK handles nonce, signing, and wire format conversion internally.
 
 Hyperliquid constraints discovered during testnet testing:
-  - Minimum order value is $10
-  - Sizes must be rounded (floor) to avoid float_to_wire precision errors
+  - Minimum order value is $10 (checked against mid price, not limit price)
+  - Sizes must respect per-asset szDecimals from exchange metadata
+  - Sizes are floored (not rounded) to avoid float_to_wire precision errors
   - SL/TP trigger orders must be submitted individually after entry fills
     (positionTpsl grouping only accepts 1 SL + 1 TP, not multiple TPs)
 """
 
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from src.parser.signal_parser import ParsedSignal, Side
@@ -26,26 +27,6 @@ logger = logging.getLogger(__name__)
 
 # Hyperliquid minimum order value in USD
 MIN_ORDER_VALUE_USD = 10.0
-
-# Default size decimal precision per price tier
-# Lower-priced coins need more decimals, higher-priced need fewer
-_SZ_DECIMALS_BY_PRICE = [
-    (0.001, 0),       # sub-penny coins: whole units
-    (0.1, 0),         # penny coins: whole units
-    (1.0, 1),         # dollar coins: 1 decimal
-    (10.0, 2),        # ~$10 coins: 2 decimals
-    (100.0, 3),       # ~$100 coins: 3 decimals
-    (1000.0, 4),      # ~$1000 coins: 4 decimals
-    (float("inf"), 5), # expensive coins: 5 decimals
-]
-
-
-def _sz_decimals(price: float) -> int:
-    """Determine appropriate size decimal precision based on coin price."""
-    for threshold, decimals in _SZ_DECIMALS_BY_PRICE:
-        if price < threshold:
-            return decimals
-    return 5
 
 
 def _floor_to(value: float, decimals: int) -> float:
@@ -86,6 +67,7 @@ class TradeOrderSet:
 def build_orders(
     signal: ParsedSignal,
     position_size_usd: float,
+    asset_meta: dict[str, Any],
     tp_split: list[float] | None = None,
     max_leverage: int | None = None,
 ) -> TradeOrderSet:
@@ -94,6 +76,8 @@ def build_orders(
     Args:
         signal: Parsed TRADING SIGNAL ALERT.
         position_size_usd: Total USD value for this position.
+        asset_meta: Per-coin metadata from HyperliquidClient.get_asset_meta().
+            Must contain at least {"szDecimals": int, "maxLeverage": int} for the coin.
         tp_split: Fraction of position to close at each TP level.
             Must sum to 1.0. Defaults to [0.33, 0.33, 0.34].
         max_leverage: Cap leverage at this value regardless of signal.
@@ -103,7 +87,7 @@ def build_orders(
         TradeOrderSet with entry, SL, and TP orders ready for submission.
 
     Raises:
-        ValueError: If position_size_usd is below the $10 minimum or tp_split is invalid.
+        ValueError: If position size is too small, coin not found, or tp_split is invalid.
     """
     if tp_split is None:
         tp_split = [0.33, 0.33, 0.34]
@@ -120,16 +104,35 @@ def build_orders(
     # --- Resolve coin name and direction ---
     coin = potion_to_hyperliquid(signal.pair)
     is_long = signal.side == Side.LONG
-    leverage = min(signal.leverage, max_leverage) if max_leverage else signal.leverage
+
+    if coin not in asset_meta:
+        raise ValueError(f"Coin '{coin}' not found in Hyperliquid asset metadata")
+
+    meta = asset_meta[coin]
+    sz_decimals = meta["szDecimals"]
+
+    # Cap leverage at both user-specified max and exchange max
+    exchange_max_lev = meta.get("maxLeverage", signal.leverage)
+    leverage = signal.leverage
+    if max_leverage:
+        leverage = min(leverage, max_leverage)
+    leverage = min(leverage, exchange_max_lev)
 
     # --- Calculate and round position size ---
-    decimals = _sz_decimals(signal.entry)
-    sz = _floor_to(position_size_usd / signal.entry, decimals)
+    sz = _floor_to(position_size_usd / signal.entry, sz_decimals)
 
     if sz <= 0:
         raise ValueError(
-            f"Position size rounds to 0 at {decimals} decimals "
+            f"Position size rounds to 0 at {sz_decimals} szDecimals "
             f"(${position_size_usd} / ${signal.entry})"
+        )
+
+    # Verify the floored size still meets the $10 minimum
+    notional = sz * signal.entry
+    if notional < MIN_ORDER_VALUE_USD:
+        raise ValueError(
+            f"Order notional ${notional:.2f} ({sz} {coin} @ ${signal.entry}) "
+            f"is below Hyperliquid minimum of ${MIN_ORDER_VALUE_USD:.2f}"
         )
 
     # --- Entry order (limit GTC) ---
@@ -164,11 +167,11 @@ def build_orders(
     allocated = 0.0
     for i, (tp_price, fraction) in enumerate(zip(tp_prices, tp_split)):
         if i < len(tp_split) - 1:
-            tp_sz = _floor_to(sz * fraction, decimals)
+            tp_sz = _floor_to(sz * fraction, sz_decimals)
             allocated += tp_sz
         else:
             # Last TP gets the remainder to ensure sizes sum exactly to entry
-            tp_sz = _floor_to(sz - allocated, decimals)
+            tp_sz = _floor_to(sz - allocated, sz_decimals)
 
         take_profits.append(
             OrderParams(

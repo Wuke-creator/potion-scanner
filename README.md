@@ -253,9 +253,9 @@ print(c.get_balance())
 | 1.6 | Signal parser (TRADING SIGNAL ALERT) | Done |
 | 1.7 | Update parser (TP hit, SL, cancellations, etc.) | Done |
 | 1.8 | Hyperliquid testnet connection + balance check | Done |
-| 1.9 | Order builder | Next |
-| 1.10 | Basic execution: entry + SL + TP1 on testnet | |
-| 1.11 | SQLite state persistence | |
+| 1.9 | Order builder | Done — uses exchange metadata for szDecimals + max leverage |
+| 1.10 | Basic execution: entry + SL + TP1 on testnet | Done — validated on testnet |
+| 1.11 | SQLite state persistence | Next |
 | 1.12 | Config system + .env | |
 | 1.13 | Unit tests for parser | |
 
@@ -266,7 +266,24 @@ Position sizing, all 7 strategies, multi-TP management, SL updates, trade cancel
 Error handling, auto-reconnect, health checks, structured logging, Docker, CI/CD, kill switch.
 
 ### Phase 4: Extensions
-Discord bot adapter, Telegram notifications, mainnet migration, web dashboard, multi-user support.
+Discord bot adapter, Telegram notifications, mainnet migration, web dashboard.
+
+---
+
+## Multi-User Design
+
+The core pipeline is designed for multi-user support from the start:
+
+| Component | Multi-User Ready | Notes |
+|-----------|-----------------|-------|
+| HyperliquidClient | Yes | Instance-based — each user gets their own client with their own credentials |
+| Order Builder | Yes | Pure functions, no shared state |
+| Parsers | Yes | Stateless — classify/parse are pure functions |
+| Input Adapters | Yes | Instance-scoped queues, no globals |
+| Config system | Not yet | Will load per-user credentials + strategy settings (task 1.12) |
+| Database | Not yet | Will use `user_id` isolation in all tables (task 1.11) |
+
+All future work (config, state, logging) must maintain per-user isolation. No singletons, no global state, no shared file paths between users.
 
 ---
 
@@ -291,6 +308,14 @@ Strategy 1 dominates — will be the default. All 7 will be selectable via confi
 ## Changelog
 
 *This README is a living document updated every few pushes.*
+
+**2026-02-10 — Tasks 1.9–1.10 complete**
+- Order builder now uses real Hyperliquid exchange metadata (`szDecimals`, `maxLeverage`) instead of price-based heuristics
+- Fixed bug: ETH orders rejected as "invalid size" because heuristic gave 5 decimals instead of the correct 4
+- Added notional validation (sz * price >= $10) and exchange max leverage capping
+- Validated full order flow on testnet: entry + SL + 3 TPs for ETH
+- Added `get_asset_meta()` to HyperliquidClient (cached per session)
+- Documented multi-user compatibility — core pipeline is already multi-user safe
 
 **2026-02-09 — Tasks 1.1–1.8 complete**
 - Scaffolded project with full directory structure
