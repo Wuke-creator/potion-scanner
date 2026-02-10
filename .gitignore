@@ -178,6 +178,7 @@ config/config.yaml
 
 # Database
 *.db
+data/
 
 # Logs
 logs/
