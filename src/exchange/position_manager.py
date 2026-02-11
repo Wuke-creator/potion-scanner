@@ -62,6 +62,133 @@ class PositionManager:
         self._client = client
         self._db = db
 
+    # ------------------------------------------------------------------
+    # Startup sync
+    # ------------------------------------------------------------------
+
+    def sync_positions(self) -> dict[str, list]:
+        """Reconcile local DB state with actual exchange state.
+
+        Call this once on startup to handle anything that changed while
+        the bot was offline (fills, liquidations, expired orders, etc.).
+
+        Returns a summary dict with lists of trade_ids that were updated:
+            {
+                "closed": [...],    # OPEN in DB, no position on exchange
+                "canceled": [...],  # PENDING in DB, no resting entry order
+                "verified": [...],  # OPEN in DB, position confirmed on exchange
+                "orphans": [...],   # Positions on exchange with no local trade
+            }
+        """
+        summary: dict[str, list] = {
+            "closed": [],
+            "canceled": [],
+            "verified": [],
+            "orphans": [],
+        }
+
+        # Fetch exchange state
+        try:
+            exchange_positions = self._client.get_open_positions()
+            exchange_orders = self._client.get_open_orders()
+        except Exception as e:
+            logger.error("Failed to fetch exchange state for sync: %s", e)
+            return summary
+
+        # Index by coin for quick lookup
+        positions_by_coin: dict[str, dict] = {
+            p["coin"]: p for p in exchange_positions
+        }
+        # Collect all resting order oids
+        resting_oids: set[int] = {
+            int(o["oid"]) for o in exchange_orders if "oid" in o
+        }
+
+        # Load local open/pending trades
+        local_trades = self._db.get_open_trades()
+        local_coins: set[str] = set()
+
+        for trade in local_trades:
+            local_coins.add(trade.coin)
+
+            if trade.status == TradeStatus.OPEN:
+                # Trade was OPEN — check if position still exists
+                if trade.coin in positions_by_coin:
+                    logger.info(
+                        "Sync: trade #%d %s confirmed open (size=%s)",
+                        trade.trade_id, trade.coin,
+                        positions_by_coin[trade.coin]["size"],
+                    )
+                    summary["verified"].append(trade.trade_id)
+                else:
+                    # Position gone — SL/TP filled or liquidated while offline
+                    logger.warning(
+                        "Sync: trade #%d %s was OPEN but no position found — marking CLOSED",
+                        trade.trade_id, trade.coin,
+                    )
+                    self._db.update_trade_status(
+                        trade.trade_id, TradeStatus.CLOSED,
+                        close_reason="sync_no_position",
+                    )
+                    summary["closed"].append(trade.trade_id)
+
+            elif trade.status == TradeStatus.PENDING:
+                # Trade was PENDING — check if entry order is still resting
+                orders = self._db.get_orders_for_trade(trade.trade_id)
+                entry_order = next(
+                    (o for o in orders if o.order_type == OrderType.ENTRY),
+                    None,
+                )
+
+                if entry_order and entry_order.oid and entry_order.oid in resting_oids:
+                    # Entry still resting, trade is still pending
+                    logger.info(
+                        "Sync: trade #%d %s entry order still resting (oid=%d)",
+                        trade.trade_id, trade.coin, entry_order.oid,
+                    )
+                    summary["verified"].append(trade.trade_id)
+                elif trade.coin in positions_by_coin:
+                    # Entry filled while offline — promote to OPEN
+                    logger.info(
+                        "Sync: trade #%d %s entry filled while offline — marking OPEN",
+                        trade.trade_id, trade.coin,
+                    )
+                    self._db.update_trade_status(trade.trade_id, TradeStatus.OPEN)
+                    summary["verified"].append(trade.trade_id)
+                else:
+                    # No resting order and no position — entry expired/rejected
+                    logger.warning(
+                        "Sync: trade #%d %s was PENDING but no order or position — marking CANCELED",
+                        trade.trade_id, trade.coin,
+                    )
+                    self._db.update_trade_status(
+                        trade.trade_id, TradeStatus.CANCELED,
+                        close_reason="sync_no_order",
+                    )
+                    summary["canceled"].append(trade.trade_id)
+
+        # Check for orphan positions (on exchange but no local trade)
+        for coin, pos in positions_by_coin.items():
+            if coin not in local_coins:
+                logger.warning(
+                    "Sync: orphan position found — %s size=%s (no matching local trade)",
+                    coin, pos["size"],
+                )
+                summary["orphans"].append(coin)
+
+        logger.info(
+            "Sync complete: %d verified, %d closed, %d canceled, %d orphans",
+            len(summary["verified"]),
+            len(summary["closed"]),
+            len(summary["canceled"]),
+            len(summary["orphans"]),
+        )
+        return summary
+
+    # ------------------------------------------------------------------
+    # Trade submission
+    # ------------------------------------------------------------------
+
     def submit_trade(self, trade_set: TradeOrderSet) -> bool:
         """Submit a complete trade (entry + SL + TPs) to the exchange.
 

@@ -10,6 +10,7 @@ import sys
 
 from src.config import Config, load_config
 from src.exchange.hyperliquid import HyperliquidClient
+from src.exchange.position_manager import PositionManager
 from src.input.cli_adapter import CLIAdapter
 from src.input.simulation_adapter import SimulationAdapter
 from src.pipeline import Pipeline
@@ -48,6 +49,17 @@ async def run(config: Config, user_id: str = "default") -> None:
 
     # --- Initialize database ---
     db = TradeDatabase(user_id=user_id, db_path=config.database.path)
+
+    # --- Sync positions with exchange ---
+    pm = PositionManager(client, db)
+    sync_result = pm.sync_positions()
+    if sync_result["closed"] or sync_result["canceled"]:
+        logger.warning(
+            "Sync updated trades: %d closed, %d canceled",
+            len(sync_result["closed"]), len(sync_result["canceled"]),
+        )
+    if sync_result["orphans"]:
+        logger.warning("Orphan positions on exchange: %s", sync_result["orphans"])
 
     # --- Initialize pipeline ---
     pipeline = Pipeline(config=config, client=client, db=db)
