@@ -250,6 +250,47 @@ def parse_preparation(raw: str) -> Preparation:
     )
 
 
+@dataclass
+class SlUpdate:
+    """Parsed stop-loss adjustment instruction."""
+
+    trade_id: int
+    new_price: float
+
+
+def parse_sl_update(raw: str) -> SlUpdate | None:
+    """Try to extract a stop-loss move instruction from free-text.
+
+    Returns an SlUpdate if the message looks like an SL adjustment,
+    or None if it doesn't match any known pattern.
+
+    Recognised patterns (case-insensitive):
+        - "Move SL to 1985"
+        - "Adjust stop loss to 0.025"
+        - "New SL: 1985"
+        - "SL → 1985" / "SL -> 1985"
+        - "Stop loss 1985"
+        - "Change SL to 1985"
+    """
+    text = _clean(raw)
+
+    trade_id = _extract_trade_id(text)
+    if trade_id is None:
+        return None
+
+    patterns = [
+        r"(?:move|adjust|change|update|set)\s+(?:stop\s*loss|sl)\s+(?:to\s+)?([\d.]+)",
+        r"(?:new|updated?)\s+(?:stop\s*loss|sl)[:\s]+([\d.]+)",
+        r"(?:stop\s*loss|sl)\s*(?:→|->|to)\s*([\d.]+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return SlUpdate(trade_id=trade_id, new_price=float(m.group(1)))
+
+    return None
+
+
 def parse_manual_update(raw: str) -> ManualUpdate:
     text = _clean(raw)
 

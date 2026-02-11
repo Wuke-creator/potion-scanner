@@ -179,8 +179,11 @@ class PositionManager:
 
         self._db.update_trade_status(trade_id, TradeStatus.CLOSED, close_reason=reason)
 
-    def move_sl_to_breakeven(self, trade_id: int, coin: str, entry_price: float) -> None:
-        """Cancel the existing SL and place a new one at the entry price."""
+    def move_stop_loss(self, trade_id: int, coin: str, new_price: float) -> bool:
+        """Cancel the existing SL and place a new one at *new_price*.
+
+        Returns True if the new SL was placed, False otherwise.
+        """
         orders = self._db.get_orders_for_trade(trade_id)
         sl_order = next(
             (o for o in orders if o.order_type == OrderType.STOP_LOSS and o.status == OrderStatus.SUBMITTED),
@@ -188,7 +191,7 @@ class PositionManager:
         )
         if not sl_order or not sl_order.oid:
             logger.warning("No active SL found for trade #%d to move", trade_id)
-            return
+            return False
 
         # Cancel old SL
         try:
@@ -197,28 +200,33 @@ class PositionManager:
             logger.info("Canceled old SL oid=%d for trade #%d", sl_order.oid, trade_id)
         except Exception as e:
             logger.error("Failed to cancel old SL oid=%d: %s", sl_order.oid, e)
-            return
+            return False
 
         # Determine direction: if original SL was a BUY (closing a short), new one is also BUY
         is_buy = sl_order.side == "BUY"
 
-        # Place new SL at entry price
+        # Place new SL at the requested price
         new_sl = OrderParams(
             coin=coin,
             is_buy=is_buy,
             sz=sl_order.size,
-            limit_px=entry_price,
+            limit_px=new_price,
             order_type={
                 "trigger": {
-                    "triggerPx": entry_price,
+                    "triggerPx": new_price,
                     "isMarket": True,
                     "tpsl": "sl",
                 }
             },
             reduce_only=True,
         )
-        self._submit_and_record(trade_id, OrderType.STOP_LOSS, new_sl, coin)
-        logger.info("Moved SL to breakeven (%.6f) for trade #%d", entry_price, trade_id)
+        oid = self._submit_and_record(trade_id, OrderType.STOP_LOSS, new_sl, coin)
+        logger.info("Moved SL to %.6f for trade #%d", new_price, trade_id)
+        return oid is not None
+
+    def move_sl_to_breakeven(self, trade_id: int, coin: str, entry_price: float) -> bool:
+        """Convenience wrapper — move SL to the entry price."""
+        return self.move_stop_loss(trade_id, coin, entry_price)
 
     def _submit_order(self, params: OrderParams) -> dict:
         """Submit a single order to the exchange."""

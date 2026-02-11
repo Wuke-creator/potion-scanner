@@ -21,6 +21,7 @@ from src.parser.update_parser import (
     parse_canceled,
     parse_manual_update,
     parse_preparation,
+    parse_sl_update,
     parse_stop_hit,
     parse_tp_hit,
     parse_trade_closed,
@@ -204,9 +205,21 @@ class Pipeline:
         )
 
     def _handle_breakeven(self, raw: str) -> None:
-        """Breakeven — informational, SL was already moved if configured."""
+        """Breakeven — move SL to entry if not already done by TP-hit auto-move."""
         be = parse_breakeven(raw)
+        trade = self._db.get_trade(be.trade_id)
+        if not trade:
+            logger.warning("Breakeven for unknown trade #%d", be.trade_id)
+            return
+
         logger.info("Breakeven for trade #%d %s (TP%d secured)", be.trade_id, be.pair, be.tp_secured)
+
+        if trade.status == TradeStatus.OPEN and self._config.strategy.auto_execute:
+            moved = self._pm.move_sl_to_breakeven(be.trade_id, trade.coin, trade.entry_price)
+            if moved:
+                logger.info("SL moved to breakeven for trade #%d via provider message", be.trade_id)
+            # If move_sl_to_breakeven returns False it means no active SL was found
+            # (likely already moved by the TP-hit auto-move) — that's fine.
 
     def _handle_stop_hit(self, raw: str) -> None:
         """Stop hit — trade is closed at a loss."""
@@ -259,7 +272,26 @@ class Pipeline:
         )
 
     def _handle_manual_update(self, raw: str) -> None:
-        """Manual update — log for human review."""
+        """Manual update — try to detect actionable instructions (e.g. SL moves)."""
+        # Try to detect an SL adjustment instruction first
+        sl = parse_sl_update(raw)
+        if sl:
+            trade = self._db.get_trade(sl.trade_id)
+            if not trade:
+                logger.warning("SL update for unknown trade #%d", sl.trade_id)
+                return
+            if trade.status != TradeStatus.OPEN:
+                logger.warning("SL update for non-open trade #%d (status=%s)", sl.trade_id, trade.status.value)
+                return
+
+            logger.info("SL update detected: trade #%d → new SL %.6f", sl.trade_id, sl.new_price)
+            if self._config.strategy.auto_execute:
+                self._pm.move_stop_loss(sl.trade_id, trade.coin, sl.new_price)
+            else:
+                logger.info("SL update ready (auto_execute=false) for trade #%d", sl.trade_id)
+            return
+
+        # Not an SL instruction — log for human review
         mu = parse_manual_update(raw)
         logger.info(
             "Manual update: trade #%s %s — %s",

@@ -11,6 +11,7 @@ from src.parser.update_parser import (
     parse_canceled,
     parse_manual_update,
     parse_preparation,
+    parse_sl_update,
     parse_stop_hit,
     parse_tp_hit,
     parse_trade_closed,
@@ -251,3 +252,67 @@ class TestUpdateParserErrors:
     def test_preparation_missing_pair_raises(self):
         with pytest.raises(UpdateParseError):
             parse_preparation("Trade #1234 Incoming...\n(Prepare, dont place it yet)")
+
+
+# ------------------------------------------------------------------
+# SL_UPDATE (parse_sl_update)
+# ------------------------------------------------------------------
+
+class TestSlUpdate:
+
+    def test_move_sl_to(self):
+        r = parse_sl_update("Trade #1286 — Move SL to 1985")
+        assert r is not None
+        assert r.trade_id == 1286
+        assert r.new_price == 1985.0
+
+    def test_adjust_stop_loss_to(self):
+        r = parse_sl_update("Trade #1250 Adjust stop loss to 0.025")
+        assert r is not None
+        assert r.trade_id == 1250
+        assert r.new_price == 0.025
+
+    def test_new_sl_colon(self):
+        r = parse_sl_update("#1284 New SL: 510.5")
+        assert r is not None
+        assert r.trade_id == 1284
+        assert r.new_price == 510.5
+
+    def test_sl_arrow(self):
+        r = parse_sl_update("Trade #1260 SL → 0.178")
+        assert r is not None
+        assert r.trade_id == 1260
+        assert r.new_price == 0.178
+
+    def test_sl_dash_arrow(self):
+        r = parse_sl_update("#1260 SL -> 0.178")
+        assert r is not None
+        assert r.trade_id == 1260
+        assert r.new_price == 0.178
+
+    def test_change_sl(self):
+        r = parse_sl_update("Trade #1234 change SL to 45000")
+        assert r is not None
+        assert r.trade_id == 1234
+        assert r.new_price == 45000.0
+
+    def test_set_stop_loss(self):
+        r = parse_sl_update("#1234 set stop loss 2000.5")
+        assert r is not None
+        assert r.trade_id == 1234
+        assert r.new_price == 2000.5
+
+    def test_update_sl(self):
+        r = parse_sl_update("Trade #1280 update SL to 3.45")
+        assert r is not None
+        assert r.trade_id == 1280
+        assert r.new_price == 3.45
+
+    def test_no_trade_id_returns_none(self):
+        assert parse_sl_update("Move SL to 1985") is None
+
+    def test_no_sl_instruction_returns_none(self):
+        assert parse_sl_update("Trade #1286 — close half the position") is None
+
+    def test_unrelated_message_returns_none(self):
+        assert parse_sl_update("Great job everyone, TP1 hit!") is None
