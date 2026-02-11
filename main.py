@@ -1,42 +1,35 @@
 """Potion Perps Bot — Entry point.
 
 Loads config, connects to exchange, and runs the signal processing pipeline
-with the configured input adapter.
+with the configured input adapter. Handles graceful shutdown via SIGTERM/SIGINT.
 """
 
 import asyncio
 import logging
+import signal
 import sys
 
 from src.config import Config, load_config
 from src.exchange.hyperliquid import HyperliquidClient
 from src.exchange.position_manager import PositionManager
+from src.health import HealthServer
 from src.input.cli_adapter import CLIAdapter
 from src.input.simulation_adapter import SimulationAdapter
 from src.pipeline import Pipeline
 from src.state.database import TradeDatabase
-
-
-def _setup_logging(config: Config) -> None:
-    """Configure logging from config settings."""
-    from pathlib import Path
-
-    log_path = Path(config.logging.file)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    logging.basicConfig(
-        level=getattr(logging, config.logging.level, logging.INFO),
-        format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(log_path),
-        ],
-    )
+from src.utils.logger import setup_logging
 
 
 async def run(config: Config, user_id: str = "default") -> None:
     """Main loop: read signals from adapter, process through pipeline."""
     logger = logging.getLogger(__name__)
+
+    shutdown_event = asyncio.Event()
+
+    # --- Register signal handlers ---
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, shutdown_event.set)
 
     # --- Connect to exchange ---
     client = HyperliquidClient(
@@ -64,6 +57,12 @@ async def run(config: Config, user_id: str = "default") -> None:
     # --- Initialize pipeline ---
     pipeline = Pipeline(config=config, client=client, db=db)
 
+    # --- Start health server ---
+    health_server = HealthServer(port=config.health.port)
+    if config.health.enabled:
+        await health_server.start()
+        logger.info("Health server listening on port %d", config.health.port)
+
     # --- Select input adapter ---
     adapter_name = config.input.adapter
     if adapter_name == "cli":
@@ -84,17 +83,28 @@ async def run(config: Config, user_id: str = "default") -> None:
     adapter_task = asyncio.create_task(adapter.start())
 
     try:
-        while True:
-            raw_message = await adapter.queue.get()
+        while not shutdown_event.is_set():
+            try:
+                raw_message = await asyncio.wait_for(adapter.queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
             if not raw_message.strip():
                 continue
             logger.info("--- Incoming message (%d chars) ---", len(raw_message))
             pipeline.process_message(raw_message)
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
+            health_server.record_message()
+    except Exception:
+        logger.exception("Unexpected error in main loop")
     finally:
+        logger.info("Shutting down...")
         adapter_task.cancel()
+        try:
+            await adapter_task
+        except asyncio.CancelledError:
+            pass
+        await health_server.stop()
         db.close()
+        logger.info("Shutdown complete")
 
 
 def main() -> None:
@@ -104,7 +114,7 @@ def main() -> None:
         user_id = sys.argv[1]
 
     config = load_config()
-    _setup_logging(config)
+    setup_logging(config.logging)
     asyncio.run(run(config, user_id))
 
 

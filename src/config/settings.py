@@ -135,6 +135,15 @@ class LoggingConfig:
 
     level: str = "INFO"
     file: str = "logs/bot.log"
+    format: str = "json"  # "json" (server) or "console" (dev)
+
+
+@dataclass
+class HealthConfig:
+    """Health check endpoint settings."""
+
+    enabled: bool = True
+    port: int = 8080
 
 
 @dataclass
@@ -156,6 +165,7 @@ class Config:
     risk: RiskConfig = field(default_factory=RiskConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    health: HealthConfig = field(default_factory=HealthConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
 
     def get_active_preset(self) -> StrategyPreset:
@@ -268,6 +278,7 @@ def load_config(
         risk=_build_dataclass(RiskConfig, yaml_data.get("risk", {})),
         database=_build_dataclass(DatabaseConfig, yaml_data.get("database", {})),
         logging=_build_dataclass(LoggingConfig, yaml_data.get("logging", {})),
+        health=_build_dataclass(HealthConfig, yaml_data.get("health", {})),
         discord=DiscordConfig(
             bot_token=os.getenv("DISCORD_BOT_TOKEN", ""),
             channel_id=yaml_data.get("discord", {}).get("channel_id", ""),

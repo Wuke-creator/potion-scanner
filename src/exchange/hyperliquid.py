@@ -1,6 +1,9 @@
 """Hyperliquid API wrapper — connection, auth, order placement."""
 
+import functools
 import logging
+import random
+import time
 from typing import Any
 
 import eth_account
@@ -9,6 +12,48 @@ from hyperliquid.info import Info
 from hyperliquid.utils.constants import TESTNET_API_URL, MAINNET_API_URL
 
 logger = logging.getLogger(__name__)
+
+TRANSIENT_EXCEPTIONS = (ConnectionError, TimeoutError, OSError)
+RATE_LIMIT_STRINGS = ("rate limit", "too many requests", "429")
+
+
+def retry_on_transient(max_retries: int = 3, base_delay: float = 1.0):
+    """Decorator that retries on transient network errors with exponential backoff + jitter."""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exc = None
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except TRANSIENT_EXCEPTIONS as e:
+                    last_exc = e
+                    if attempt == max_retries:
+                        raise
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
+                    logger.warning(
+                        "Transient error in %s (attempt %d/%d), retrying in %.1fs: %s",
+                        func.__name__, attempt + 1, max_retries, delay, e,
+                    )
+                    time.sleep(delay)
+                except Exception as e:
+                    # Check for rate-limit messages in string representation
+                    err_str = str(e).lower()
+                    if any(s in err_str for s in RATE_LIMIT_STRINGS):
+                        last_exc = e
+                        if attempt == max_retries:
+                            raise
+                        delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
+                        logger.warning(
+                            "Rate limited in %s (attempt %d/%d), retrying in %.1fs: %s",
+                            func.__name__, attempt + 1, max_retries, delay, e,
+                        )
+                        time.sleep(delay)
+                    else:
+                        raise
+            raise last_exc  # pragma: no cover
+        return wrapper
+    return decorator
 
 NETWORK_URLS = {
     "testnet": TESTNET_API_URL,
@@ -90,10 +135,12 @@ class HyperliquidClient:
     # Account queries
     # ------------------------------------------------------------------
 
+    @retry_on_transient()
     def get_account_state(self) -> dict[str, Any]:
         """Return full account state (positions, margin summary, withdrawable)."""
         return self._info.user_state(self._account_address)
 
+    @retry_on_transient()
     def get_spot_balances(self) -> list[dict[str, str]]:
         """Return non-zero spot token balances (includes USDC under portfolio margin)."""
         state = self._info.spot_user_state(self._account_address)
@@ -108,6 +155,7 @@ class HyperliquidClient:
                 })
         return balances
 
+    @retry_on_transient()
     def get_balance(self) -> dict[str, str]:
         """Return unified account summary.
 
@@ -134,6 +182,7 @@ class HyperliquidClient:
             "withdrawable": perp_state.get("withdrawable", "0"),
         }
 
+    @retry_on_transient()
     def get_open_positions(self) -> list[dict[str, Any]]:
         """Return list of non-zero positions."""
         state = self.get_account_state()
@@ -152,14 +201,17 @@ class HyperliquidClient:
                 })
         return positions
 
+    @retry_on_transient()
     def get_open_orders(self) -> list[dict[str, Any]]:
         """Return all open orders."""
         return self._info.open_orders(self._account_address)
 
+    @retry_on_transient()
     def get_all_mids(self) -> dict[str, str]:
         """Return current mid prices for all traded assets."""
         return self._info.all_mids()
 
+    @retry_on_transient()
     def get_asset_meta(self) -> dict[str, dict]:
         """Return per-coin metadata from the exchange, cached for the session.
 

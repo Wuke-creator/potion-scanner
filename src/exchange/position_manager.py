@@ -8,7 +8,7 @@ import logging
 import math
 from typing import Any
 
-from src.exchange.hyperliquid import HyperliquidClient
+from src.exchange.hyperliquid import HyperliquidClient, retry_on_transient
 from src.exchange.order_builder import OrderParams, TradeOrderSet, order_params_to_sdk_request
 from src.state.models import OrderStatus, OrderType, TradeStatus
 from src.state.database import TradeDatabase
@@ -365,6 +365,7 @@ class PositionManager:
         """Convenience wrapper — move SL to the entry price."""
         return self.move_stop_loss(trade_id, coin, entry_price)
 
+    @retry_on_transient(max_retries=2, base_delay=0.5)
     def _submit_order(self, params: OrderParams) -> dict:
         """Submit a single order to the exchange."""
         req = order_params_to_sdk_request(params)
