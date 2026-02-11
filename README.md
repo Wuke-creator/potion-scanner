@@ -332,13 +332,74 @@ Full pipeline verified on Hyperliquid testnet:
 | 2.7 | Position sync on startup (survive restarts) | Done |
 | 2.8 | Risk controls (daily loss breaker, exposure cap, 158 tests) | Done |
 
-### Phase 3: Robustness & Monitoring — Next
+### Phase 3A: Server-Ready Pipeline — Next
 
-Error handling, auto-reconnect, health checks, structured logging, Docker, CI/CD, kill switch.
+Make the existing pipeline deployable and reliable on a server.
 
-### Phase 4: Extensions
+| Task | Description |
+|------|-------------|
+| 3A.1 | Graceful shutdown & signal handling (SIGTERM, SIGINT) |
+| 3A.2 | Retry logic for exchange API calls (transient failures, rate limits) |
+| 3A.3 | Health check endpoint (simple HTTP — "am I alive?") |
+| 3A.4 | Structured logging (JSON format for server log aggregation) |
+| 3A.5 | Docker container + docker-compose for deployment |
 
-Discord bot adapter, Telegram notifications with strategy selection, mainnet migration, web dashboard.
+### Phase 3B: Multi-User Architecture
+
+Fan-out layer so one signal source serves all users.
+
+| Task | Description |
+|------|-------------|
+| 3B.1 | Per-user config stored in DB (replace per-user YAML files) |
+| 3B.2 | Encrypted credential storage (user API keys at rest) |
+| 3B.3 | User registry: add/remove/activate/deactivate users |
+| 3B.4 | Multi-user orchestrator: one signal → dispatch to all active user pipelines |
+| 3B.5 | Discord adapter: connect to Potion Perps channel, feed signals into the system |
+
+### Phase 4: Telegram Bot
+
+User-facing interface for trade management.
+
+| Task | Description |
+|------|-------------|
+| 4.1 | Bot setup + user registration flow |
+| 4.2 | Credential onboarding ("paste your HL API key") |
+| 4.3 | Strategy configuration via Telegram (preset picker, custom params) |
+| 4.4 | Signal notifications with approve/reject buttons |
+| 4.5 | Three execution modes: manual approval, preset auto, full auto |
+| 4.6 | Status commands: /balance, /trades, /pnl, /exposure |
+| 4.7 | Admin commands: /kill (emergency stop), /users |
+
+### Phase 5: Polish & Mainnet
+
+| Task | Description |
+|------|-------------|
+| 5.1 | Mainnet migration with safety checks |
+| 5.2 | Rate limiting & abuse prevention |
+| 5.3 | Database backup/restore |
+| 5.4 | CI/CD pipeline |
+| 5.5 | Monitoring dashboard (optional) |
+
+---
+
+## Production Architecture
+
+```
+Discord (Potion Perps) → [Signal Ingestion Service] → Signal Queue
+                                                          ↓
+                                              ┌──── User Pipeline (alice) ──→ Hyperliquid
+                                              ├──── User Pipeline (bob)   ──→ Hyperliquid
+                                              └──── User Pipeline (...)   ──→ Hyperliquid
+                                                          ↕
+                                                   Telegram Bot
+                                              (notifications, config, approval)
+```
+
+- **Signal source**: One process scrapes/receives Potion Perps signals from Discord
+- **Multi-user dispatch**: Each signal fans out to every active user's pipeline
+- **Per-user pipeline**: Exactly what we built (Phase 1-2), running per-user with their own config and credentials
+- **Telegram bot**: User-facing interface for onboarding, strategy config, trade approval, and monitoring
+- **Server**: Everything runs on a VPS via Docker, always on
 
 ---
 
