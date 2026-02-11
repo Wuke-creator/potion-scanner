@@ -5,6 +5,7 @@ All operations are recorded in the TradeDatabase.
 """
 
 import logging
+import math
 from typing import Any
 
 from src.exchange.hyperliquid import HyperliquidClient
@@ -17,6 +18,16 @@ logger = logging.getLogger(__name__)
 
 class OrderSubmissionError(Exception):
     """Raised when an order fails to submit."""
+
+
+def _round_price(price: float, sig_figs: int = 5) -> float:
+    """Round a price to N significant figures (Hyperliquid uses 5)."""
+    if price == 0:
+        return 0.0
+    d = math.ceil(math.log10(abs(price)))
+    power = sig_figs - d
+    magnitude = 10 ** power
+    return round(price * magnitude) / magnitude
 
 
 def _extract_oid(result: dict) -> int | None:
@@ -286,11 +297,10 @@ class PositionManager:
         # Market close: sell if long, buy if short
         size = abs(pos["size"])
         is_buy = pos["size"] < 0  # buy to close short, sell to close long
-        # Use aggressive price for IOC
+        # Use aggressive price for IOC, rounded to 5 sig figs (Hyperliquid requirement)
         mids = self._client.get_all_mids()
         mid = float(mids.get(coin, 0))
-        # Set limit far from mid to ensure fill
-        limit_px = mid * 0.9 if not is_buy else mid * 1.1
+        limit_px = _round_price(mid * 0.9 if not is_buy else mid * 1.1)
 
         result = self._client.exchange.order(
             coin, is_buy, size, limit_px,
