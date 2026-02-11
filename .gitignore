@@ -180,6 +180,9 @@ config/config.yaml
 *.db
 data/
 
+# Encryption key
+data/.encryption_key
+
 # Logs
 logs/
 

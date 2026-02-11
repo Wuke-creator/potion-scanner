@@ -5,6 +5,9 @@ pyyaml
 python-dotenv
 aiosqlite
 structlog
+cryptography
+aiohttp
+discord.py
 
 # File watching
 watchdog
