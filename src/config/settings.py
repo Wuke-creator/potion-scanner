@@ -118,6 +118,7 @@ class RiskConfig:
     max_open_positions: int = 10
     max_daily_loss_pct: float = 10.0
     max_position_size_usd: float = 500.0
+    max_total_exposure_usd: float = 2000.0
     min_order_usd: float = 10.0
 
 

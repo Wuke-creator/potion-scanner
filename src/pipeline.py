@@ -28,7 +28,12 @@ from src.parser.update_parser import (
 )
 from src.state.database import TradeDatabase
 from src.state.models import TradeRecord, TradeStatus
-from src.strategy.position_sizer import PositionSizeError, calculate_position_size
+from src.strategy.position_sizer import (
+    PositionSizeError,
+    RiskLimitBreached,
+    calculate_position_size,
+    check_risk_limits,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,15 +103,6 @@ class Pipeline:
             logger.warning("Trade #%d already exists (status=%s), skipping", signal.trade_id, existing.status.value)
             return
 
-        # Check max open positions
-        open_trades = self._db.get_open_trades()
-        if len(open_trades) >= self._config.risk.max_open_positions:
-            logger.warning(
-                "Max open positions reached (%d/%d), skipping trade #%d",
-                len(open_trades), self._config.risk.max_open_positions, signal.trade_id,
-            )
-            return
-
         # Calculate position size
         balance = self._get_balance_usd()
         try:
@@ -116,6 +112,19 @@ class Pipeline:
             )
         except PositionSizeError as e:
             logger.warning("Skipping trade #%d: %s", signal.trade_id, e)
+            return
+
+        # Risk gate — check all limits before proceeding
+        try:
+            check_risk_limits(
+                risk_config=self._config.risk,
+                open_trade_count=len(self._db.get_open_trades()),
+                daily_pnl_pct=self._db.get_daily_closed_pnl(),
+                total_exposure_usd=self._db.get_total_open_exposure_usd(),
+                new_position_usd=position_size_usd,
+            )
+        except RiskLimitBreached as e:
+            logger.warning("Skipping trade #%d — risk limit: %s", signal.trade_id, e)
             return
 
         # Build orders

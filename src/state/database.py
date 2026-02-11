@@ -199,6 +199,36 @@ class TradeDatabase:
             "Trade #%d status -> %s (reason=%s)", trade_id, status.value, close_reason
         )
 
+    def get_daily_closed_pnl(self) -> float:
+        """Return the sum of pnl_pct for all trades closed today (UTC).
+
+        Only includes trades with a non-null pnl_pct and closed_at today.
+        Returns 0.0 if no trades were closed today.
+        """
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        row = self._conn.execute(
+            """SELECT COALESCE(SUM(pnl_pct), 0.0) AS total
+               FROM trades
+               WHERE user_id = ?
+                 AND status = 'closed'
+                 AND closed_at IS NOT NULL
+                 AND closed_at >= ?
+                 AND pnl_pct IS NOT NULL""",
+            (self._user_id, today),
+        ).fetchone()
+        return float(row["total"])
+
+    def get_total_open_exposure_usd(self) -> float:
+        """Return the total USD exposure across all open/pending trades."""
+        row = self._conn.execute(
+            """SELECT COALESCE(SUM(position_size_usd), 0.0) AS total
+               FROM trades
+               WHERE user_id = ?
+                 AND status IN ('pending', 'open')""",
+            (self._user_id,),
+        ).fetchone()
+        return float(row["total"])
+
     # ------------------------------------------------------------------
     # Order operations
     # ------------------------------------------------------------------

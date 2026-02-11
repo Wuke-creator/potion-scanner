@@ -1,10 +1,15 @@
-"""Position size calculator.
+"""Position size calculator and risk gate.
 
 Determines how much USD to allocate per trade based on:
   1. Account balance
   2. Strategy preset (size_pct)
   3. Risk level override (size_by_risk)
   4. Risk limits (max_position_size_usd, min_order_usd)
+
+Also provides check_risk_limits() as a pre-trade gate that enforces:
+  - Max open positions
+  - Daily loss circuit breaker
+  - Total exposure cap
 """
 
 import logging
@@ -16,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 class PositionSizeError(Exception):
     """Raised when a valid position size cannot be calculated."""
+
+
+class RiskLimitBreached(Exception):
+    """Raised when a risk guardrail blocks a new trade."""
 
 
 def calculate_position_size(
@@ -72,3 +81,48 @@ def calculate_position_size(
     )
 
     return clamped_size
+
+
+def check_risk_limits(
+    risk_config: RiskConfig,
+    open_trade_count: int,
+    daily_pnl_pct: float,
+    total_exposure_usd: float,
+    new_position_usd: float,
+) -> None:
+    """Pre-trade risk gate — raises RiskLimitBreached if any limit is hit.
+
+    Call this before opening any new trade. All checks are independent;
+    the first breach raises immediately.
+
+    Args:
+        risk_config: Risk limits from config.
+        open_trade_count: Current number of open/pending trades.
+        daily_pnl_pct: Sum of pnl_pct for trades closed today (negative = losses).
+        total_exposure_usd: Current total USD across all open/pending positions.
+        new_position_usd: The proposed new position size in USD.
+
+    Raises:
+        RiskLimitBreached: With a human-readable reason.
+    """
+    # 1. Max open positions
+    if open_trade_count >= risk_config.max_open_positions:
+        raise RiskLimitBreached(
+            f"Max open positions reached ({open_trade_count}/{risk_config.max_open_positions})"
+        )
+
+    # 2. Daily loss circuit breaker
+    if daily_pnl_pct <= -risk_config.max_daily_loss_pct:
+        raise RiskLimitBreached(
+            f"Daily loss limit breached ({daily_pnl_pct:.1f}% vs "
+            f"-{risk_config.max_daily_loss_pct:.1f}% max)"
+        )
+
+    # 3. Total exposure cap
+    projected_exposure = total_exposure_usd + new_position_usd
+    if projected_exposure > risk_config.max_total_exposure_usd:
+        raise RiskLimitBreached(
+            f"Total exposure would be ${projected_exposure:.2f} "
+            f"(${total_exposure_usd:.2f} existing + ${new_position_usd:.2f} new), "
+            f"exceeds max ${risk_config.max_total_exposure_usd:.2f}"
+        )

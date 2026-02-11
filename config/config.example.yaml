@@ -46,8 +46,9 @@ strategy:
 # --- Risk management ---
 risk:
   max_open_positions: 10           # max concurrent trades
-  max_daily_loss_pct: 10.0         # stop trading if daily loss exceeds this %
-  max_position_size_usd: 500       # absolute max USD per position
+  max_daily_loss_pct: 10.0         # circuit breaker: stop trading if daily loss exceeds this %
+  max_position_size_usd: 500       # absolute max USD per single position
+  max_total_exposure_usd: 2000     # max total USD across all open positions combined
   min_order_usd: 10.0              # Hyperliquid minimum order value
 
 # --- State persistence ---
