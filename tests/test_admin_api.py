@@ -47,6 +47,7 @@ async def api_client(user_db):
     """Create a test client for the admin API."""
     activated = []
     deactivated = []
+    kill_results = {}
 
     async def on_activate(user_id):
         activated.append(user_id)
@@ -54,10 +55,18 @@ async def api_client(user_db):
     async def on_deactivate(user_id):
         deactivated.append(user_id)
 
+    async def on_kill():
+        return kill_results
+
+    async def on_resume():
+        pass
+
     admin = AdminAPI(
         user_db=user_db,
         on_user_activate=on_activate,
         on_user_deactivate=on_deactivate,
+        on_kill=on_kill,
+        on_resume=on_resume,
     )
     server = TestServer(admin._app)
     client = TestClient(server)
@@ -304,3 +313,29 @@ class TestActivateDeactivate:
     async def test_deactivate_nonexistent(self, api_client):
         resp = await api_client.post("/api/users/nobody/deactivate", headers=_headers())
         assert resp.status == 404
+
+
+class TestKillSwitch:
+    @pytest.mark.asyncio
+    async def test_kill_endpoint(self, api_client):
+        resp = await api_client.post("/api/kill", headers=_headers())
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["status"] == "killed"
+
+    @pytest.mark.asyncio
+    async def test_resume_endpoint(self, api_client):
+        resp = await api_client.post("/api/resume", headers=_headers())
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["status"] == "resumed"
+
+    @pytest.mark.asyncio
+    async def test_kill_requires_auth(self, api_client):
+        resp = await api_client.post("/api/kill")
+        assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_resume_requires_auth(self, api_client):
+        resp = await api_client.post("/api/resume")
+        assert resp.status == 401

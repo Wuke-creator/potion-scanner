@@ -41,10 +41,15 @@ class Orchestrator:
         self._global_config = global_config
         self._user_db = user_db
         self._pipelines: dict[str, UserPipelineContext] = {}
+        self._killed = False
 
     @property
     def pipelines(self) -> dict[str, UserPipelineContext]:
         return self._pipelines
+
+    @property
+    def killed(self) -> bool:
+        return self._killed
 
     def start(self) -> None:
         """Load all active users from DB and create pipeline contexts.
@@ -121,8 +126,12 @@ class Orchestrator:
         """Fan out a signal to all active pipelines.
 
         Each pipeline is called in a try/except so one user's error
-        doesn't crash others.
+        doesn't crash others. Blocked when kill switch is active.
         """
+        if self._killed:
+            logger.warning("Kill switch active — message ignored")
+            return
+
         if not self._pipelines:
             logger.warning("No active pipelines — message ignored")
             return
@@ -135,6 +144,54 @@ class Orchestrator:
 
         if health_server:
             health_server.record_message()
+
+    def kill_all(self) -> dict[str, dict]:
+        """Emergency kill switch — cancel all orders and close all positions.
+
+        Sets the killed flag to block further signal processing, then
+        iterates all active pipelines and attempts to close everything.
+
+        Returns:
+            Dict of user_id -> {canceled: int, closed: int, errors: list[str]}
+        """
+        self._killed = True
+        logger.critical("KILL SWITCH ACTIVATED — canceling orders and closing positions for all users")
+
+        results: dict[str, dict] = {}
+
+        for user_id, ctx in self._pipelines.items():
+            user_result: dict = {"canceled": 0, "closed": 0, "errors": []}
+            try:
+                pm = PositionManager(ctx.client, ctx.db)
+
+                # Cancel all open orders for open trades
+                open_trades = ctx.db.get_open_trades()
+                for trade in open_trades:
+                    try:
+                        pm.close_position(trade.trade_id, trade.coin, reason="kill_switch")
+                        user_result["closed"] += 1
+                    except Exception as e:
+                        err = f"Failed to close trade #{trade.trade_id} ({trade.coin}): {e}"
+                        logger.error("Kill switch — user %s: %s", user_id, err)
+                        user_result["errors"].append(err)
+
+            except Exception as e:
+                err = f"Kill switch failed for user {user_id}: {e}"
+                logger.error(err)
+                user_result["errors"].append(err)
+
+            results[user_id] = user_result
+            logger.info(
+                "Kill switch — user %s: closed %d positions, %d errors",
+                user_id, user_result["closed"], len(user_result["errors"]),
+            )
+
+        return results
+
+    def resume(self) -> None:
+        """Resume signal processing after a kill switch activation."""
+        self._killed = False
+        logger.warning("Kill switch deactivated — signal processing resumed")
 
     def stop(self) -> None:
         """Shut down all user pipelines."""

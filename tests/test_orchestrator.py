@@ -12,6 +12,8 @@ from src.config.settings import Config, ExchangeConfig
 from src.crypto import reset_fernet
 from src.health import HealthServer
 from src.orchestrator import Orchestrator, UserPipelineContext
+from src.state.database import TradeDatabase
+from src.state.models import TradeRecord, TradeStatus
 from src.state.user_db import UserDatabase
 
 SAMPLE_CREDS = {
@@ -224,6 +226,111 @@ class TestEnvFallback:
         assert len(orch.pipelines) == 0
         orch.stop()
         user_db.close()
+
+
+class TestKillSwitch:
+    def test_kill_blocks_dispatch(self, global_config, user_db):
+        orch = Orchestrator(global_config, user_db)
+        pipeline = MagicMock()
+        orch._pipelines["u1"] = UserPipelineContext(
+            user_id="u1", config=global_config, client=MagicMock(),
+            db=MagicMock(), pipeline=pipeline,
+        )
+
+        orch._killed = True
+        orch.dispatch("test signal")
+
+        pipeline.process_message.assert_not_called()
+
+    def test_kill_all_sets_flag(self, global_config, user_db):
+        orch = Orchestrator(global_config, user_db)
+        mock_db = MagicMock()
+        mock_db.get_open_trades.return_value = []
+        orch._pipelines["u1"] = UserPipelineContext(
+            user_id="u1", config=global_config, client=MagicMock(),
+            db=mock_db, pipeline=MagicMock(),
+        )
+
+        assert not orch.killed
+        orch.kill_all()
+        assert orch.killed
+
+    def test_kill_all_closes_positions(self, global_config, user_db):
+        orch = Orchestrator(global_config, user_db)
+
+        mock_trade = MagicMock()
+        mock_trade.trade_id = 1
+        mock_trade.coin = "BTC"
+
+        mock_db = MagicMock()
+        mock_db.get_open_trades.return_value = [mock_trade]
+
+        mock_client = MagicMock()
+
+        orch._pipelines["u1"] = UserPipelineContext(
+            user_id="u1", config=global_config, client=mock_client,
+            db=mock_db, pipeline=MagicMock(),
+        )
+
+        with patch("src.orchestrator.PositionManager") as MockPM:
+            results = orch.kill_all()
+
+        assert results["u1"]["closed"] == 1
+        assert orch.killed
+
+    def test_kill_all_error_isolation(self, global_config, user_db):
+        """One user's close failure shouldn't prevent other users from being processed."""
+        orch = Orchestrator(global_config, user_db)
+
+        mock_trade = MagicMock()
+        mock_trade.trade_id = 1
+        mock_trade.coin = "BTC"
+
+        # User 1 — will fail
+        mock_db1 = MagicMock()
+        mock_db1.get_open_trades.return_value = [mock_trade]
+        # User 2 — no open trades
+        mock_db2 = MagicMock()
+        mock_db2.get_open_trades.return_value = []
+
+        orch._pipelines["u1"] = UserPipelineContext(
+            user_id="u1", config=global_config, client=MagicMock(),
+            db=mock_db1, pipeline=MagicMock(),
+        )
+        orch._pipelines["u2"] = UserPipelineContext(
+            user_id="u2", config=global_config, client=MagicMock(),
+            db=mock_db2, pipeline=MagicMock(),
+        )
+
+        with patch("src.orchestrator.PositionManager") as MockPM:
+            pm_instance = MockPM.return_value
+            pm_instance.close_position.side_effect = RuntimeError("exchange down")
+            results = orch.kill_all()
+
+        assert len(results["u1"]["errors"]) == 1
+        assert "u2" in results
+
+    def test_resume_clears_flag(self, global_config, user_db):
+        orch = Orchestrator(global_config, user_db)
+        orch._killed = True
+        orch.resume()
+        assert not orch.killed
+
+    def test_resume_allows_dispatch(self, global_config, user_db):
+        orch = Orchestrator(global_config, user_db)
+        pipeline = MagicMock()
+        orch._pipelines["u1"] = UserPipelineContext(
+            user_id="u1", config=global_config, client=MagicMock(),
+            db=MagicMock(), pipeline=pipeline,
+        )
+
+        orch._killed = True
+        orch.dispatch("blocked")
+        pipeline.process_message.assert_not_called()
+
+        orch.resume()
+        orch.dispatch("allowed")
+        pipeline.process_message.assert_called_once_with("allowed")
 
 
 class TestStop:

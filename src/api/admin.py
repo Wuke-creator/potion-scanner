@@ -15,6 +15,8 @@ from src.state.user_db import UserDatabase
 logger = logging.getLogger(__name__)
 
 OnUserCallback = Callable[[str], Awaitable[None]]
+OnKillCallback = Callable[[], Awaitable[dict]]
+OnResumeCallback = Callable[[], Awaitable[None]]
 
 
 @web.middleware
@@ -48,11 +50,15 @@ class AdminAPI:
         user_db: UserDatabase,
         on_user_activate: OnUserCallback | None = None,
         on_user_deactivate: OnUserCallback | None = None,
+        on_kill: OnKillCallback | None = None,
+        on_resume: OnResumeCallback | None = None,
         port: int | None = None,
     ):
         self._user_db = user_db
         self._on_user_activate = on_user_activate
         self._on_user_deactivate = on_user_deactivate
+        self._on_kill = on_kill
+        self._on_resume = on_resume
         self._port = port or int(os.getenv("ADMIN_API_PORT", "8081"))
         self._runner: web.AppRunner | None = None
         self._app = self._build_app()
@@ -66,6 +72,8 @@ class AdminAPI:
         app.router.add_delete("/api/users/{user_id}", self._deactivate_user)
         app.router.add_post("/api/users/{user_id}/activate", self._activate_user)
         app.router.add_post("/api/users/{user_id}/deactivate", self._deactivate_user)
+        app.router.add_post("/api/kill", self._kill)
+        app.router.add_post("/api/resume", self._resume)
         return app
 
     async def start(self) -> None:
@@ -217,3 +225,29 @@ class AdminAPI:
                 logger.error("Deactivation callback failed for %s: %s", user_id, e)
 
         return web.json_response({"status": "inactive", "user_id": user_id})
+
+    async def _kill(self, request: web.Request) -> web.Response:
+        """POST /api/kill — Emergency kill switch: cancel orders and close all positions."""
+        if not self._on_kill:
+            raise web.HTTPServiceUnavailable(text="Kill switch not configured")
+
+        try:
+            results = await self._on_kill()
+        except Exception as e:
+            logger.error("Kill switch error: %s", e)
+            raise web.HTTPInternalServerError(text=f"Kill switch error: {e}")
+
+        return web.json_response({"status": "killed", "results": results})
+
+    async def _resume(self, request: web.Request) -> web.Response:
+        """POST /api/resume — Resume signal processing after kill switch."""
+        if not self._on_resume:
+            raise web.HTTPServiceUnavailable(text="Resume not configured")
+
+        try:
+            await self._on_resume()
+        except Exception as e:
+            logger.error("Resume error: %s", e)
+            raise web.HTTPInternalServerError(text=f"Resume error: {e}")
+
+        return web.json_response({"status": "resumed"})

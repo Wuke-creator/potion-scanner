@@ -3,6 +3,7 @@
 import json
 import logging
 from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from src.utils.logger import setup_logging
@@ -78,3 +79,17 @@ class TestStructuredLogging:
         content = log_file.read_text()
         assert "ValueError" in content
         assert "boom" in content
+
+    def test_file_handler_is_rotating(self, tmp_path):
+        log_file = tmp_path / "test.log"
+        config = FakeLoggingConfig(file=str(log_file), format="json")
+        setup_logging(config)
+
+        root = logging.getLogger()
+        file_handlers = [
+            h for h in root.handlers if isinstance(h, RotatingFileHandler)
+        ]
+        assert len(file_handlers) == 1
+        handler = file_handlers[0]
+        assert handler.maxBytes == 10 * 1024 * 1024  # 10 MB
+        assert handler.backupCount == 5

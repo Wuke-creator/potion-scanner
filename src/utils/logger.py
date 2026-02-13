@@ -7,6 +7,7 @@ structured JSON (or colored console) with zero code changes.
 
 import logging
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import structlog
@@ -51,10 +52,12 @@ def setup_logging(logging_config) -> None:
         )
     )
 
-    # File handler
+    # File handler with rotation (10 MB per file, keep 5 backups)
     log_path = Path(logging_config.file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.FileHandler(log_path)
+    file_handler = RotatingFileHandler(
+        log_path, maxBytes=10 * 1024 * 1024, backupCount=5,
+    )
     file_handler.setFormatter(
         structlog.stdlib.ProcessorFormatter(
             processors=[

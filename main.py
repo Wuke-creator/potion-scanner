@@ -48,6 +48,8 @@ async def run(config: Config) -> None:
         user_db=user_db,
         on_user_activate=_make_activate_callback(orchestrator),
         on_user_deactivate=_make_deactivate_callback(orchestrator),
+        on_kill=_make_kill_callback(orchestrator),
+        on_resume=_make_resume_callback(orchestrator),
     )
     await admin_api.start()
 
@@ -116,6 +118,20 @@ def _make_deactivate_callback(orchestrator: Orchestrator):
     """Create an async callback for user deactivation."""
     async def callback(user_id: str) -> None:
         orchestrator.deactivate_user(user_id)
+    return callback
+
+
+def _make_kill_callback(orchestrator: Orchestrator):
+    """Create an async callback for the kill switch."""
+    async def callback() -> dict:
+        return orchestrator.kill_all()
+    return callback
+
+
+def _make_resume_callback(orchestrator: Orchestrator):
+    """Create an async callback to resume after kill switch."""
+    async def callback() -> None:
+        orchestrator.resume()
     return callback
 
 
