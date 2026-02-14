@@ -1,13 +1,14 @@
 """Per-user config and credential storage.
 
-Manages three tables (users, user_credentials, user_config) in the same
-SQLite database as TradeDatabase. Credentials are Fernet-encrypted at rest.
+Manages four tables (users, user_credentials, user_config, invite_codes) in
+the same SQLite database as TradeDatabase. Credentials are Fernet-encrypted
+at rest.
 """
 
 import json
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
-    return datetime.utcnow().isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 _USERS_DDL = """\
@@ -63,8 +64,24 @@ CREATE TABLE IF NOT EXISTS user_config (
     max_position_size_usd  REAL NOT NULL DEFAULT 500.0,
     max_total_exposure_usd REAL NOT NULL DEFAULT 2000.0,
     min_order_usd          REAL NOT NULL DEFAULT 10.0,
+    telegram_chat_id       INTEGER,
+    invite_code            TEXT,
+    access_expires_at      TEXT,
     created_at             TEXT NOT NULL,
     updated_at             TEXT NOT NULL
+);
+"""
+
+_INVITE_CODES_DDL = """\
+CREATE TABLE IF NOT EXISTS invite_codes (
+    code            TEXT PRIMARY KEY,
+    created_by      TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    duration_days   INTEGER,
+    redeemed_by     TEXT,
+    redeemed_at     TEXT,
+    expires_at      TEXT,
+    status          TEXT NOT NULL DEFAULT 'active'
 );
 """
 
@@ -101,6 +118,8 @@ class UserDatabase:
             self._conn.execute(_USERS_DDL)
             self._conn.execute(_USER_CREDENTIALS_DDL)
             self._conn.execute(_USER_CONFIG_DDL)
+            self._conn.execute(_INVITE_CODES_DDL)
+            self._migrate_user_config()
 
     # ------------------------------------------------------------------
     # User CRUD
@@ -400,6 +419,266 @@ class UserDatabase:
             health=global_config.health,
             discord=global_config.discord,
         )
+
+    # ------------------------------------------------------------------
+    # Migrations
+    # ------------------------------------------------------------------
+
+    def _migrate_user_config(self) -> None:
+        """Add new columns to user_config if they don't exist (for existing DBs)."""
+        cursor = self._conn.execute("PRAGMA table_info(user_config)")
+        existing = {row[1] for row in cursor.fetchall()}
+        migrations = {
+            "telegram_chat_id": "ALTER TABLE user_config ADD COLUMN telegram_chat_id INTEGER",
+            "invite_code": "ALTER TABLE user_config ADD COLUMN invite_code TEXT",
+            "access_expires_at": "ALTER TABLE user_config ADD COLUMN access_expires_at TEXT",
+        }
+        for col, sql in migrations.items():
+            if col not in existing:
+                self._conn.execute(sql)
+                logger.info("Migrated user_config: added column %s", col)
+
+    # ------------------------------------------------------------------
+    # Telegram chat ID
+    # ------------------------------------------------------------------
+
+    def set_telegram_chat_id(self, user_id: str, chat_id: int) -> None:
+        """Store the Telegram chat ID for a user."""
+        now = _now()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE user_config SET telegram_chat_id = ?, updated_at = ? WHERE user_id = ?",
+                (chat_id, now, user_id),
+            )
+
+    def get_telegram_chat_id(self, user_id: str) -> int | None:
+        """Get the Telegram chat ID for a user."""
+        row = self._conn.execute(
+            "SELECT telegram_chat_id FROM user_config WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if not row or row["telegram_chat_id"] is None:
+            return None
+        return row["telegram_chat_id"]
+
+    def get_user_by_telegram_chat_id(self, chat_id: int) -> str | None:
+        """Look up user_id by Telegram chat ID. Returns None if not found."""
+        row = self._conn.execute(
+            "SELECT user_id FROM user_config WHERE telegram_chat_id = ?", (chat_id,)
+        ).fetchone()
+        return row["user_id"] if row else None
+
+    def get_all_telegram_chat_ids(self) -> list[int]:
+        """Get all Telegram chat IDs for active users."""
+        rows = self._conn.execute(
+            "SELECT uc.telegram_chat_id FROM user_config uc "
+            "JOIN users u ON u.user_id = uc.user_id "
+            "WHERE u.status = 'active' AND uc.telegram_chat_id IS NOT NULL"
+        ).fetchall()
+        return [row["telegram_chat_id"] for row in rows]
+
+    # ------------------------------------------------------------------
+    # Invite codes
+    # ------------------------------------------------------------------
+
+    def create_invite_code(
+        self, code: str, created_by: str, duration_days: int | None = None
+    ) -> dict[str, Any]:
+        """Store a new invite code.
+
+        Args:
+            code: The invite code string (e.g. PPB-XXXX-XXXX).
+            created_by: Admin identifier who generated the code.
+            duration_days: Number of days the code grants access. None = unlimited.
+
+        Returns:
+            Dict with the code record fields.
+        """
+        now = _now()
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO invite_codes (code, created_by, created_at, duration_days, status) "
+                "VALUES (?, ?, ?, ?, 'active')",
+                (code, created_by, now, duration_days),
+            )
+        logger.info("Created invite code %s (duration=%s days)", code, duration_days)
+        return {
+            "code": code,
+            "created_by": created_by,
+            "created_at": now,
+            "duration_days": duration_days,
+            "status": "active",
+        }
+
+    def validate_invite_code(self, code: str) -> dict[str, Any]:
+        """Validate an invite code.
+
+        Returns:
+            Dict with 'valid' (bool) and 'reason' (str) keys.
+            If valid, also includes the code record.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM invite_codes WHERE code = ?", (code,)
+        ).fetchone()
+
+        if not row:
+            return {"valid": False, "reason": "Code not found"}
+
+        if row["status"] == "redeemed":
+            return {"valid": False, "reason": "Code already redeemed"}
+
+        if row["status"] == "revoked":
+            return {"valid": False, "reason": "Code has been revoked"}
+
+        if row["status"] == "expired":
+            return {"valid": False, "reason": "Code has expired"}
+
+        return {
+            "valid": True,
+            "reason": "Valid",
+            "code": row["code"],
+            "duration_days": row["duration_days"],
+            "created_by": row["created_by"],
+        }
+
+    def redeem_invite_code(self, code: str, user_id: str) -> str | None:
+        """Redeem an invite code for a user.
+
+        Sets the code status to 'redeemed', calculates expiry, and stores
+        the invite_code and access_expires_at on the user's config.
+
+        Returns:
+            The access_expires_at ISO string, or None if unlimited.
+        """
+        now = _now()
+        row = self._conn.execute(
+            "SELECT * FROM invite_codes WHERE code = ?", (code,)
+        ).fetchone()
+        if not row:
+            raise ValueError(f"Invite code {code} not found")
+
+        duration_days = row["duration_days"]
+        expires_at = None
+        if duration_days is not None:
+            expires_at = (
+                datetime.now(timezone.utc) + timedelta(days=duration_days)
+            ).isoformat()
+
+        with self._conn:
+            # Mark code as redeemed
+            self._conn.execute(
+                "UPDATE invite_codes SET redeemed_by = ?, redeemed_at = ?, "
+                "expires_at = ?, status = 'redeemed' WHERE code = ?",
+                (user_id, now, expires_at, code),
+            )
+            # Store on user config
+            self._conn.execute(
+                "UPDATE user_config SET invite_code = ?, access_expires_at = ?, "
+                "updated_at = ? WHERE user_id = ?",
+                (code, expires_at, now, user_id),
+            )
+
+        logger.info("Redeemed invite code %s for user %s (expires=%s)", code, user_id, expires_at)
+        return expires_at
+
+    def list_invite_codes(self, status: str | None = None) -> list[dict[str, Any]]:
+        """List invite codes, optionally filtered by status."""
+        if status:
+            rows = self._conn.execute(
+                "SELECT * FROM invite_codes WHERE status = ? ORDER BY created_at DESC",
+                (status,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM invite_codes ORDER BY created_at DESC"
+            ).fetchall()
+
+        return [
+            {
+                "code": r["code"],
+                "created_by": r["created_by"],
+                "created_at": r["created_at"],
+                "duration_days": r["duration_days"],
+                "redeemed_by": r["redeemed_by"],
+                "redeemed_at": r["redeemed_at"],
+                "expires_at": r["expires_at"],
+                "status": r["status"],
+            }
+            for r in rows
+        ]
+
+    def revoke_invite_code(self, code: str) -> bool:
+        """Revoke an unused invite code. Returns True if revoked, False if not found or already used."""
+        row = self._conn.execute(
+            "SELECT status FROM invite_codes WHERE code = ?", (code,)
+        ).fetchone()
+
+        if not row:
+            return False
+        if row["status"] != "active":
+            return False
+
+        with self._conn:
+            self._conn.execute(
+                "UPDATE invite_codes SET status = 'revoked' WHERE code = ?",
+                (code,),
+            )
+        logger.info("Revoked invite code %s", code)
+        return True
+
+    # ------------------------------------------------------------------
+    # Access expiry
+    # ------------------------------------------------------------------
+
+    def get_access_expiry(self, user_id: str) -> str | None:
+        """Get access expiry timestamp for a user. None = unlimited."""
+        row = self._conn.execute(
+            "SELECT access_expires_at FROM user_config WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return row["access_expires_at"]
+
+    def get_expired_users(self) -> list[str]:
+        """Return user_ids whose access has expired."""
+        now = _now()
+        rows = self._conn.execute(
+            "SELECT uc.user_id FROM user_config uc "
+            "JOIN users u ON u.user_id = uc.user_id "
+            "WHERE uc.access_expires_at IS NOT NULL "
+            "AND uc.access_expires_at < ? "
+            "AND u.status = 'active'",
+            (now,),
+        ).fetchall()
+        return [row["user_id"] for row in rows]
+
+    def extend_user_access(self, user_id: str, days: int) -> str:
+        """Extend a user's access by N days from now.
+
+        Returns:
+            The new access_expires_at ISO string.
+        """
+        new_expiry = (
+            datetime.now(timezone.utc) + timedelta(days=days)
+        ).isoformat()
+        now = _now()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE user_config SET access_expires_at = ?, updated_at = ? WHERE user_id = ?",
+                (new_expiry, now, user_id),
+            )
+        logger.info("Extended access for user %s to %s", user_id, new_expiry)
+        return new_expiry
+
+    def revoke_user_access(self, user_id: str) -> None:
+        """Revoke a user's access by setting expiry to now."""
+        now = _now()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE user_config SET access_expires_at = ?, updated_at = ? WHERE user_id = ?",
+                (now, now, user_id),
+            )
+        self.set_user_status(user_id, "inactive")
+        logger.info("Revoked access for user %s", user_id)
 
     def close(self) -> None:
         """Close the database connection."""

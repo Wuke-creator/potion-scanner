@@ -156,6 +156,14 @@ class DiscordConfig:
 
 
 @dataclass
+class TelegramConfig:
+    """Telegram bot settings."""
+
+    bot_token: str = ""
+    admin_ids: list[int] = field(default_factory=list)
+
+
+@dataclass
 class Config:
     """Top-level configuration — single source of truth for all bot settings."""
 
@@ -167,6 +175,7 @@ class Config:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
+    telegram: TelegramConfig = field(default_factory=TelegramConfig)
 
     def get_active_preset(self) -> StrategyPreset:
         """Resolve the currently active strategy preset.
@@ -284,6 +293,10 @@ def load_config(
             channel_id=yaml_data.get("discord", {}).get("channel_id", ""),
             source_bot_name=yaml_data.get("discord", {}).get("source_bot_name", "Potion Perps"),
         ),
+        telegram=TelegramConfig(
+            bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
+            admin_ids=_parse_admin_ids(os.getenv("TELEGRAM_ADMIN_IDS", "")),
+        ),
     )
 
     _validate(config)
@@ -297,6 +310,18 @@ def load_config(
     )
 
     return config
+
+
+def _parse_admin_ids(raw: str) -> list[int]:
+    """Parse comma-separated Telegram admin IDs from env var."""
+    if not raw.strip():
+        return []
+    ids = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.append(int(part))
+    return ids
 
 
 def _build_dataclass(cls, data: dict):

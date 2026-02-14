@@ -53,6 +53,21 @@ async def run(config: Config) -> None:
     )
     await admin_api.start()
 
+    # --- Start Telegram bot (if token configured) ---
+    telegram_bot = None
+    if config.telegram.bot_token:
+        from src.telegram.bot import TelegramBot
+        telegram_bot = TelegramBot(
+            token=config.telegram.bot_token,
+            user_db=user_db,
+            config=config,
+            orchestrator=orchestrator,
+        )
+        await telegram_bot.start()
+        logger.info("Telegram bot started")
+    else:
+        logger.info("Telegram bot disabled (no TELEGRAM_BOT_TOKEN in .env)")
+
     # --- Select input adapter ---
     adapter_name = config.input.adapter
     if adapter_name == "cli":
@@ -100,6 +115,8 @@ async def run(config: Config) -> None:
             await adapter_task
         except asyncio.CancelledError:
             pass
+        if telegram_bot:
+            await telegram_bot.stop()
         await admin_api.stop()
         await health_server.stop()
         orchestrator.stop()

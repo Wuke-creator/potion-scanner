@@ -1,0 +1,273 @@
+"""Trade view handlers — /trades, /history, /stats."""
+
+import logging
+from typing import Any
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ContextTypes
+
+from src.orchestrator import Orchestrator
+from src.state.models import TradeRecord, TradeStatus
+from src.state.user_db import UserDatabase
+from src.telegram.middleware import registered_only
+
+logger = logging.getLogger(__name__)
+
+TRADES_PER_PAGE = 5
+
+
+def _get_trade_db(context: ContextTypes.DEFAULT_TYPE, user_id: str):
+    """Get the TradeDatabase for a user from the orchestrator."""
+    orchestrator: Orchestrator | None = context.bot_data.get("orchestrator")
+    if not orchestrator:
+        return None
+    ctx = orchestrator.pipelines.get(user_id)
+    return ctx.db if ctx else None
+
+
+def _format_trade_summary(t: TradeRecord) -> str:
+    """Format a single trade as a compact summary line."""
+    status_icon = {
+        "pending": "⏳",
+        "open": "🟢",
+        "closed": "✅",
+        "canceled": "🚫",
+        "preparing": "📝",
+    }.get(t.status.value, "❓")
+
+    pnl_text = ""
+    if t.pnl_pct is not None:
+        sign = "+" if t.pnl_pct >= 0 else ""
+        pnl_text = f" | {sign}{t.pnl_pct:.1f}%"
+
+    return (
+        f"{status_icon} *#{t.trade_id}* {t.coin} {t.side}\n"
+        f"  Entry: {t.entry_price} | SL: {t.stop_loss} | Lev: {t.leverage}x{pnl_text}"
+    )
+
+
+def _format_trade_detail(t: TradeRecord) -> str:
+    """Format full trade detail view."""
+    status_icon = {
+        "pending": "⏳ Pending",
+        "open": "🟢 Open",
+        "closed": "✅ Closed",
+        "canceled": "🚫 Canceled",
+        "preparing": "📝 Preparing",
+    }.get(t.status.value, t.status.value)
+
+    lines = [
+        f"*Trade #{t.trade_id} — {t.coin} {t.side}*\n",
+        f"Status: {status_icon}",
+        f"Pair: {t.pair}",
+        f"Type: {t.trade_type} | Risk: {t.risk_level}",
+        f"Leverage: {t.leverage}x (signal: {t.signal_leverage}x)",
+        f"Size: ${t.position_size_usd:,.2f} ({t.position_size_coin} {t.coin})\n",
+        f"*Prices*",
+        f"Entry: {t.entry_price}",
+        f"Stop Loss: {t.stop_loss}",
+        f"TP1: {t.tp1}",
+        f"TP2: {t.tp2}",
+        f"TP3: {t.tp3}",
+    ]
+
+    if t.pnl_pct is not None:
+        sign = "+" if t.pnl_pct >= 0 else ""
+        lines.append(f"\nPnL: {sign}{t.pnl_pct:.2f}%")
+
+    if t.close_reason:
+        lines.append(f"Close Reason: {t.close_reason}")
+
+    if t.created_at:
+        lines.append(f"\nOpened: {str(t.created_at)[:19]}")
+    if t.closed_at:
+        lines.append(f"Closed: {str(t.closed_at)[:19]}")
+
+    return "\n".join(lines)
+
+
+def _pagination_keyboard(prefix: str, page: int, total_pages: int) -> InlineKeyboardMarkup | None:
+    """Build pagination buttons if needed."""
+    if total_pages <= 1:
+        return None
+
+    buttons = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton("< Prev", callback_data=f"{prefix}:{page - 1}"))
+    buttons.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        buttons.append(InlineKeyboardButton("Next >", callback_data=f"{prefix}:{page + 1}"))
+    return InlineKeyboardMarkup([buttons])
+
+
+def _format_trade_list(trades: list[TradeRecord], page: int, title: str) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Format a paginated list of trades."""
+    if not trades:
+        return f"*{title}*\n\nNo trades found.", None
+
+    total_pages = (len(trades) + TRADES_PER_PAGE - 1) // TRADES_PER_PAGE
+    page = max(0, min(page, total_pages - 1))
+    start = page * TRADES_PER_PAGE
+    page_trades = trades[start:start + TRADES_PER_PAGE]
+
+    lines = [f"*{title}*\n"]
+    for t in page_trades:
+        lines.append(_format_trade_summary(t))
+
+    # Add trade detail buttons
+    detail_buttons = [
+        InlineKeyboardButton(f"#{t.trade_id}", callback_data=f"trade:{t.trade_id}")
+        for t in page_trades
+    ]
+    # Split into rows of 5
+    keyboard_rows = [detail_buttons[i:i + 5] for i in range(0, len(detail_buttons), 5)]
+
+    # Pagination row
+    if total_pages > 1:
+        nav_buttons = []
+        prefix = "trades_page" if title == "Active Trades" else "history_page"
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton("< Prev", callback_data=f"{prefix}:{page - 1}"))
+        nav_buttons.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav_buttons.append(InlineKeyboardButton("Next >", callback_data=f"{prefix}:{page + 1}"))
+        keyboard_rows.append(nav_buttons)
+
+    keyboard = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
+    return "\n\n".join(lines), keyboard
+
+
+@registered_only
+async def trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /trades — list active trades (pending + open)."""
+    user_id = context.user_data["user_id"]
+    trade_db = _get_trade_db(context, user_id)
+
+    if not trade_db:
+        await update.message.reply_text(
+            "Your trading pipeline is not active. Use /activate or contact admin."
+        )
+        return
+
+    trades = trade_db.get_open_trades()
+    text, keyboard = _format_trade_list(trades, 0, "Active Trades")
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+@registered_only
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /history — list recently closed trades."""
+    user_id = context.user_data["user_id"]
+    trade_db = _get_trade_db(context, user_id)
+
+    if not trade_db:
+        await update.message.reply_text(
+            "Your trading pipeline is not active. Use /activate or contact admin."
+        )
+        return
+
+    closed = trade_db.get_trades_by_status(TradeStatus.CLOSED)
+    # Most recent first
+    closed.sort(key=lambda t: t.closed_at or t.updated_at, reverse=True)
+    text, keyboard = _format_trade_list(closed, 0, "Trade History")
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+@registered_only
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /stats — trading performance summary."""
+    user_id = context.user_data["user_id"]
+    trade_db = _get_trade_db(context, user_id)
+
+    if not trade_db:
+        await update.message.reply_text(
+            "Your trading pipeline is not active. Use /activate or contact admin."
+        )
+        return
+
+    closed = trade_db.get_trades_by_status(TradeStatus.CLOSED)
+    open_trades = trade_db.get_open_trades()
+
+    if not closed and not open_trades:
+        await update.message.reply_text("*Trading Stats*\n\nNo trades yet.", parse_mode="Markdown")
+        return
+
+    total = len(closed)
+    wins = sum(1 for t in closed if t.pnl_pct is not None and t.pnl_pct > 0)
+    losses = sum(1 for t in closed if t.pnl_pct is not None and t.pnl_pct < 0)
+    breakeven = sum(1 for t in closed if t.pnl_pct is not None and t.pnl_pct == 0)
+
+    pnls = [t.pnl_pct for t in closed if t.pnl_pct is not None]
+    total_pnl = sum(pnls) if pnls else 0
+    avg_pnl = total_pnl / len(pnls) if pnls else 0
+    best = max(pnls) if pnls else 0
+    worst = min(pnls) if pnls else 0
+    win_rate = (wins / total * 100) if total > 0 else 0
+
+    text = (
+        f"*Trading Stats*\n\n"
+        f"*Overview*\n"
+        f"Total Closed: {total}\n"
+        f"Currently Open: {len(open_trades)}\n"
+        f"Win Rate: {win_rate:.1f}%\n\n"
+        f"*Results*\n"
+        f"Wins: {wins} | Losses: {losses} | BE: {breakeven}\n"
+        f"Total PnL: {'+' if total_pnl >= 0 else ''}{total_pnl:.2f}%\n"
+        f"Avg PnL: {'+' if avg_pnl >= 0 else ''}{avg_pnl:.2f}%\n"
+        f"Best: {'+' if best >= 0 else ''}{best:.2f}%\n"
+        f"Worst: {'+' if worst >= 0 else ''}{worst:.2f}%"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def trade_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle trade detail view via inline button."""
+    query = update.callback_query
+    await query.answer()
+
+    user_db: UserDatabase = context.bot_data["user_db"]
+    chat_id = update.effective_chat.id
+    user_id = user_db.get_user_by_telegram_chat_id(chat_id)
+    if not user_id:
+        await query.edit_message_text("You're not registered.")
+        return
+
+    trade_db = _get_trade_db(context, user_id)
+    if not trade_db:
+        await query.edit_message_text("Your trading pipeline is not active.")
+        return
+
+    data = query.data
+    if data.startswith("trade:"):
+        trade_id = int(data.split(":")[1])
+        trade = trade_db.get_trade(trade_id)
+        if not trade:
+            await query.edit_message_text(f"Trade #{trade_id} not found.")
+            return
+
+        text = _format_trade_detail(trade)
+        back_button = InlineKeyboardMarkup([
+            [InlineKeyboardButton("< Back to Trades", callback_data="back:trades")]
+        ])
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=back_button)
+
+    elif data.startswith("trades_page:"):
+        page = int(data.split(":")[1])
+        trades = trade_db.get_open_trades()
+        text, keyboard = _format_trade_list(trades, page, "Active Trades")
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    elif data.startswith("history_page:"):
+        page = int(data.split(":")[1])
+        closed = trade_db.get_trades_by_status(TradeStatus.CLOSED)
+        closed.sort(key=lambda t: t.closed_at or t.updated_at, reverse=True)
+        text, keyboard = _format_trade_list(closed, page, "Trade History")
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    elif data == "back:trades":
+        trades = trade_db.get_open_trades()
+        text, keyboard = _format_trade_list(trades, 0, "Active Trades")
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    elif data == "noop":
+        pass  # Page indicator button, do nothing
