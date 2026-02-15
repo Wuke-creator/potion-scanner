@@ -18,6 +18,11 @@ from src.telegram.handlers.account import (
     positions_command,
     status_command,
 )
+from src.telegram.handlers.approval import (
+    close_trade_callback,
+    confirm_close_callback,
+    signal_approval_callback,
+)
 from src.telegram.handlers.admin import (
     generate_code_command,
     generate_codes_command,
@@ -123,6 +128,11 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("history", history_command))
         self._app.add_handler(CommandHandler("stats", stats_command))
         self._app.add_handler(CallbackQueryHandler(trade_detail_callback, pattern=r"^(trade:|trades_page:|history_page:|back:trades|noop)"))
+
+        # Trade approval (Approve/Reject from push notifications, Close Position)
+        self._app.add_handler(CallbackQueryHandler(signal_approval_callback, pattern=r"^signal:(approve|reject):"))
+        self._app.add_handler(CallbackQueryHandler(close_trade_callback, pattern=r"^close_trade:"))
+        self._app.add_handler(CallbackQueryHandler(confirm_close_callback, pattern=r"^(confirm_close|cancel_close):"))
 
         # Admin commands
         self._app.add_handler(CommandHandler("generate_code", generate_code_command))

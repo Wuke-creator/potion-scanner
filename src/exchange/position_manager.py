@@ -30,9 +30,25 @@ def _round_price(price: float, sig_figs: int = 5) -> float:
     return round(price * magnitude) / magnitude
 
 
+def _get_statuses(result: dict) -> list:
+    """Safely extract the statuses list from an exchange response.
+
+    The expected shape is {"response": {"data": {"statuses": [...]}}},
+    but the exchange may return strings at any nesting level.
+    """
+    response = result.get("response")
+    if not isinstance(response, dict):
+        return []
+    data = response.get("data")
+    if not isinstance(data, dict):
+        return []
+    statuses = data.get("statuses", [])
+    return statuses if isinstance(statuses, list) else []
+
+
 def _extract_oid(result: dict) -> int | None:
     """Extract the order ID from an exchange response."""
-    statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+    statuses = _get_statuses(result)
     if not statuses:
         return None
     status = statuses[0]
@@ -45,7 +61,7 @@ def _extract_oid(result: dict) -> int | None:
 
 def _extract_fill(result: dict) -> dict | None:
     """Extract fill info from an exchange response."""
-    statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+    statuses = _get_statuses(result)
     if not statuses:
         return None
     status = statuses[0]
@@ -56,8 +72,12 @@ def _extract_fill(result: dict) -> dict | None:
 
 def _get_error(result: dict) -> str | None:
     """Extract error message from an exchange response."""
-    statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+    statuses = _get_statuses(result)
     if not statuses:
+        # If we can't parse the response, treat the whole thing as an error
+        response = result.get("response")
+        if isinstance(response, str) and response:
+            return response
         return None
     status = statuses[0]
     return status.get("error")

@@ -246,9 +246,15 @@ async def trade_detail_callback(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         text = _format_trade_detail(trade)
-        back_button = InlineKeyboardMarkup([
+        keyboard_rows = []
+        if trade.status == TradeStatus.OPEN:
+            keyboard_rows.append(
+                [InlineKeyboardButton("Close Position", callback_data=f"close_trade:{trade_id}")]
+            )
+        keyboard_rows.append(
             [InlineKeyboardButton("< Back to Trades", callback_data="back:trades")]
-        ])
+        )
+        back_button = InlineKeyboardMarkup(keyboard_rows)
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=back_button)
 
     elif data.startswith("trades_page:"):
