@@ -53,3 +53,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Handle /help — list available commands."""
     logger.info("User %s sent /help", update.effective_user.id)
     await update.message.reply_text(HELP_MESSAGE, parse_mode="Markdown")
+
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle unknown commands."""
+    await update.message.reply_text(
+        "Unknown command. Type /help to see available commands."
+    )

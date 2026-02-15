@@ -7,6 +7,7 @@ the rest of the system.
 
 import logging
 
+from telegram import BotCommand
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 from src.config.settings import Config
@@ -47,7 +48,7 @@ from src.telegram.handlers.config import (
     config_text_handler,
     preset_command,
 )
-from src.telegram.handlers.help import help_command, start_command
+from src.telegram.handlers.help import help_command, start_command, unknown_command
 from src.telegram.handlers.registration import build_registration_handler
 from src.telegram.handlers.trades import (
     history_command,
@@ -95,6 +96,23 @@ class TelegramBot:
         await self._app.initialize()
         await self._app.start()
         await self._app.updater.start_polling(drop_pending_updates=True)
+
+        # Register command menu (autocomplete suggestions when typing /)
+        await self._app.bot.set_my_commands([
+            BotCommand("start", "Welcome message"),
+            BotCommand("help", "Show available commands"),
+            BotCommand("register", "Register with an invite code"),
+            BotCommand("balance", "Account balance"),
+            BotCommand("positions", "Open positions"),
+            BotCommand("status", "Risk dashboard & access info"),
+            BotCommand("trades", "Active trades"),
+            BotCommand("history", "Trade history"),
+            BotCommand("stats", "Trading statistics"),
+            BotCommand("config", "View & change settings"),
+            BotCommand("preset", "Change strategy preset"),
+            BotCommand("auto", "Toggle auto-execute"),
+            BotCommand("admin", "Admin commands"),
+        ])
 
         logger.info("Telegram bot started")
 
@@ -166,3 +184,6 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("remove_admin", remove_admin_command))
         self._app.add_handler(CommandHandler("list_admins", list_admins_command))
         self._app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin:"))
+
+        # Unknown command handler — must be last
+        self._app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
