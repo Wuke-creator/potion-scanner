@@ -72,6 +72,14 @@ CREATE TABLE IF NOT EXISTS user_config (
 );
 """
 
+_TELEGRAM_ADMINS_DDL = """\
+CREATE TABLE IF NOT EXISTS telegram_admins (
+    telegram_id   INTEGER PRIMARY KEY,
+    added_by      INTEGER NOT NULL,
+    created_at    TEXT NOT NULL
+);
+"""
+
 _INVITE_CODES_DDL = """\
 CREATE TABLE IF NOT EXISTS invite_codes (
     code            TEXT PRIMARY KEY,
@@ -119,6 +127,7 @@ class UserDatabase:
             self._conn.execute(_USER_CREDENTIALS_DDL)
             self._conn.execute(_USER_CONFIG_DDL)
             self._conn.execute(_INVITE_CODES_DDL)
+            self._conn.execute(_TELEGRAM_ADMINS_DDL)
             self._migrate_user_config()
 
     # ------------------------------------------------------------------
@@ -707,6 +716,41 @@ class UserDatabase:
             )
         self.set_user_status(user_id, "inactive")
         logger.info("Revoked access for user %s", user_id)
+
+    # ------------------------------------------------------------------
+    # Telegram admin management
+    # ------------------------------------------------------------------
+
+    def add_telegram_admin(self, telegram_id: int, added_by: int) -> bool:
+        """Add a Telegram admin. Returns False if already exists."""
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT INTO telegram_admins (telegram_id, added_by, created_at) VALUES (?, ?, ?)",
+                    (telegram_id, added_by, _now()),
+                )
+            logger.info("Added Telegram admin %d (by %d)", telegram_id, added_by)
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def remove_telegram_admin(self, telegram_id: int) -> bool:
+        """Remove a Telegram admin. Returns False if not found."""
+        with self._conn:
+            cursor = self._conn.execute(
+                "DELETE FROM telegram_admins WHERE telegram_id = ?", (telegram_id,)
+            )
+        if cursor.rowcount > 0:
+            logger.info("Removed Telegram admin %d", telegram_id)
+            return True
+        return False
+
+    def list_telegram_admins(self) -> list[int]:
+        """Return all dynamically added Telegram admin IDs."""
+        rows = self._conn.execute(
+            "SELECT telegram_id FROM telegram_admins ORDER BY created_at"
+        ).fetchall()
+        return [row["telegram_id"] for row in rows]
 
     def close(self) -> None:
         """Close the database connection."""

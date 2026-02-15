@@ -24,6 +24,7 @@ from src.telegram.handlers.approval import (
     signal_approval_callback,
 )
 from src.telegram.handlers.admin import (
+    add_admin_command,
     admin_callback,
     admin_help_command,
     broadcast_command,
@@ -31,7 +32,9 @@ from src.telegram.handlers.admin import (
     generate_code_command,
     generate_codes_command,
     kill_command,
+    list_admins_command,
     list_codes_command,
+    remove_admin_command,
     resume_command,
     revoke_code_command,
     revoke_command,
@@ -79,7 +82,12 @@ class TelegramBot:
         # Store shared dependencies in bot_data for handlers
         self._app.bot_data["user_db"] = self._user_db
         self._app.bot_data["config"] = self._config
-        self._app.bot_data["admin_ids"] = self._config.telegram.admin_ids
+        # Merge env-based admin IDs with DB-stored admin IDs
+        admin_ids = list(self._config.telegram.admin_ids)
+        for db_admin in self._user_db.list_telegram_admins():
+            if db_admin not in admin_ids:
+                admin_ids.append(db_admin)
+        self._app.bot_data["admin_ids"] = admin_ids
         self._app.bot_data["orchestrator"] = self._orchestrator
 
         self._register_handlers()
@@ -154,4 +162,7 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("kill", kill_command))
         self._app.add_handler(CommandHandler("resume", resume_command))
         self._app.add_handler(CommandHandler("broadcast", broadcast_command))
+        self._app.add_handler(CommandHandler("add_admin", add_admin_command))
+        self._app.add_handler(CommandHandler("remove_admin", remove_admin_command))
+        self._app.add_handler(CommandHandler("list_admins", list_admins_command))
         self._app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin:"))

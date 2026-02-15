@@ -36,7 +36,11 @@ ADMIN_HELP_MESSAGE = (
     "/kill — Kill switch (close all positions)\n"
     "/resume — Resume after kill switch\n\n"
     "*Communication*\n"
-    "/broadcast <message> — Message all active users"
+    "/broadcast <message> — Message all active users\n\n"
+    "*Admin Access*\n"
+    "/add\\_admin <telegram\\_id> — Grant admin access\n"
+    "/remove\\_admin <telegram\\_id> — Revoke admin access\n"
+    "/list\\_admins — List all admins"
 )
 
 
@@ -371,3 +375,99 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     elif action == "admin:kill_cancel":
         await query.edit_message_text("Kill switch canceled.")
+
+
+# ------------------------------------------------------------------
+# Admin access management
+# ------------------------------------------------------------------
+
+
+@admin_only
+async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /add_admin <telegram_id> — grant admin access."""
+    user_db = _get_user_db(context)
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /add\\_admin <telegram\\_id>\nExample: `/add_admin 123456789`",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        new_admin_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Telegram ID must be a number.")
+        return
+
+    added_by = update.effective_user.id
+    if user_db.add_telegram_admin(new_admin_id, added_by):
+        # Add to runtime list so it takes effect immediately
+        admin_ids: list[int] = context.bot_data.get("admin_ids", [])
+        if new_admin_id not in admin_ids:
+            admin_ids.append(new_admin_id)
+        await update.message.reply_text(
+            f"Admin access granted to `{new_admin_id}`.",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            f"`{new_admin_id}` is already an admin.",
+            parse_mode="Markdown",
+        )
+
+
+@admin_only
+async def remove_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /remove_admin <telegram_id> — revoke admin access."""
+    user_db = _get_user_db(context)
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /remove\\_admin <telegram\\_id>\nExample: `/remove_admin 123456789`",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Telegram ID must be a number.")
+        return
+
+    # Prevent removing yourself
+    if target_id == update.effective_user.id:
+        await update.message.reply_text("You cannot remove yourself as admin.")
+        return
+
+    if user_db.remove_telegram_admin(target_id):
+        # Remove from runtime list
+        admin_ids: list[int] = context.bot_data.get("admin_ids", [])
+        if target_id in admin_ids:
+            admin_ids.remove(target_id)
+        await update.message.reply_text(
+            f"Admin access revoked for `{target_id}`.",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            f"`{target_id}` is not a dynamically added admin.\n"
+            "Admins set via TELEGRAM\\_ADMIN\\_IDS env var cannot be removed here.",
+            parse_mode="Markdown",
+        )
+
+
+@admin_only
+async def list_admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /list_admins — show all admin IDs."""
+    admin_ids: list[int] = context.bot_data.get("admin_ids", [])
+
+    if not admin_ids:
+        await update.message.reply_text("No admins configured.")
+        return
+
+    lines = ["*Admin Users*\n"]
+    for aid in admin_ids:
+        lines.append(f"`{aid}`")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
