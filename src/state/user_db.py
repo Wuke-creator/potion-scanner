@@ -651,6 +651,25 @@ class UserDatabase:
         ).fetchall()
         return [row["user_id"] for row in rows]
 
+    def get_users_expiring_within(self, hours: int) -> list[tuple[str, str]]:
+        """Return (user_id, access_expires_at) for active users expiring within N hours.
+
+        Only returns users whose expiry is in the future but within the window.
+        """
+        now_dt = datetime.now(timezone.utc)
+        cutoff = (now_dt + timedelta(hours=hours)).isoformat()
+        now = now_dt.isoformat()
+        rows = self._conn.execute(
+            "SELECT uc.user_id, uc.access_expires_at FROM user_config uc "
+            "JOIN users u ON u.user_id = uc.user_id "
+            "WHERE uc.access_expires_at IS NOT NULL "
+            "AND uc.access_expires_at > ? "
+            "AND uc.access_expires_at <= ? "
+            "AND u.status = 'active'",
+            (now, cutoff),
+        ).fetchall()
+        return [(row["user_id"], row["access_expires_at"]) for row in rows]
+
     def extend_user_access(self, user_id: str, days: int) -> str:
         """Extend a user's access by N days from current expiry (or from now if expired/unset).
 

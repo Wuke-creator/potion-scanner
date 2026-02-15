@@ -25,6 +25,7 @@ from src.telegram.handlers.approval import (
 )
 from src.telegram.handlers.admin import (
     admin_callback,
+    admin_help_command,
     broadcast_command,
     extend_command,
     generate_code_command,
@@ -142,6 +143,7 @@ class TelegramBot:
         self._app.add_handler(CallbackQueryHandler(confirm_close_callback, pattern=r"^(confirm_close|cancel_close):"))
 
         # Admin commands
+        self._app.add_handler(CommandHandler("admin", admin_help_command))
         self._app.add_handler(CommandHandler("generate_code", generate_code_command))
         self._app.add_handler(CommandHandler("generate_codes", generate_codes_command))
         self._app.add_handler(CommandHandler("list_codes", list_codes_command))

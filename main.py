@@ -77,8 +77,18 @@ async def run(config: Config) -> None:
         for uid, ctx in orchestrator.pipelines.items():
             ctx.pipeline._notifier = _notifier_factory(uid)
 
+        # Start expiry checker background task
+        from src.telegram.expiry_checker import ExpiryChecker
+        expiry_checker = ExpiryChecker(
+            bot=telegram_bot.bot,
+            user_db=user_db,
+            orchestrator=orchestrator,
+        )
+        await expiry_checker.start()
+
         logger.info("Telegram bot started with trade notifications")
     else:
+        expiry_checker = None
         logger.info("Telegram bot disabled (no TELEGRAM_BOT_TOKEN in .env)")
 
     # --- Select input adapter ---
@@ -128,6 +138,8 @@ async def run(config: Config) -> None:
             await adapter_task
         except asyncio.CancelledError:
             pass
+        if expiry_checker:
+            await expiry_checker.stop()
         if telegram_bot:
             await telegram_bot.stop()
         await admin_api.stop()

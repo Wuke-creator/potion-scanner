@@ -37,7 +37,9 @@ HELP_MESSAGE = (
     "*Control*\n"
     "/activate — Activate trading\n"
     "/deactivate — Pause trading\n"
-    "/cancel — Cancel current action"
+    "/cancel — Cancel current action\n\n"
+    "*Admin*\n"
+    "/admin — Admin commands (admin only)"
 )
 
 

@@ -21,6 +21,31 @@ def _get_orchestrator(context: ContextTypes.DEFAULT_TYPE) -> Orchestrator:
     return context.bot_data["orchestrator"]
 
 
+ADMIN_HELP_MESSAGE = (
+    "*Admin Commands*\n\n"
+    "*Invite Codes*\n"
+    "/generate\\_code \\[days\\] — Generate invite code\n"
+    "/generate\\_codes <count> \\[days\\] — Batch generate codes\n"
+    "/list\\_codes — List all invite codes\n"
+    "/revoke\\_code <code> — Revoke an invite code\n\n"
+    "*User Management*\n"
+    "/users — List all registered users\n"
+    "/extend <user\\_id> <days> — Extend user access\n"
+    "/revoke <user\\_id> — Revoke user access\n\n"
+    "*Emergency*\n"
+    "/kill — Kill switch (close all positions)\n"
+    "/resume — Resume after kill switch\n\n"
+    "*Communication*\n"
+    "/broadcast <message> — Message all active users"
+)
+
+
+@admin_only
+async def admin_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /admin — show all admin commands."""
+    await update.message.reply_text(ADMIN_HELP_MESSAGE, parse_mode="Markdown")
+
+
 @admin_only
 async def generate_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /generate_code [days] — generate a single invite code."""
@@ -208,9 +233,21 @@ async def extend_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     new_expiry = user_db.extend_user_access(target_user_id, days)
+
+    # Re-activate if user was inactive (expired)
+    reactivated = ""
+    if user.status == "inactive":
+        user_db.set_user_status(target_user_id, "active")
+        orchestrator = _get_orchestrator(context)
+        try:
+            orchestrator.activate_user(target_user_id)
+            reactivated = "\nUser re-activated and pipeline started."
+        except Exception as e:
+            reactivated = f"\nUser status set to active. Pipeline activation failed: {e}"
+
     await update.message.reply_text(
         f"Access extended for `{target_user_id}` by {days} days.\n"
-        f"New expiry: `{new_expiry[:19]}`",
+        f"New expiry: `{new_expiry[:19]}`{reactivated}",
         parse_mode="Markdown",
     )
 
