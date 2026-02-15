@@ -652,14 +652,23 @@ class UserDatabase:
         return [row["user_id"] for row in rows]
 
     def extend_user_access(self, user_id: str, days: int) -> str:
-        """Extend a user's access by N days from now.
+        """Extend a user's access by N days from current expiry (or from now if expired/unset).
 
         Returns:
             The new access_expires_at ISO string.
         """
-        new_expiry = (
-            datetime.now(timezone.utc) + timedelta(days=days)
-        ).isoformat()
+        current_expiry = self.get_access_expiry(user_id)
+        now_dt = datetime.now(timezone.utc)
+
+        if current_expiry:
+            base = datetime.fromisoformat(current_expiry)
+            # If already expired, extend from now instead of the past
+            if base < now_dt:
+                base = now_dt
+        else:
+            base = now_dt
+
+        new_expiry = (base + timedelta(days=days)).isoformat()
         now = _now()
         with self._conn:
             self._conn.execute(

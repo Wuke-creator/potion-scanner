@@ -24,10 +24,17 @@ from src.telegram.handlers.approval import (
     signal_approval_callback,
 )
 from src.telegram.handlers.admin import (
+    admin_callback,
+    broadcast_command,
+    extend_command,
     generate_code_command,
     generate_codes_command,
+    kill_command,
     list_codes_command,
+    resume_command,
     revoke_code_command,
+    revoke_command,
+    users_command,
 )
 from src.telegram.handlers.config import (
     auto_command,
@@ -139,3 +146,10 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("generate_codes", generate_codes_command))
         self._app.add_handler(CommandHandler("list_codes", list_codes_command))
         self._app.add_handler(CommandHandler("revoke_code", revoke_code_command))
+        self._app.add_handler(CommandHandler("users", users_command))
+        self._app.add_handler(CommandHandler("extend", extend_command))
+        self._app.add_handler(CommandHandler("revoke", revoke_command))
+        self._app.add_handler(CommandHandler("kill", kill_command))
+        self._app.add_handler(CommandHandler("resume", resume_command))
+        self._app.add_handler(CommandHandler("broadcast", broadcast_command))
+        self._app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin:"))
