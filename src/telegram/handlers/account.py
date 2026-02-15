@@ -1,4 +1,4 @@
-"""Account monitoring handlers — /balance, /positions, /status."""
+"""Account monitoring handlers — /balance, /positions, /status, /activate, /deactivate."""
 
 import logging
 
@@ -155,4 +155,59 @@ async def account_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         text,
         parse_mode="Markdown",
         reply_markup=account_nav_keyboard(view),
+    )
+
+
+@registered_only
+async def activate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /activate — resume receiving trade signals."""
+    user_id = context.user_data["user_id"]
+    orchestrator: Orchestrator | None = context.bot_data.get("orchestrator")
+
+    if not orchestrator:
+        await update.message.reply_text("Trading system is not available.")
+        return
+
+    paused = orchestrator.is_user_paused(user_id)
+    if paused is None:
+        await update.message.reply_text(
+            "Your trading pipeline is not active. Contact admin."
+        )
+        return
+
+    if not paused:
+        await update.message.reply_text("Trading is already active.")
+        return
+
+    orchestrator.resume_user(user_id)
+    await update.message.reply_text(
+        "Trading activated. You will now receive trade signals."
+    )
+
+
+@registered_only
+async def deactivate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /deactivate — pause receiving trade signals."""
+    user_id = context.user_data["user_id"]
+    orchestrator: Orchestrator | None = context.bot_data.get("orchestrator")
+
+    if not orchestrator:
+        await update.message.reply_text("Trading system is not available.")
+        return
+
+    paused = orchestrator.is_user_paused(user_id)
+    if paused is None:
+        await update.message.reply_text(
+            "Your trading pipeline is not active. Contact admin."
+        )
+        return
+
+    if paused:
+        await update.message.reply_text("Trading is already paused.")
+        return
+
+    orchestrator.pause_user(user_id)
+    await update.message.reply_text(
+        "Trading deactivated. You will not receive new trade signals.\n"
+        "Use /activate to resume."
     )

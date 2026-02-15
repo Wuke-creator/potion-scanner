@@ -15,7 +15,9 @@ from src.orchestrator import Orchestrator
 from src.state.user_db import UserDatabase
 from src.telegram.handlers.account import (
     account_nav_callback,
+    activate_command,
     balance_command,
+    deactivate_command,
     positions_command,
     status_command,
 )
@@ -112,6 +114,8 @@ class TelegramBot:
             BotCommand("config", "View & change settings"),
             BotCommand("preset", "Change strategy preset"),
             BotCommand("auto", "Toggle auto-execute"),
+            BotCommand("activate", "Resume receiving trade signals"),
+            BotCommand("deactivate", "Pause trade signals"),
             BotCommand("cancel", "Cancel current action"),
             BotCommand("admin", "Admin commands"),
         ])
@@ -157,6 +161,8 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("balance", balance_command))
         self._app.add_handler(CommandHandler("positions", positions_command))
         self._app.add_handler(CommandHandler("status", status_command))
+        self._app.add_handler(CommandHandler("activate", activate_command))
+        self._app.add_handler(CommandHandler("deactivate", deactivate_command))
         self._app.add_handler(CallbackQueryHandler(account_nav_callback, pattern=r"^nav:"))
 
         # Configuration

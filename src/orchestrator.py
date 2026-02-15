@@ -31,6 +31,7 @@ class UserPipelineContext:
     client: HyperliquidClient
     db: TradeDatabase
     pipeline: Pipeline
+    paused: bool = False
 
 
 class Orchestrator:
@@ -132,6 +133,31 @@ class Orchestrator:
         else:
             logger.warning("User %s not found in active pipelines", user_id)
 
+    def pause_user(self, user_id: str) -> bool:
+        """Pause signal processing for a user. Pipeline stays alive."""
+        ctx = self._pipelines.get(user_id)
+        if not ctx:
+            return False
+        ctx.paused = True
+        logger.info("Paused signal processing for user %s", user_id)
+        return True
+
+    def resume_user(self, user_id: str) -> bool:
+        """Resume signal processing for a paused user."""
+        ctx = self._pipelines.get(user_id)
+        if not ctx:
+            return False
+        ctx.paused = False
+        logger.info("Resumed signal processing for user %s", user_id)
+        return True
+
+    def is_user_paused(self, user_id: str) -> bool | None:
+        """Check if a user's pipeline is paused. None if user not found."""
+        ctx = self._pipelines.get(user_id)
+        if not ctx:
+            return None
+        return ctx.paused
+
     def dispatch(self, raw_message: str, health_server: HealthServer | None = None) -> None:
         """Fan out a signal to all active pipelines.
 
@@ -147,6 +173,8 @@ class Orchestrator:
             return
 
         for user_id, ctx in self._pipelines.items():
+            if ctx.paused:
+                continue
             try:
                 ctx.pipeline.process_message(raw_message)
             except Exception:
