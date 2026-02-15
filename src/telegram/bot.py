@@ -8,7 +8,7 @@ the rest of the system.
 import logging
 
 from telegram import BotCommand
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, TypeHandler, filters
 
 from src.config.settings import Config
 from src.orchestrator import Orchestrator
@@ -48,7 +48,8 @@ from src.telegram.handlers.config import (
     config_text_handler,
     preset_command,
 )
-from src.telegram.handlers.help import help_command, start_command, unknown_command
+from src.telegram.handlers.help import cancel_command, help_command, start_command, unknown_command
+from src.telegram.middleware import dm_only_filter, global_error_handler, rate_limit_filter
 from src.telegram.handlers.registration import build_registration_handler
 from src.telegram.handlers.trades import (
     history_command,
@@ -111,6 +112,7 @@ class TelegramBot:
             BotCommand("config", "View & change settings"),
             BotCommand("preset", "Change strategy preset"),
             BotCommand("auto", "Toggle auto-execute"),
+            BotCommand("cancel", "Cancel current action"),
             BotCommand("admin", "Admin commands"),
         ])
 
@@ -137,8 +139,16 @@ class TelegramBot:
 
     def _register_handlers(self) -> None:
         """Register all command handlers."""
+        # Pre-processing: DM-only and rate limiting (group -1 runs before all handlers)
+        self._app.add_handler(TypeHandler(Update, dm_only_filter), group=-2)
+        self._app.add_handler(TypeHandler(Update, rate_limit_filter), group=-1)
+
+        # Global error handler
+        self._app.add_error_handler(global_error_handler)
+
         self._app.add_handler(CommandHandler("start", start_command))
         self._app.add_handler(CommandHandler("help", help_command))
+        self._app.add_handler(CommandHandler("cancel", cancel_command))
 
         # Registration conversation (must be before simple command handlers)
         self._app.add_handler(build_registration_handler())

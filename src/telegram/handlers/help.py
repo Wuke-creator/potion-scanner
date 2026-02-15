@@ -55,6 +55,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(HELP_MESSAGE, parse_mode="Markdown")
 
 
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /cancel — reset any pending state."""
+    # Clear any user_data state that might be lingering
+    if context.user_data:
+        context.user_data.clear()
+    await update.message.reply_text("Action cancelled. Use /help to see available commands.")
+
+
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle unknown commands."""
     await update.message.reply_text(
