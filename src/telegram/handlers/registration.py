@@ -193,6 +193,14 @@ async def receive_network(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text("Invalid network. Please select Testnet or Mainnet.")
         return NETWORK
 
+    if network == "mainnet":
+        await query.edit_message_text(
+            "Only *Testnet* trading is available at the moment.\n\n"
+            "Please select Testnet to continue.",
+            parse_mode="Markdown",
+        )
+        return NETWORK
+
     context.user_data["network"] = network
     await query.edit_message_text(f"Network: {network}\n\nValidating credentials...")
 
