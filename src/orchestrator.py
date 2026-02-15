@@ -4,9 +4,12 @@ Each user gets an isolated Pipeline with their own Config, HyperliquidClient,
 and TradeDatabase. Errors in one user's pipeline do not affect others.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 from dataclasses import dataclass
+from typing import Callable
 
 from src.config.settings import Config
 from src.exchange.hyperliquid import HyperliquidClient
@@ -37,9 +40,15 @@ class Orchestrator:
     Falls back to single-user mode when no DB users exist and .env has credentials.
     """
 
-    def __init__(self, global_config: Config, user_db: UserDatabase):
+    def __init__(
+        self,
+        global_config: Config,
+        user_db: UserDatabase,
+        notifier_factory: Callable[[str], object] | None = None,
+    ):
         self._global_config = global_config
         self._user_db = user_db
+        self._notifier_factory = notifier_factory
         self._pipelines: dict[str, UserPipelineContext] = {}
         self._killed = False
 
@@ -102,7 +111,8 @@ class Orchestrator:
                 user_id, len(sync_result["closed"]), len(sync_result["canceled"]),
             )
 
-        pipeline = Pipeline(config=user_config, client=client, db=db)
+        notifier = self._notifier_factory(user_id) if self._notifier_factory else None
+        pipeline = Pipeline(config=user_config, client=client, db=db, notifier=notifier)
 
         self._pipelines[user_id] = UserPipelineContext(
             user_id=user_id,
@@ -218,7 +228,8 @@ class Orchestrator:
                 len(sync_result["closed"]), len(sync_result["canceled"]),
             )
 
-        pipeline = Pipeline(config=self._global_config, client=client, db=db)
+        notifier = self._notifier_factory(user_id) if self._notifier_factory else None
+        pipeline = Pipeline(config=self._global_config, client=client, db=db, notifier=notifier)
 
         self._pipelines[user_id] = UserPipelineContext(
             user_id=user_id,

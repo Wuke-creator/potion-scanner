@@ -6,7 +6,14 @@ the exchange, and records in the database. For lifecycle events: updates
 the trade state accordingly.
 """
 
+from __future__ import annotations
+
+import asyncio
 import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.telegram.notifications import TelegramNotifier
 
 from src.config.settings import Config, StrategyPreset
 from src.exchange.hyperliquid import HyperliquidClient
@@ -52,12 +59,14 @@ class Pipeline:
         config: Config,
         client: HyperliquidClient,
         db: TradeDatabase,
+        notifier: TelegramNotifier | None = None,
     ):
         self._config = config
         self._client = client
         self._db = db
         self._pm = PositionManager(client, db)
         self._asset_meta = client.get_asset_meta()
+        self._notifier = notifier
 
     def process_message(self, raw_message: str) -> None:
         """Classify and process a single raw message.
@@ -156,6 +165,13 @@ class Pipeline:
         )
         self._db.create_trade(trade_record)
 
+        # Notify new signal
+        if self._notifier:
+            self._notify(self._notifier.notify_new_signal(
+                signal, trade_set, position_size_usd,
+                auto_execute=self._config.strategy.auto_execute,
+            ))
+
         # Submit to exchange
         if self._config.strategy.auto_execute:
             success = self._pm.submit_trade(trade_set)
@@ -165,9 +181,18 @@ class Pipeline:
                     signal.trade_id, trade_set.coin, signal.side.value,
                     trade_set.entry.sz, signal.entry, trade_set.leverage, position_size_usd,
                 )
+                if self._notifier:
+                    self._notify(self._notifier.notify_trade_opened(
+                        signal.trade_id, trade_set.coin, signal.side.value,
+                        signal.entry, position_size_usd,
+                    ))
             else:
                 logger.error("Trade #%d submission failed", signal.trade_id)
                 self._db.update_trade_status(signal.trade_id, TradeStatus.CANCELED, close_reason="submission_failed")
+                if self._notifier:
+                    self._notify(self._notifier.notify_trade_failed(
+                        signal.trade_id, trade_set.coin, "Exchange submission failed",
+                    ))
         else:
             logger.info(
                 "Trade #%d ready (auto_execute=false): %s %s %s @ %s (lev=%dx, size=$%.2f)",
@@ -199,6 +224,11 @@ class Pipeline:
         if should_move and trade.status == TradeStatus.OPEN:
             self._pm.move_sl_to_breakeven(tp.trade_id, trade.coin, trade.entry_price)
 
+        if self._notifier:
+            self._notify(self._notifier.notify_tp_hit(
+                tp.trade_id, trade.coin, tp.tp_number, tp.profit_pct,
+            ))
+
     def _handle_all_tp_hit(self, raw: str) -> None:
         """All TPs hit — trade is fully closed."""
         atp = parse_all_tp_hit(raw)
@@ -212,6 +242,11 @@ class Pipeline:
             atp.trade_id, TradeStatus.CLOSED,
             close_reason="all_tp_hit", pnl_pct=atp.profit_pct,
         )
+
+        if self._notifier:
+            self._notify(self._notifier.notify_all_tp_hit(
+                atp.trade_id, trade.coin, atp.profit_pct,
+            ))
 
     def _handle_breakeven(self, raw: str) -> None:
         """Breakeven — move SL to entry if not already done by TP-hit auto-move."""
@@ -227,6 +262,10 @@ class Pipeline:
             moved = self._pm.move_sl_to_breakeven(be.trade_id, trade.coin, trade.entry_price)
             if moved:
                 logger.info("SL moved to breakeven for trade #%d via provider message", be.trade_id)
+                if self._notifier:
+                    self._notify(self._notifier.notify_breakeven(
+                        be.trade_id, trade.coin, trade.entry_price,
+                    ))
             # If move_sl_to_breakeven returns False it means no active SL was found
             # (likely already moved by the TP-hit auto-move) — that's fine.
 
@@ -244,6 +283,11 @@ class Pipeline:
             close_reason="stop_hit", pnl_pct=sh.loss_pct,
         )
 
+        if self._notifier:
+            self._notify(self._notifier.notify_stop_hit(
+                sh.trade_id, trade.coin, sh.loss_pct,
+            ))
+
     def _handle_canceled(self, raw: str) -> None:
         """Trade canceled — cancel all orders on exchange."""
         cancel = parse_canceled(raw)
@@ -258,6 +302,11 @@ class Pipeline:
         else:
             self._pm.cancel_trade(cancel.trade_id)
 
+        if self._notifier:
+            self._notify(self._notifier.notify_trade_canceled(
+                cancel.trade_id, trade.coin, cancel.reason,
+            ))
+
     def _handle_trade_closed(self, raw: str) -> None:
         """Trade manually closed — close position on exchange."""
         tc = parse_trade_closed(raw)
@@ -271,6 +320,11 @@ class Pipeline:
             self._pm.close_position(tc.trade_id, trade.coin, reason="manual_close")
         else:
             self._db.update_trade_status(tc.trade_id, TradeStatus.CLOSED, close_reason="manual_close")
+
+        if self._notifier:
+            self._notify(self._notifier.notify_trade_closed(
+                tc.trade_id, trade.coin, tc.detail,
+            ))
 
     def _handle_preparation(self, raw: str) -> None:
         """Preparation message — log but do not execute."""
@@ -296,6 +350,10 @@ class Pipeline:
             logger.info("SL update detected: trade #%d → new SL %.6f", sl.trade_id, sl.new_price)
             if self._config.strategy.auto_execute:
                 self._pm.move_stop_loss(sl.trade_id, trade.coin, sl.new_price)
+                if self._notifier:
+                    self._notify(self._notifier.notify_sl_moved(
+                        sl.trade_id, trade.coin, sl.new_price,
+                    ))
             else:
                 logger.info("SL update ready (auto_execute=false) for trade #%d", sl.trade_id)
             return
@@ -314,6 +372,16 @@ class Pipeline:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _notify(self, coro) -> None:
+        """Schedule an async notification without blocking the sync pipeline."""
+        if self._notifier is None:
+            return
+        try:
+            loop = asyncio.get_event_loop()
+            loop.create_task(coro)
+        except RuntimeError:
+            logger.debug("No event loop available for notification")
 
     def _get_balance_usd(self) -> float:
         """Get current USDC balance."""

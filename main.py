@@ -57,6 +57,8 @@ async def run(config: Config) -> None:
     telegram_bot = None
     if config.telegram.bot_token:
         from src.telegram.bot import TelegramBot
+        from src.telegram.notifications import TelegramNotifier
+
         telegram_bot = TelegramBot(
             token=config.telegram.bot_token,
             user_db=user_db,
@@ -64,7 +66,18 @@ async def run(config: Config) -> None:
             orchestrator=orchestrator,
         )
         await telegram_bot.start()
-        logger.info("Telegram bot started")
+
+        # Create notifier factory now that the bot is running
+        def _notifier_factory(uid: str) -> TelegramNotifier:
+            return TelegramNotifier(bot=telegram_bot.bot, user_db=user_db, user_id=uid)
+
+        orchestrator._notifier_factory = _notifier_factory
+
+        # Re-attach notifiers to any pipelines already activated
+        for uid, ctx in orchestrator.pipelines.items():
+            ctx.pipeline._notifier = _notifier_factory(uid)
+
+        logger.info("Telegram bot started with trade notifications")
     else:
         logger.info("Telegram bot disabled (no TELEGRAM_BOT_TOKEN in .env)")
 

@@ -77,6 +77,13 @@ class TelegramBot:
 
         logger.info("Telegram bot started")
 
+    @property
+    def bot(self) -> "Bot":
+        """Return the underlying telegram.Bot instance (available after start)."""
+        if self._app is None:
+            raise RuntimeError("TelegramBot not started yet")
+        return self._app.bot
+
     async def stop(self) -> None:
         """Stop polling and shut down the application."""
         if self._app is None:
