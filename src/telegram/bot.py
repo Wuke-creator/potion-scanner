@@ -7,7 +7,7 @@ the rest of the system.
 
 import logging
 
-from telegram import BotCommand
+from telegram import BotCommand, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, TypeHandler, filters
 
 from src.config.settings import Config
