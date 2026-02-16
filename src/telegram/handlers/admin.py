@@ -37,6 +37,8 @@ ADMIN_HELP_MESSAGE = (
     "/resume — Resume after kill switch\n\n"
     "*Communication*\n"
     "/broadcast <message> — Message all active users\n\n"
+    "*Testing*\n"
+    "/inject — Inject test signal (for testing)\n\n"
     "*Admin Access*\n"
     "/add\\_admin <telegram\\_id> — Grant admin access\n"
     "/remove\\_admin <telegram\\_id> — Revoke admin access\n"
@@ -471,3 +473,91 @@ async def list_admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         lines.append(f"`{aid}`")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ------------------------------------------------------------------
+# Test signal injection
+# ------------------------------------------------------------------
+
+_TEST_SIGNALS = {
+    "signal": (
+        "TRADING SIGNAL ALERT\n\n"
+        "PAIR: ETH/USDT #9999\n"
+        "(LOW RISK)\n\n"
+        "TYPE: SWING\n"
+        "SIZE: 1-4%\n"
+        "SIDE: LONG\n\n"
+        "ENTRY: 2100.7\n"
+        "SL: 2042.0          (-30.00%)\n\n"
+        "TAKE PROFIT TARGETS:\n\n"
+        "TP1: 2119.5      (16.67%)\n"
+        "TP2: 2146.8      (36.67%)\n"
+        "TP3: 2178.2      (70.00%)\n\n"
+        "LEVERAGE: 5x\n\n"
+        "PROTECT YOUR CAPITAL, MANAGE RISK, LETS PRINT!"
+    ),
+    "tp1": (
+        "**\u2705 TP TARGET 1 HIT**\n\n"
+        "**\U0001f4ddPAIR:** ETH/USDT #9999\n\n"
+        "**\U0001f4b0PROFIT:** 16.67% \U0001f4c8"
+    ),
+    "tp2": (
+        "**\u2705 TP TARGET 2 HIT**\n\n"
+        "**\U0001f4ddPAIR:** ETH/USDT #9999\n\n"
+        "**\U0001f4b0PROFIT:** 36.67% \U0001f4c8"
+    ),
+    "all_tp": (
+        "**\U0001f525ALL TAKE-PROFIT TARGETS HIT**\n\n"
+        "**\U0001f4ddPAIR:** ETH/USDT #9999\n\n"
+        "**\U0001f4b0PROFIT:** 70.00% \U0001f4c8"
+    ),
+}
+
+
+@admin_only
+async def inject_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /inject — show test signal buttons for quick injection."""
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("New Signal (ETH LONG)", callback_data="inject:signal")],
+        [
+            InlineKeyboardButton("TP1 Hit", callback_data="inject:tp1"),
+            InlineKeyboardButton("TP2 Hit", callback_data="inject:tp2"),
+        ],
+        [InlineKeyboardButton("All TP Hit", callback_data="inject:all_tp")],
+    ])
+    await update.message.reply_text(
+        "*Test Signal Injection*\n\nSelect a signal to inject into the pipeline for all active users:",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
+async def inject_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inject:{signal_type} callbacks — dispatch test signal to all users."""
+    query = update.callback_query
+    await query.answer()
+
+    # Admin check
+    admin_ids: list[int] = context.bot_data.get("admin_ids", [])
+    if update.effective_user.id not in admin_ids:
+        await query.edit_message_text("This action is only available to administrators.")
+        return
+
+    signal_type = query.data.replace("inject:", "")
+    raw_signal = _TEST_SIGNALS.get(signal_type)
+    if not raw_signal:
+        await query.edit_message_text(f"Unknown signal type: {signal_type}")
+        return
+
+    orchestrator = _get_orchestrator(context)
+    orchestrator.dispatch(raw_signal)
+
+    label = {"signal": "New Signal", "tp1": "TP1 Hit", "tp2": "TP2 Hit", "all_tp": "All TP Hit"}
+    pipelines = len(orchestrator.pipelines)
+    paused = sum(1 for ctx in orchestrator.pipelines.values() if ctx.paused)
+
+    await query.edit_message_text(
+        f"*{label.get(signal_type, signal_type)}* injected.\n"
+        f"Dispatched to {pipelines - paused} active pipeline(s).",
+        parse_mode="Markdown",
+    )

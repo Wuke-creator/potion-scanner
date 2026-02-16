@@ -34,6 +34,8 @@ from src.telegram.handlers.admin import (
     extend_command,
     generate_code_command,
     generate_codes_command,
+    inject_callback,
+    inject_command,
     kill_command,
     list_admins_command,
     list_codes_command,
@@ -199,6 +201,8 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("add_admin", add_admin_command))
         self._app.add_handler(CommandHandler("remove_admin", remove_admin_command))
         self._app.add_handler(CommandHandler("list_admins", list_admins_command))
+        self._app.add_handler(CommandHandler("inject", inject_command))
+        self._app.add_handler(CallbackQueryHandler(inject_callback, pattern=r"^inject:"))
         self._app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin:"))
 
         # Unknown command handler — must be last
