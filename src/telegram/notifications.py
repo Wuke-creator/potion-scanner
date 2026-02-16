@@ -64,24 +64,24 @@ class TelegramNotifier:
         auto_execute: bool = True,
     ) -> None:
         """New signal received — notify user with trade details."""
-        side_emoji = "LONG" if signal.side.value == "long" else "SHORT"
+        side_emoji = "📈 LONG" if signal.side.value == "long" else "📉 SHORT"
         text = (
-            f"*New Signal — Trade #{signal.trade_id}*\n\n"
-            f"Pair: {signal.pair}\n"
-            f"Side: {side_emoji}\n"
-            f"Entry: {signal.entry}\n"
-            f"Stop Loss: {signal.stop_loss}\n"
-            f"Size: {format_usd(position_size_usd)}\n"
-            f"Leverage: {trade_set.leverage}x"
+            f"🔔 *New Signal — Trade #{signal.trade_id}*\n\n"
+            f"💱 Pair: {signal.pair}\n"
+            f"Direction: {side_emoji}\n"
+            f"🎯 Entry: {signal.entry}\n"
+            f"🛡 Stop Loss: {signal.stop_loss}\n"
+            f"💰 Size: {format_usd(position_size_usd)}\n"
+            f"📊 Leverage: {trade_set.leverage}x"
         )
 
         reply_markup = None
         if not auto_execute:
-            text += "\n\n_Auto-execute is OFF. Approve or reject this trade:_"
+            text += "\n\n_⚡ Auto-execute is OFF. Approve or reject this trade:_"
             reply_markup = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("Approve", callback_data=f"signal:approve:{signal.trade_id}"),
-                    InlineKeyboardButton("Reject", callback_data=f"signal:reject:{signal.trade_id}"),
+                    InlineKeyboardButton("✅ Approve", callback_data=f"signal:approve:{signal.trade_id}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"signal:reject:{signal.trade_id}"),
                 ]
             ])
 
@@ -91,21 +91,22 @@ class TelegramNotifier:
         self, trade_id: int, coin: str, side: str, entry_price: float, size_usd: float,
     ) -> None:
         """Entry order filled — trade is now open."""
+        side_emoji = "📈" if side.upper() == "LONG" else "📉"
         text = (
-            f"*Trade Opened — #{trade_id}*\n\n"
-            f"Coin: {coin}\n"
-            f"Side: {side.upper()}\n"
-            f"Entry: {entry_price}\n"
-            f"Size: {format_usd(size_usd)}"
+            f"✅ *Trade Opened — #{trade_id}*\n\n"
+            f"💱 Coin: {coin}\n"
+            f"{side_emoji} Side: {side.upper()}\n"
+            f"🎯 Entry: {entry_price}\n"
+            f"💰 Size: {format_usd(size_usd)}"
         )
         await self._send(text)
 
     async def notify_trade_failed(self, trade_id: int, coin: str, error: str) -> None:
         """Trade submission failed."""
         text = (
-            f"*Trade Failed — #{trade_id}*\n\n"
-            f"Coin: {coin}\n"
-            f"Error: {error}"
+            f"❌ *Trade Failed — #{trade_id}*\n\n"
+            f"💱 Coin: {coin}\n"
+            f"⚠️ Error: {error}"
         )
         await self._send(text)
 
@@ -114,9 +115,9 @@ class TelegramNotifier:
     ) -> None:
         """Partial take-profit hit."""
         text = (
-            f"*TP{tp_number} Hit — Trade #{trade_id}*\n\n"
-            f"Coin: {coin}\n"
-            f"Profit: {format_pct(profit_pct)}"
+            f"🎯 *TP{tp_number} Hit — Trade #{trade_id}*\n\n"
+            f"💱 Coin: {coin}\n"
+            f"💹 Profit: {format_pct(profit_pct)}"
         )
         await self._send(text)
 
@@ -125,10 +126,10 @@ class TelegramNotifier:
     ) -> None:
         """All TPs hit — trade fully closed in profit."""
         text = (
-            f"*All TPs Hit — Trade #{trade_id}*\n\n"
-            f"Coin: {coin}\n"
-            f"Total Profit: {format_pct(profit_pct)}\n"
-            f"Trade fully closed."
+            f"🏆 *All TPs Hit — Trade #{trade_id}*\n\n"
+            f"💱 Coin: {coin}\n"
+            f"💹 Total Profit: {format_pct(profit_pct)}\n"
+            f"✅ Trade fully closed."
         )
         await self._send(text)
 
@@ -137,9 +138,9 @@ class TelegramNotifier:
     ) -> None:
         """Stop loss hit — trade closed at a loss."""
         text = (
-            f"*Stop Hit — Trade #{trade_id}*\n\n"
-            f"Coin: {coin}\n"
-            f"Loss: {format_pct(loss_pct)}"
+            f"🛑 *Stop Hit — Trade #{trade_id}*\n\n"
+            f"💱 Coin: {coin}\n"
+            f"📉 Loss: {format_pct(loss_pct)}"
         )
         await self._send(text)
 
@@ -148,9 +149,9 @@ class TelegramNotifier:
     ) -> None:
         """Trade canceled."""
         text = (
-            f"*Trade Canceled — #{trade_id}*\n\n"
-            f"Coin: {coin}\n"
-            f"Reason: {reason}"
+            f"🚫 *Trade Canceled — #{trade_id}*\n\n"
+            f"💱 Coin: {coin}\n"
+            f"📋 Reason: {reason}"
         )
         await self._send(text)
 
@@ -159,9 +160,9 @@ class TelegramNotifier:
     ) -> None:
         """Trade manually closed."""
         text = (
-            f"*Trade Closed — #{trade_id}*\n\n"
-            f"Coin: {coin}\n"
-            f"Detail: {detail}"
+            f"📋 *Trade Closed — #{trade_id}*\n\n"
+            f"💱 Coin: {coin}\n"
+            f"📝 Detail: {detail}"
         )
         await self._send(text)
 
@@ -170,9 +171,9 @@ class TelegramNotifier:
     ) -> None:
         """Stop loss moved to breakeven (entry price)."""
         text = (
-            f"*Breakeven — Trade #{trade_id}*\n\n"
-            f"Coin: {coin}\n"
-            f"SL moved to entry: {entry_price}"
+            f"⚖️ *Breakeven — Trade #{trade_id}*\n\n"
+            f"💱 Coin: {coin}\n"
+            f"🛡 SL moved to entry: {entry_price}"
         )
         await self._send(text)
 
@@ -181,13 +182,13 @@ class TelegramNotifier:
     ) -> None:
         """Stop loss adjusted to a new price."""
         text = (
-            f"*SL Moved — Trade #{trade_id}*\n\n"
-            f"Coin: {coin}\n"
-            f"New SL: {new_price}"
+            f"🛡 *SL Moved — Trade #{trade_id}*\n\n"
+            f"💱 Coin: {coin}\n"
+            f"🎯 New SL: {new_price}"
         )
         await self._send(text)
 
     async def notify_risk_warning(self, message: str) -> None:
         """Risk limit warning."""
-        text = f"*Risk Warning*\n\n{message}"
+        text = f"⚠️ *Risk Warning*\n\n{message}"
         await self._send(text)

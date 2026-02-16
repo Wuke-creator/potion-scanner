@@ -6,8 +6,9 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from src.config.settings import BUILTIN_PRESETS
+from src.orchestrator import Orchestrator
 from src.state.user_db import UserDatabase
-from src.telegram.keyboards import config_main_keyboard, preset_keyboard, risk_keyboard
+from src.telegram.keyboards import config_menu_keyboard, preset_keyboard, risk_keyboard
 from src.telegram.middleware import registered_only
 
 logger = logging.getLogger(__name__)
@@ -17,10 +18,20 @@ def _get_user_db(context: ContextTypes.DEFAULT_TYPE) -> UserDatabase:
     return context.bot_data["user_db"]
 
 
+def _is_pipeline_active(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> bool:
+    orchestrator: Orchestrator | None = context.bot_data.get("orchestrator")
+    if not orchestrator:
+        return False
+    paused = orchestrator.is_user_paused(user_id)
+    if paused is None:
+        return False
+    return not paused
+
+
 def _format_config(cfg: dict) -> str:
     """Format current config for display."""
     preset = cfg.get("active_preset", "runner")
-    auto = "ON" if cfg.get("auto_execute") else "OFF"
+    auto = "✅ ON" if cfg.get("auto_execute") else "❌ OFF"
     lev = cfg.get("max_leverage", 20)
 
     # Get preset details
@@ -31,11 +42,11 @@ def _format_config(cfg: dict) -> str:
         tp_desc = f" ({tp_pcts[0]}/{tp_pcts[1]}/{tp_pcts[2]})"
 
     return (
-        f"*Current Configuration*\n\n"
-        f"Strategy: {preset}{tp_desc}\n"
-        f"Auto-execute: {auto}\n"
-        f"Max Leverage: {lev}x\n\n"
-        f"*Risk Limits*\n"
+        "⚙️ *Configuration*\n\n"
+        f"🎯 Strategy: {preset}{tp_desc}\n"
+        f"⚡ Auto-execute: {auto}\n"
+        f"📊 Max Leverage: {lev}x\n\n"
+        "🔒 *Risk Limits*\n"
         f"Max Positions: {cfg.get('max_open_positions', 10)}\n"
         f"Max Position Size: ${cfg.get('max_position_size_usd', 500):,.0f}\n"
         f"Max Exposure: ${cfg.get('max_total_exposure_usd', 2000):,.0f}\n"
@@ -49,12 +60,13 @@ async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = context.user_data["user_id"]
     user_db = _get_user_db(context)
     cfg = user_db.get_user_config(user_id)
+    is_active = _is_pipeline_active(context, user_id)
 
     text = _format_config(cfg)
     await update.message.reply_text(
         text,
         parse_mode="Markdown",
-        reply_markup=config_main_keyboard(),
+        reply_markup=config_menu_keyboard(is_active),
     )
 
 
@@ -74,14 +86,14 @@ async def preset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     name = context.args[0].lower()
     if name not in BUILTIN_PRESETS:
         names = ", ".join(sorted(BUILTIN_PRESETS.keys()))
-        await update.message.reply_text(f"Unknown preset. Available: {names}")
+        await update.message.reply_text(f"❌ Unknown preset. Available: {names}")
         return
 
     user_db.update_user_config(user_id, active_preset=name)
     p = BUILTIN_PRESETS[name]
     tp_pcts = [int(x * 100) for x in p.tp_split]
     await update.message.reply_text(
-        f"Preset changed to *{name}* ({tp_pcts[0]}/{tp_pcts[1]}/{tp_pcts[2]})",
+        f"🎯 Preset changed to *{name}* ({tp_pcts[0]}/{tp_pcts[1]}/{tp_pcts[2]})",
         parse_mode="Markdown",
     )
 
@@ -95,8 +107,8 @@ async def auto_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     new_value = not cfg.get("auto_execute", False)
     user_db.update_user_config(user_id, auto_execute=new_value)
-    state = "ON" if new_value else "OFF"
-    await update.message.reply_text(f"Auto-execute: *{state}*", parse_mode="Markdown")
+    state = "✅ ON" if new_value else "❌ OFF"
+    await update.message.reply_text(f"⚡ Auto-execute: *{state}*", parse_mode="Markdown")
 
 
 async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -108,21 +120,22 @@ async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     chat_id = update.effective_chat.id
     user_id = user_db.get_user_by_telegram_chat_id(chat_id)
     if not user_id:
-        await query.edit_message_text("You're not registered. Use /register.")
+        await query.edit_message_text("❌ You're not registered. Use /register.")
         return
 
-    data = query.data  # e.g. "cfg:strategy", "cfg:preset:runner", "cfg:auto", "cfg:risk", etc.
+    data = query.data
 
     if data == "cfg:strategy":
         await query.edit_message_text(
-            "Select a strategy preset:",
+            "🎯 *Select a strategy preset:*",
+            parse_mode="Markdown",
             reply_markup=preset_keyboard(),
         )
 
     elif data.startswith("cfg:preset:"):
         name = data.split(":", 2)[2]
         if name not in BUILTIN_PRESETS:
-            await query.edit_message_text("Unknown preset.")
+            await query.edit_message_text("❌ Unknown preset.")
             return
 
         user_db.update_user_config(user_id, active_preset=name)
@@ -131,11 +144,10 @@ async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         cfg = user_db.get_user_config(user_id)
         text = _format_config(cfg)
-        text += f"\n\n_Changed to {name} ({tp_pcts[0]}/{tp_pcts[1]}/{tp_pcts[2]})_"
+        text += f"\n\n_🎯 Changed to {name} ({tp_pcts[0]}/{tp_pcts[1]}/{tp_pcts[2]})_"
+        is_active = _is_pipeline_active(context, user_id)
         await query.edit_message_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=config_main_keyboard(),
+            text, parse_mode="Markdown", reply_markup=config_menu_keyboard(is_active),
         )
 
     elif data == "cfg:auto":
@@ -145,59 +157,113 @@ async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         cfg = user_db.get_user_config(user_id)
         text = _format_config(cfg)
-        state = "ON" if new_value else "OFF"
-        text += f"\n\n_Auto-execute toggled {state}_"
+        state = "✅ ON" if new_value else "❌ OFF"
+        text += f"\n\n_⚡ Auto-execute toggled {state}_"
+        is_active = _is_pipeline_active(context, user_id)
         await query.edit_message_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=config_main_keyboard(),
+            text, parse_mode="Markdown", reply_markup=config_menu_keyboard(is_active),
         )
 
     elif data == "cfg:risk":
         cfg = user_db.get_user_config(user_id)
         await query.edit_message_text(
-            "*Risk Limits*\n\n"
-            f"Max Positions: {cfg.get('max_open_positions', 10)}\n"
-            f"Max Position Size: ${cfg.get('max_position_size_usd', 500):,.0f}\n"
-            f"Max Exposure: ${cfg.get('max_total_exposure_usd', 2000):,.0f}\n"
-            f"Daily Loss Limit: {cfg.get('max_daily_loss_pct', 10)}%\n\n"
+            "🔒 *Risk Limits*\n\n"
+            f"📊 Max Positions: {cfg.get('max_open_positions', 10)}\n"
+            f"💰 Max Position Size: ${cfg.get('max_position_size_usd', 500):,.0f}\n"
+            f"📈 Max Exposure: ${cfg.get('max_total_exposure_usd', 2000):,.0f}\n"
+            f"🛡 Daily Loss Limit: {cfg.get('max_daily_loss_pct', 10)}%\n\n"
             "Select a limit to change:",
             parse_mode="Markdown",
             reply_markup=risk_keyboard(),
         )
 
     elif data == "cfg:leverage":
-        # Store that we're waiting for leverage input
         context.user_data["awaiting_config"] = "max_leverage"
         cfg = user_db.get_user_config(user_id)
         await query.edit_message_text(
-            f"Current max leverage: {cfg.get('max_leverage', 20)}x\n\n"
+            f"📊 Current max leverage: {cfg.get('max_leverage', 20)}x\n\n"
             "Send the new max leverage value (1-50):"
         )
 
     elif data.startswith("cfg:risk:"):
         field = data.split(":", 2)[2]
         field_labels = {
-            "max_open_positions": "Max Open Positions",
-            "max_position_size_usd": "Max Position Size (USD)",
-            "max_total_exposure_usd": "Max Total Exposure (USD)",
-            "max_daily_loss_pct": "Max Daily Loss (%)",
+            "max_open_positions": "📊 Max Open Positions",
+            "max_position_size_usd": "💰 Max Position Size (USD)",
+            "max_total_exposure_usd": "📈 Max Total Exposure (USD)",
+            "max_daily_loss_pct": "🛡 Max Daily Loss (%)",
         }
         label = field_labels.get(field, field)
         context.user_data["awaiting_config"] = field
         cfg = user_db.get_user_config(user_id)
         current = cfg.get(field, "?")
         await query.edit_message_text(
-            f"Current {label}: {current}\n\nSend the new value:"
+            f"{label}\nCurrent: {current}\n\nSend the new value:"
         )
 
     elif data == "cfg:back":
         cfg = user_db.get_user_config(user_id)
         text = _format_config(cfg)
+        is_active = _is_pipeline_active(context, user_id)
         await query.edit_message_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=config_main_keyboard(),
+            text, parse_mode="Markdown", reply_markup=config_menu_keyboard(is_active),
+        )
+
+    elif data == "cfg:activate":
+        orchestrator: Orchestrator | None = context.bot_data.get("orchestrator")
+        if not orchestrator:
+            await query.edit_message_text("⚠️ Trading system is not available.")
+            return
+
+        paused = orchestrator.is_user_paused(user_id)
+        if paused is None:
+            await query.edit_message_text("⚠️ Your trading pipeline is not active. Contact admin.")
+            return
+
+        if not paused:
+            # Already active, just refresh
+            cfg = user_db.get_user_config(user_id)
+            text = _format_config(cfg)
+            text += "\n\n_▶️ Trading is already active._"
+            await query.edit_message_text(
+                text, parse_mode="Markdown", reply_markup=config_menu_keyboard(True),
+            )
+            return
+
+        orchestrator.resume_user(user_id)
+        cfg = user_db.get_user_config(user_id)
+        text = _format_config(cfg)
+        text += "\n\n_▶️ Trading activated! You will receive trade signals._"
+        await query.edit_message_text(
+            text, parse_mode="Markdown", reply_markup=config_menu_keyboard(True),
+        )
+
+    elif data == "cfg:deactivate":
+        orchestrator: Orchestrator | None = context.bot_data.get("orchestrator")
+        if not orchestrator:
+            await query.edit_message_text("⚠️ Trading system is not available.")
+            return
+
+        paused = orchestrator.is_user_paused(user_id)
+        if paused is None:
+            await query.edit_message_text("⚠️ Your trading pipeline is not active. Contact admin.")
+            return
+
+        if paused:
+            cfg = user_db.get_user_config(user_id)
+            text = _format_config(cfg)
+            text += "\n\n_⏸ Trading is already paused._"
+            await query.edit_message_text(
+                text, parse_mode="Markdown", reply_markup=config_menu_keyboard(False),
+            )
+            return
+
+        orchestrator.pause_user(user_id)
+        cfg = user_db.get_user_config(user_id)
+        text = _format_config(cfg)
+        text += "\n\n_⏸ Trading deactivated. No new signals will be sent._"
+        await query.edit_message_text(
+            text, parse_mode="Markdown", reply_markup=config_menu_keyboard(False),
         )
 
 
@@ -221,7 +287,7 @@ async def config_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             value = int(text)
             if not 1 <= value <= 50:
                 await update.message.reply_text(
-                    "Leverage must be between 1 and 50. Try again:"
+                    "⚠️ Leverage must be between 1 and 50. Try again:"
                 )
                 return
             user_db.update_user_config(user_id, max_leverage=value)
@@ -229,46 +295,47 @@ async def config_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif awaiting == "max_open_positions":
             value = int(text)
             if not 1 <= value <= 50:
-                await update.message.reply_text("Must be between 1 and 50. Try again:")
+                await update.message.reply_text("⚠️ Must be between 1 and 50. Try again:")
                 return
             user_db.update_user_config(user_id, max_open_positions=value)
 
         elif awaiting == "max_position_size_usd":
             value = float(text)
             if value < 10:
-                await update.message.reply_text("Minimum is $10. Try again:")
+                await update.message.reply_text("⚠️ Minimum is $10. Try again:")
                 return
             user_db.update_user_config(user_id, max_position_size_usd=value)
 
         elif awaiting == "max_total_exposure_usd":
             value = float(text)
             if value < 10:
-                await update.message.reply_text("Minimum is $10. Try again:")
+                await update.message.reply_text("⚠️ Minimum is $10. Try again:")
                 return
             user_db.update_user_config(user_id, max_total_exposure_usd=value)
 
         elif awaiting == "max_daily_loss_pct":
             value = float(text)
             if not 0.1 <= value <= 100:
-                await update.message.reply_text("Must be between 0.1% and 100%. Try again:")
+                await update.message.reply_text("⚠️ Must be between 0.1% and 100%. Try again:")
                 return
             user_db.update_user_config(user_id, max_daily_loss_pct=value)
 
         else:
             context.user_data.pop("awaiting_config", None)
-            await update.message.reply_text("Unknown setting.")
+            await update.message.reply_text("❌ Unknown setting.")
             return
 
     except ValueError:
-        await update.message.reply_text("Invalid number. Try again:")
+        await update.message.reply_text("⚠️ Invalid number. Try again:")
         return
 
     # Success — clear state and show updated config with menu
     context.user_data.pop("awaiting_config", None)
     cfg = user_db.get_user_config(user_id)
     config_text = _format_config(cfg)
+    is_active = _is_pipeline_active(context, user_id)
     await update.message.reply_text(
-        config_text + "\n\n_Setting updated._",
+        config_text + "\n\n_✅ Setting updated._",
         parse_mode="Markdown",
-        reply_markup=config_main_keyboard(),
+        reply_markup=config_menu_keyboard(is_active),
     )

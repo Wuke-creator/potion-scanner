@@ -228,8 +228,8 @@ async def test_notify_new_signal_auto_execute_false(notifier, mock_bot):
     # Extract button labels from the inline keyboard
     buttons = markup.inline_keyboard[0]
     labels = [b.text for b in buttons]
-    assert "Approve" in labels
-    assert "Reject" in labels
+    assert any("Approve" in l for l in labels)
+    assert any("Reject" in l for l in labels)
 
     # Check callback data
     callback_data = [b.callback_data for b in buttons]

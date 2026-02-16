@@ -52,7 +52,8 @@ from src.telegram.handlers.config import (
     config_text_handler,
     preset_command,
 )
-from src.telegram.handlers.help import cancel_command, help_command, start_command, unknown_command
+from src.telegram.handlers.help import cancel_command, help_command, start_command, start_register_callback, unknown_command
+from src.telegram.handlers.menu import menu_callback, menu_command
 from src.telegram.middleware import dm_only_filter, global_error_handler, rate_limit_filter
 from src.telegram.handlers.registration import build_registration_handler
 from src.telegram.handlers.trades import (
@@ -60,6 +61,7 @@ from src.telegram.handlers.trades import (
     stats_command,
     trade_detail_callback,
     trades_command,
+    trading_callback,
 )
 
 logger = logging.getLogger(__name__)
@@ -104,20 +106,17 @@ class TelegramBot:
 
         # Register command menu (autocomplete suggestions when typing /)
         await self._app.bot.set_my_commands([
-            BotCommand("start", "Welcome message"),
+            BotCommand("menu", "Open main menu"),
+            BotCommand("start", "Welcome / main menu"),
             BotCommand("help", "Show available commands"),
             BotCommand("register", "Register with an invite code"),
             BotCommand("balance", "Account balance"),
             BotCommand("positions", "Open positions"),
-            BotCommand("status", "Risk dashboard & access info"),
             BotCommand("trades", "Active trades"),
             BotCommand("history", "Trade history"),
             BotCommand("stats", "Trading statistics"),
+            BotCommand("status", "Risk dashboard"),
             BotCommand("config", "View & change settings"),
-            BotCommand("preset", "Change strategy preset"),
-            BotCommand("auto", "Toggle auto-execute"),
-            BotCommand("activate", "Resume receiving trade signals"),
-            BotCommand("deactivate", "Pause trade signals"),
             BotCommand("cancel", "Cancel current action"),
             BotCommand("admin", "Admin commands"),
         ])
@@ -154,12 +153,17 @@ class TelegramBot:
 
         self._app.add_handler(CommandHandler("start", start_command))
         self._app.add_handler(CommandHandler("help", help_command))
+        self._app.add_handler(CommandHandler("menu", menu_command))
         self._app.add_handler(CommandHandler("cancel", cancel_command))
 
         # Registration conversation (must be before simple command handlers)
         self._app.add_handler(build_registration_handler())
 
-        # Account monitoring
+        # Menu navigation callbacks
+        self._app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
+        self._app.add_handler(CallbackQueryHandler(start_register_callback, pattern=r"^start:register$"))
+
+        # Account monitoring (command shortcuts)
         self._app.add_handler(CommandHandler("balance", balance_command))
         self._app.add_handler(CommandHandler("positions", positions_command))
         self._app.add_handler(CommandHandler("status", status_command))
@@ -180,6 +184,7 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("history", history_command))
         self._app.add_handler(CommandHandler("stats", stats_command))
         self._app.add_handler(CallbackQueryHandler(trade_detail_callback, pattern=r"^(trade:|trades_page:|history_page:|back:trades|noop)"))
+        self._app.add_handler(CallbackQueryHandler(trading_callback, pattern=r"^trading:"))
 
         # Trade approval (Approve/Reject from push notifications, Close Position)
         self._app.add_handler(CallbackQueryHandler(signal_approval_callback, pattern=r"^signal:(approve|reject):"))

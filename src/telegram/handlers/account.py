@@ -8,7 +8,7 @@ from telegram.ext import ContextTypes
 from src.orchestrator import Orchestrator
 from src.state.user_db import UserDatabase
 from src.telegram.formatters import format_balance, format_positions, format_status
-from src.telegram.keyboards import account_nav_keyboard
+from src.telegram.keyboards import account_nav_keyboard, trading_sub_keyboard
 from src.telegram.middleware import registered_only
 
 logger = logging.getLogger(__name__)
@@ -33,7 +33,7 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if not client:
         await update.message.reply_text(
-            "Your trading pipeline is not active. Use /activate or contact admin."
+            "⚠️ Your trading pipeline is not active. Use /activate or contact admin."
         )
         return
 
@@ -41,14 +41,14 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         balance = client.get_balance()
     except Exception as e:
         logger.error("Failed to fetch balance for user %s: %s", user_id, e)
-        await update.message.reply_text("Failed to fetch balance. Try again later.")
+        await update.message.reply_text("⚠️ Failed to fetch balance. Try again later.")
         return
 
     text = format_balance(balance)
     await update.message.reply_text(
         text,
         parse_mode="Markdown",
-        reply_markup=account_nav_keyboard("balance"),
+        reply_markup=trading_sub_keyboard(),
     )
 
 
@@ -60,7 +60,7 @@ async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if not client:
         await update.message.reply_text(
-            "Your trading pipeline is not active. Use /activate or contact admin."
+            "⚠️ Your trading pipeline is not active. Use /activate or contact admin."
         )
         return
 
@@ -68,14 +68,14 @@ async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         positions = client.get_open_positions()
     except Exception as e:
         logger.error("Failed to fetch positions for user %s: %s", user_id, e)
-        await update.message.reply_text("Failed to fetch positions. Try again later.")
+        await update.message.reply_text("⚠️ Failed to fetch positions. Try again later.")
         return
 
     text = format_positions(positions)
     await update.message.reply_text(
         text,
         parse_mode="Markdown",
-        reply_markup=account_nav_keyboard("positions"),
+        reply_markup=trading_sub_keyboard(),
     )
 
 
@@ -88,7 +88,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if not client:
         await update.message.reply_text(
-            "Your trading pipeline is not active. Use /activate or contact admin."
+            "⚠️ Your trading pipeline is not active. Use /activate or contact admin."
         )
         return
 
@@ -100,14 +100,15 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         positions = client.get_open_positions()
     except Exception as e:
         logger.error("Failed to fetch account data for user %s: %s", user_id, e)
-        await update.message.reply_text("Failed to fetch account data. Try again later.")
+        await update.message.reply_text("⚠️ Failed to fetch account data. Try again later.")
         return
 
     text = format_status(user_config, balance, positions, expires_at)
+    from src.telegram.keyboards import dashboard_keyboard
     await update.message.reply_text(
         text,
         parse_mode="Markdown",
-        reply_markup=account_nav_keyboard("status"),
+        reply_markup=dashboard_keyboard(),
     )
 
 
@@ -121,12 +122,12 @@ async def account_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     chat_id = update.effective_chat.id
     user_id = user_db.get_user_by_telegram_chat_id(chat_id)
     if not user_id:
-        await query.edit_message_text("You're not registered. Use /register to get started.")
+        await query.edit_message_text("❌ You're not registered. Use /register to get started.")
         return
 
     client = _get_client(context, user_id)
     if not client:
-        await query.edit_message_text("Your trading pipeline is not active.")
+        await query.edit_message_text("⚠️ Your trading pipeline is not active.")
         return
 
     view = query.data.replace("nav:", "")
@@ -148,7 +149,7 @@ async def account_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return
     except Exception as e:
         logger.error("Failed to fetch data for nav:%s user %s: %s", view, user_id, e)
-        await query.edit_message_text("Failed to fetch data. Try again later.")
+        await query.edit_message_text("⚠️ Failed to fetch data. Try again later.")
         return
 
     await query.edit_message_text(
@@ -165,23 +166,23 @@ async def activate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     orchestrator: Orchestrator | None = context.bot_data.get("orchestrator")
 
     if not orchestrator:
-        await update.message.reply_text("Trading system is not available.")
+        await update.message.reply_text("⚠️ Trading system is not available.")
         return
 
     paused = orchestrator.is_user_paused(user_id)
     if paused is None:
         await update.message.reply_text(
-            "Your trading pipeline is not active. Contact admin."
+            "⚠️ Your trading pipeline is not active. Contact admin."
         )
         return
 
     if not paused:
-        await update.message.reply_text("Trading is already active.")
+        await update.message.reply_text("✅ Trading is already active.")
         return
 
     orchestrator.resume_user(user_id)
     await update.message.reply_text(
-        "Trading activated. You will now receive trade signals."
+        "▶️ Trading activated! You will now receive trade signals."
     )
 
 
@@ -192,22 +193,22 @@ async def deactivate_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     orchestrator: Orchestrator | None = context.bot_data.get("orchestrator")
 
     if not orchestrator:
-        await update.message.reply_text("Trading system is not available.")
+        await update.message.reply_text("⚠️ Trading system is not available.")
         return
 
     paused = orchestrator.is_user_paused(user_id)
     if paused is None:
         await update.message.reply_text(
-            "Your trading pipeline is not active. Contact admin."
+            "⚠️ Your trading pipeline is not active. Contact admin."
         )
         return
 
     if paused:
-        await update.message.reply_text("Trading is already paused.")
+        await update.message.reply_text("⏸ Trading is already paused.")
         return
 
     orchestrator.pause_user(user_id)
     await update.message.reply_text(
-        "Trading deactivated. You will not receive new trade signals.\n"
+        "⏸ Trading deactivated. You will not receive new trade signals.\n"
         "Use /activate to resume."
     )

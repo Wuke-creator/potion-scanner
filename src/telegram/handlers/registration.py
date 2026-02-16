@@ -45,7 +45,7 @@ async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # DM-only check
     if update.effective_chat.type != "private":
         await update.message.reply_text(
-            "Registration must be done in a private chat. Send me a DM."
+            "🔒 Registration must be done in a private chat. Send me a DM."
         )
         return ConversationHandler.END
 
@@ -55,10 +55,14 @@ async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Check if already registered
     existing_user = user_db.get_user_by_telegram_chat_id(chat_id)
     if existing_user:
-        await update.message.reply_text("You're already registered.")
+        await update.message.reply_text("✅ You're already registered. Use /menu to get started!")
         return ConversationHandler.END
 
-    await update.message.reply_text("Enter your invite code:")
+    await update.message.reply_text(
+        "🔑 *Registration*\n\n"
+        "Let's get you set up! Enter your invite code:",
+        parse_mode="Markdown",
+    )
     return INVITE_CODE
 
 
@@ -72,11 +76,11 @@ async def receive_invite_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         reason = result["reason"]
         if "redeemed" in reason.lower():
             await update.message.reply_text(
-                "This code has already been used. Contact admin for a new code."
+                "❌ This code has already been used. Contact admin for a new code."
             )
         else:
             await update.message.reply_text(
-                "Invalid or expired invite code. Contact admin for access."
+                "❌ Invalid or expired invite code. Contact admin for access."
             )
         return ConversationHandler.END
 
@@ -87,10 +91,10 @@ async def receive_invite_code(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data["duration_days"] = duration
 
     await update.message.reply_text(
-        f"Code accepted! Access: {duration_text}\n\n"
-        "Now I'll need your Hyperliquid API credentials.\n"
+        f"✅ *Code accepted!* Access: {duration_text}\n\n"
+        "🔐 Now I'll need your Hyperliquid API credentials.\n"
         "Make sure you're in a private chat.\n\n"
-        "Send your *Account Address* (0x...):",
+        "📋 Send your *Account Address* (0x...):",
         parse_mode="Markdown",
     )
     return ACCOUNT_ADDRESS
@@ -108,8 +112,8 @@ async def receive_account_address(update: Update, context: ContextTypes.DEFAULT_
 
     if not _HEX_PATTERN.match(text) or len(text) != 42:
         await update.effective_chat.send_message(
-            "Invalid address format. Must be a 42-character 0x-prefixed hex address.\n"
-            "Send your *Account Address* (0x...):",
+            "❌ Invalid address format. Must be a 42-character 0x-prefixed hex address.\n\n"
+            "📋 Send your *Account Address* (0x...):",
             parse_mode="Markdown",
         )
         return ACCOUNT_ADDRESS
@@ -117,8 +121,8 @@ async def receive_account_address(update: Update, context: ContextTypes.DEFAULT_
     context.user_data["account_address"] = text
     masked = mask_address(text)
     await update.effective_chat.send_message(
-        f"Account Address saved ({masked}).\n\n"
-        "Now send your *API Wallet Address* (0x...):",
+        f"✅ Account Address saved (`{masked}`)\n\n"
+        "🔑 Now send your *API Wallet Address* (0x...):",
         parse_mode="Markdown",
     )
     return API_WALLET
@@ -135,8 +139,8 @@ async def receive_api_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if not _HEX_PATTERN.match(text) or len(text) != 42:
         await update.effective_chat.send_message(
-            "Invalid address format. Must be a 42-character 0x-prefixed hex address.\n"
-            "Send your *API Wallet Address* (0x...):",
+            "❌ Invalid address format. Must be a 42-character 0x-prefixed hex address.\n\n"
+            "🔑 Send your *API Wallet Address* (0x...):",
             parse_mode="Markdown",
         )
         return API_WALLET
@@ -144,8 +148,8 @@ async def receive_api_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["api_wallet"] = text
     masked = mask_address(text)
     await update.effective_chat.send_message(
-        f"API Wallet saved ({masked}).\n\n"
-        "Now send your *API Private Key* (0x...):",
+        f"✅ API Wallet saved (`{masked}`)\n\n"
+        "🔒 Now send your *API Private Key* (0x...):",
         parse_mode="Markdown",
     )
     return API_SECRET
@@ -162,8 +166,8 @@ async def receive_api_secret(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if not _HEX_PATTERN.match(text) or len(text) != 66:
         await update.effective_chat.send_message(
-            "Invalid private key format. Must be a 66-character 0x-prefixed hex string.\n"
-            "Send your *API Private Key* (0x...):",
+            "❌ Invalid private key format. Must be a 66-character 0x-prefixed hex string.\n\n"
+            "🔒 Send your *API Private Key* (0x...):",
             parse_mode="Markdown",
         )
         return API_SECRET
@@ -172,12 +176,12 @@ async def receive_api_secret(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("Testnet", callback_data="network:testnet"),
-            InlineKeyboardButton("Mainnet", callback_data="network:mainnet"),
+            InlineKeyboardButton("🧪 Testnet", callback_data="network:testnet"),
+            InlineKeyboardButton("🌐 Mainnet", callback_data="network:mainnet"),
         ]
     ])
     await update.effective_chat.send_message(
-        "Private Key encrypted.\n\nSelect network:",
+        "🔐 Private Key encrypted.\n\n🌐 Select network:",
         reply_markup=keyboard,
     )
     return NETWORK
@@ -190,19 +194,19 @@ async def receive_network(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     network = query.data.replace("network:", "")
     if network not in ("testnet", "mainnet"):
-        await query.edit_message_text("Invalid network. Please select Testnet or Mainnet.")
+        await query.edit_message_text("❌ Invalid network. Please select Testnet or Mainnet.")
         return NETWORK
 
     if network == "mainnet":
         await query.edit_message_text(
-            "Only *Testnet* trading is available at the moment.\n\n"
-            "Please select Testnet to continue.",
+            "⚠️ Only *Testnet* trading is available at the moment.\n\n"
+            "Please select 🧪 Testnet to continue.",
             parse_mode="Markdown",
         )
         return NETWORK
 
     context.user_data["network"] = network
-    await query.edit_message_text(f"Network: {network}\n\nValidating credentials...")
+    await query.edit_message_text("🔄 Validating credentials...")
 
     user_db = _get_user_db(context)
     chat_id = update.effective_chat.id
@@ -222,8 +226,9 @@ async def receive_network(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as e:
         logger.warning("Credential validation failed for chat %d: %s", chat_id, e)
         await query.edit_message_text(
-            f"Credential validation failed: {e}\n\n"
-            "Please check your credentials and try /register again."
+            f"❌ *Credential validation failed:*\n{e}\n\n"
+            "Please check your credentials and try /register again.",
+            parse_mode="Markdown",
         )
         _clear_user_data(context)
         return ConversationHandler.END
@@ -244,7 +249,7 @@ async def receive_network(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as e:
         logger.error("Failed to create user %s: %s", user_id, e)
         await query.edit_message_text(
-            "Registration failed. You may already be registered. Contact admin."
+            "❌ Registration failed. You may already be registered. Contact admin."
         )
         _clear_user_data(context)
         return ConversationHandler.END
@@ -264,16 +269,21 @@ async def receive_network(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except Exception as e:
             logger.error("Failed to activate pipeline for user %s: %s", user_id, e)
 
-    # Build completion message
+    # Build congratulations message with Continue button
     expiry_text = format_expiry(expires_at)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 Continue", callback_data="menu:main")],
+    ])
     await query.edit_message_text(
-        f"*Registration complete!*\n\n"
-        f"Access expires: {expiry_text}\n"
-        f"Strategy: runner (33/33/34)\n"
-        f"Auto-execute: OFF\n"
-        f"Max leverage: 20x\n\n"
-        f"Use /help to see all commands.",
+        "🎉 *Registration Complete!*\n\n"
+        "Welcome to Potion Perps! Your account is set up and ready to go.\n\n"
+        f"⏰ Access expires: {expiry_text}\n"
+        f"🎯 Strategy: runner (33/33/34)\n"
+        f"⚡ Auto-execute: OFF\n"
+        f"📊 Max leverage: 20x\n\n"
+        "Press Continue to open the main menu!",
         parse_mode="Markdown",
+        reply_markup=keyboard,
     )
 
     _clear_user_data(context)
@@ -284,7 +294,7 @@ async def receive_network(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle /cancel — exit registration at any step."""
     _clear_user_data(context)
-    await update.message.reply_text("Registration cancelled.")
+    await update.message.reply_text("❌ Registration cancelled.")
     return ConversationHandler.END
 
 
