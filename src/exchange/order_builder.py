@@ -35,6 +35,18 @@ def _floor_to(value: float, decimals: int) -> float:
     return math.floor(value * factor) / factor
 
 
+def _round_price(price: float, sig_figs: int = 5) -> float:
+    """Round a price to N significant figures (Hyperliquid tick size rule).
+
+    Hyperliquid requires prices to have at most 5 significant figures.
+    """
+    if price == 0:
+        return 0.0
+    magnitude = math.floor(math.log10(abs(price)))
+    factor = 10 ** (sig_figs - 1 - magnitude)
+    return round(price * factor) / factor
+
+
 @dataclass
 class OrderParams:
     """Parameters for a single Hyperliquid order, ready for the SDK."""
@@ -135,12 +147,16 @@ def build_orders(
             f"is below Hyperliquid minimum of ${MIN_ORDER_VALUE_USD:.2f}"
         )
 
+    # --- Round all prices to Hyperliquid tick size (5 significant figures) ---
+    entry_px = _round_price(signal.entry)
+    sl_px = _round_price(signal.stop_loss)
+
     # --- Entry order (limit GTC) ---
     entry = OrderParams(
         coin=coin,
         is_buy=is_long,
         sz=sz,
-        limit_px=signal.entry,
+        limit_px=entry_px,
         order_type={"limit": {"tif": "Gtc"}},
         reduce_only=False,
     )
@@ -150,10 +166,10 @@ def build_orders(
         coin=coin,
         is_buy=not is_long,
         sz=sz,
-        limit_px=signal.stop_loss,
+        limit_px=sl_px,
         order_type={
             "trigger": {
-                "triggerPx": signal.stop_loss,
+                "triggerPx": sl_px,
                 "isMarket": True,
                 "tpsl": "sl",
             }
@@ -162,7 +178,7 @@ def build_orders(
     )
 
     # --- Take-profit orders (trigger, market, reduce-only, split sizes) ---
-    tp_prices = [signal.tp1, signal.tp2, signal.tp3]
+    tp_prices = [_round_price(signal.tp1), _round_price(signal.tp2), _round_price(signal.tp3)]
     take_profits = []
     allocated = 0.0
     for i, (tp_price, fraction) in enumerate(zip(tp_prices, tp_split)):
@@ -207,12 +223,12 @@ def build_orders(
         signal.side.value,
         "BUY" if is_long else "SELL",
         sz,
-        signal.entry,
+        entry_px,
         leverage,
-        signal.stop_loss,
-        signal.tp1,
-        signal.tp2,
-        signal.tp3,
+        sl_px,
+        tp_prices[0],
+        tp_prices[1],
+        tp_prices[2],
     )
 
     return trade_set

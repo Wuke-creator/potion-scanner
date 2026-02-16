@@ -126,9 +126,17 @@ def format_account_info(
 def format_calls_view(signals: list[dict]) -> str:
     """Format recent signals for the calls view."""
     if not signals:
-        return "📡 *Calls View*\n\nNo recent signals."
+        return (
+            "📡 *Calls View*\n\n"
+            "_Signal approval mode — incoming signals appear here._\n\n"
+            "No recent signals."
+        )
 
-    lines = ["📡 *Calls View*\n\n📋 Recent signals:"]
+    lines = [
+        "📡 *Calls View*\n\n"
+        "_Signal approval mode — approve or reject incoming trades._\n\n"
+        "📋 Recent signals:"
+    ]
     for s in signals:
         status = s.get("status", "pending")
         if status == "open":
@@ -157,7 +165,12 @@ def format_trading_hub(balance: dict[str, str] | None, positions: list | None, o
     if balance:
         text += f"💰 Balance: {format_usd(balance.get('account_value', '0'))}\n"
     else:
-        text += "💰 Balance: _Pipeline not active_\n"
+        text += "💰 Balance: _Unavailable_\n"
+
+    # Calculate unrealized PnL from positions
+    if positions:
+        total_unrealized = sum(float(p.get("unrealized_pnl", 0)) for p in positions)
+        text += f"📈 Unrealized PnL: {format_pnl(total_unrealized)}\n"
 
     pos_count = len(positions) if positions else 0
     text += f"📂 Open Positions: {pos_count}\n"

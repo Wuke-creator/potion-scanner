@@ -92,9 +92,13 @@ def _build_main_menu_text(user_db: UserDatabase, user_id: str) -> str:
 
     # Get wallet address
     try:
-        creds = user_db.get_credentials(user_id)
-        wallet = mask_address(creds.get("account_address", "N/A"))
-        network = creds.get("network", "testnet").capitalize()
+        creds = user_db.get_user_credentials_decrypted(user_id)
+        if creds:
+            wallet = mask_address(creds.get("account_address", "N/A"))
+            network = creds.get("network", "testnet").capitalize()
+        else:
+            wallet = "N/A"
+            network = "Testnet"
     except Exception:
         wallet = "N/A"
         network = "Testnet"
@@ -117,7 +121,9 @@ def _build_account_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> str
     user_config = user_db.get_user_config(user_id)
     expires_at = user_db.get_access_expiry(user_id)
     try:
-        creds = user_db.get_credentials(user_id)
+        creds = user_db.get_user_credentials_decrypted(user_id)
+        if not creds:
+            creds = {}
     except Exception:
         creds = {}
     return format_account_info(user_config, creds, expires_at)
@@ -181,8 +187,8 @@ def _build_trading_hub_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) ->
         try:
             balance = client.get_balance()
             positions = client.get_open_positions()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("Failed to fetch trading data for user %s: %s", user_id, e)
 
     if trade_db:
         try:
@@ -244,22 +250,24 @@ def _build_config_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> str:
 # Screen prefix → rebuild mapping (for refresh)
 # ------------------------------------------------------------------
 
-_SCREEN_MAP = {
-    "🧪": "main",
-    "👤": "account",
-    "📡": "calls",
-    "📊 *Trading": "trading",
-    "📈": "stats",
-    "🛡": "dashboard",
-    "⚙️": "config",
-}
+# Screen detection: Telegram returns plain text (markdown stripped).
+# Use plain-text prefixes and check longer prefixes first.
+_SCREEN_MAP = [
+    ("📊 Trading\n", "trading"),       # Must be before stats (also 📊)
+    ("📈 Trading Statistics", "stats"),
+    ("🧪 Welcome", "main"),
+    ("👤 Account", "account"),
+    ("📡 Calls View", "calls"),
+    ("🛡 Risk Dashboard", "dashboard"),
+    ("⚙️ Configuration", "config"),
+]
 
 
 def _detect_current_screen(message_text: str | None) -> str:
     """Detect which screen is currently displayed from the message text prefix."""
     if not message_text:
         return "main"
-    for prefix, screen in _SCREEN_MAP.items():
+    for prefix, screen in _SCREEN_MAP:
         if message_text.startswith(prefix):
             return screen
     return "main"
@@ -361,9 +369,14 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await _refresh_screen(query, context, user_id, user_db, screen)
 
     except Exception as e:
+        err_msg = str(e)
+        # Telegram raises this when edit content is identical — not a real error
+        if "Message is not modified" in err_msg:
+            logger.debug("Refresh: content unchanged for user %s", user_id)
+            return
         logger.exception("Error handling menu callback %s for user %s", data, user_id)
         try:
-            await query.edit_message_text(f"Something went wrong. Try again.\n\n_Error: {e}_", parse_mode="Markdown")
+            await query.edit_message_text("⚠️ Something went wrong. Try again.")
         except Exception:
             pass
 

@@ -185,7 +185,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    closed = trade_db.get_trades_by_status(TradeStatus.CLOSED)
+    closed = trade_db.get_completed_trades()
     # Most recent first
     closed.sort(key=lambda t: t.closed_at or t.updated_at, reverse=True)
     text, keyboard = _format_trade_list(closed, 0, "Trade History")
@@ -261,7 +261,7 @@ async def trade_detail_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif data.startswith("history_page:"):
         page = int(data.split(":")[1])
-        closed = trade_db.get_trades_by_status(TradeStatus.CLOSED)
+        closed = trade_db.get_completed_trades()
         closed.sort(key=lambda t: t.closed_at or t.updated_at, reverse=True)
         text, keyboard = _format_trade_list(closed, page, "Trade History")
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
@@ -327,7 +327,7 @@ async def trading_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if not trade_db:
             await query.edit_message_text("⚠️ Your trading pipeline is not active.")
             return
-        closed = trade_db.get_trades_by_status(TradeStatus.CLOSED)
+        closed = trade_db.get_completed_trades()
         closed.sort(key=lambda t: t.closed_at or t.updated_at, reverse=True)
         text, keyboard = _format_trade_list(closed, 0, "Trade History")
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)

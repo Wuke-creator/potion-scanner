@@ -338,6 +338,7 @@ class UserDatabase:
             "max_position_size_usd": row["max_position_size_usd"],
             "max_total_exposure_usd": row["max_total_exposure_usd"],
             "min_order_usd": row["min_order_usd"],
+            "invite_code": row["invite_code"],
         }
 
     def update_user_config(self, user_id: str, **kwargs: Any) -> None:

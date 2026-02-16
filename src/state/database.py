@@ -175,6 +175,15 @@ class TradeDatabase:
         ).fetchall()
         return [self._row_to_trade(r) for r in rows]
 
+    def get_completed_trades(self) -> list[TradeRecord]:
+        """Return all closed and canceled trades (for history view)."""
+        rows = self._conn.execute(
+            "SELECT * FROM trades WHERE user_id = ? AND status IN ('closed', 'canceled') "
+            "ORDER BY created_at",
+            (self._user_id,),
+        ).fetchall()
+        return [self._row_to_trade(r) for r in rows]
+
     def update_trade_status(
         self,
         trade_id: int,
