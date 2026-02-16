@@ -479,44 +479,79 @@ async def list_admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 # Test signal injection
 # ------------------------------------------------------------------
 
-_TEST_SIGNALS = {
-    "signal": (
-        "TRADING SIGNAL ALERT\n\n"
-        "PAIR: ETH/USDT #9999\n"
-        "(LOW RISK)\n\n"
-        "TYPE: SWING\n"
-        "SIZE: 1-4%\n"
-        "SIDE: LONG\n\n"
-        "ENTRY: 2100.7\n"
-        "SL: 2042.0          (-30.00%)\n\n"
-        "TAKE PROFIT TARGETS:\n\n"
-        "TP1: 2119.5      (16.67%)\n"
-        "TP2: 2146.8      (36.67%)\n"
-        "TP3: 2178.2      (70.00%)\n\n"
-        "LEVERAGE: 5x\n\n"
-        "PROTECT YOUR CAPITAL, MANAGE RISK, LETS PRINT!"
-    ),
-    "tp1": (
-        "**\u2705 TP TARGET 1 HIT**\n\n"
-        "**\U0001f4ddPAIR:** ETH/USDT #9999\n\n"
-        "**\U0001f4b0PROFIT:** 16.67% \U0001f4c8"
-    ),
-    "tp2": (
-        "**\u2705 TP TARGET 2 HIT**\n\n"
-        "**\U0001f4ddPAIR:** ETH/USDT #9999\n\n"
-        "**\U0001f4b0PROFIT:** 36.67% \U0001f4c8"
-    ),
-    "all_tp": (
-        "**\U0001f525ALL TAKE-PROFIT TARGETS HIT**\n\n"
-        "**\U0001f4ddPAIR:** ETH/USDT #9999\n\n"
-        "**\U0001f4b0PROFIT:** 70.00% \U0001f4c8"
-    ),
-}
+# Track the last injected trade ID so TP/close signals target the right trade
+_last_inject_trade_id: int | None = None
+
+
+def _get_any_client(context: ContextTypes.DEFAULT_TYPE):
+    """Get a HyperliquidClient from any active pipeline (for price fetching)."""
+    orchestrator = _get_orchestrator(context)
+    for ctx in orchestrator.pipelines.values():
+        return ctx.client
+    return None
+
+
+def _build_signal(price: float, trade_id: int) -> str:
+    """Build a LONG signal around the current price that will fill immediately."""
+    entry = round(price * 1.001, 2)  # slightly above mid → limit buy likely fills
+    sl = round(price * 0.97, 2)      # 3% below
+    tp1 = round(price * 1.01, 2)     # +1%
+    tp2 = round(price * 1.02, 2)     # +2%
+    tp3 = round(price * 1.03, 2)     # +3%
+    return (
+        f"TRADING SIGNAL ALERT\n\n"
+        f"PAIR: ETH/USDT #{trade_id}\n"
+        f"(LOW RISK)\n\n"
+        f"TYPE: SWING\n"
+        f"SIZE: 1-4%\n"
+        f"SIDE: LONG\n\n"
+        f"ENTRY: {entry}\n"
+        f"SL: {sl}          (-3.00%)\n\n"
+        f"TAKE PROFIT TARGETS:\n\n"
+        f"TP1: {tp1}      (1.00%)\n"
+        f"TP2: {tp2}      (2.00%)\n"
+        f"TP3: {tp3}      (3.00%)\n\n"
+        f"LEVERAGE: 3x\n\n"
+        f"PROTECT YOUR CAPITAL, MANAGE RISK, LETS PRINT!"
+    )
+
+
+def _build_tp_signal(tp_num: str, profit: str, trade_id: int) -> str:
+    """Build a TP hit signal for the given trade."""
+    if tp_num == "all":
+        return (
+            f"**\U0001f525ALL TAKE-PROFIT TARGETS HIT**\n\n"
+            f"**\U0001f4ddPAIR:** ETH/USDT #{trade_id}\n\n"
+            f"**\U0001f4b0PROFIT:** {profit} \U0001f4c8"
+        )
+    return (
+        f"**\u2705 TP TARGET {tp_num} HIT**\n\n"
+        f"**\U0001f4ddPAIR:** ETH/USDT #{trade_id}\n\n"
+        f"**\U0001f4b0PROFIT:** {profit} \U0001f4c8"
+    )
 
 
 @admin_only
 async def inject_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /inject — show test signal buttons for quick injection."""
+    global _last_inject_trade_id
+
+    # Show current price for context
+    client = _get_any_client(context)
+    price_info = ""
+    if client:
+        try:
+            mids = client.get_all_mids()
+            eth_price = float(mids.get("ETH", "0"))
+            if eth_price:
+                price_info = f"\nCurrent ETH: ${eth_price:,.2f}\n"
+        except Exception:
+            pass
+
+    trade_id_info = ""
+    if _last_inject_trade_id:
+        trade_id_info = f"\nLast injected trade: #{_last_inject_trade_id}\n"
+
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("New Signal (ETH LONG)", callback_data="inject:signal")],
         [
@@ -526,7 +561,8 @@ async def inject_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         [InlineKeyboardButton("All TP Hit", callback_data="inject:all_tp")],
     ])
     await update.message.reply_text(
-        "*Test Signal Injection*\n\nSelect a signal to inject into the pipeline for all active users:",
+        f"*Test Signal Injection*\n{price_info}{trade_id_info}\n"
+        f"Select a signal to inject into the pipeline for all active users:",
         parse_mode="Markdown",
         reply_markup=keyboard,
     )
@@ -534,6 +570,8 @@ async def inject_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def inject_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle inject:{signal_type} callbacks — dispatch test signal to all users."""
+    global _last_inject_trade_id
+
     query = update.callback_query
     await query.answer()
 
@@ -544,20 +582,63 @@ async def inject_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     signal_type = query.data.replace("inject:", "")
-    raw_signal = _TEST_SIGNALS.get(signal_type)
-    if not raw_signal:
-        await query.edit_message_text(f"Unknown signal type: {signal_type}")
-        return
-
     orchestrator = _get_orchestrator(context)
-    orchestrator.dispatch(raw_signal)
 
-    label = {"signal": "New Signal", "tp1": "TP1 Hit", "tp2": "TP2 Hit", "all_tp": "All TP Hit"}
-    pipelines = len(orchestrator.pipelines)
-    paused = sum(1 for ctx in orchestrator.pipelines.values() if ctx.paused)
+    if signal_type == "signal":
+        # Fetch live ETH price
+        client = _get_any_client(context)
+        if not client:
+            await query.edit_message_text("No active pipelines — cannot fetch price.")
+            return
 
-    await query.edit_message_text(
-        f"*{label.get(signal_type, signal_type)}* injected.\n"
-        f"Dispatched to {pipelines - paused} active pipeline(s).",
-        parse_mode="Markdown",
-    )
+        try:
+            mids = client.get_all_mids()
+            eth_price = float(mids.get("ETH", "0"))
+        except Exception as e:
+            await query.edit_message_text(f"Failed to fetch ETH price: {e}")
+            return
+
+        if not eth_price:
+            await query.edit_message_text("Could not get ETH price.")
+            return
+
+        import random
+        trade_id = random.randint(8000, 8999)
+        _last_inject_trade_id = trade_id
+
+        raw_signal = _build_signal(eth_price, trade_id)
+        orchestrator.dispatch(raw_signal)
+
+        pipelines = len(orchestrator.pipelines)
+        paused = sum(1 for ctx in orchestrator.pipelines.values() if ctx.paused)
+        await query.edit_message_text(
+            f"*New Signal #{trade_id}* injected (ETH @ ${eth_price:,.2f}).\n"
+            f"Dispatched to {pipelines - paused} active pipeline(s).",
+            parse_mode="Markdown",
+        )
+
+    elif signal_type in ("tp1", "tp2", "all_tp"):
+        if not _last_inject_trade_id:
+            await query.edit_message_text("No test trade active. Inject a New Signal first.")
+            return
+
+        tp_map = {
+            "tp1": ("1", "1.00%"),
+            "tp2": ("2", "2.00%"),
+            "all_tp": ("all", "3.00%"),
+        }
+        tp_num, profit = tp_map[signal_type]
+        raw_signal = _build_tp_signal(tp_num, profit, _last_inject_trade_id)
+        orchestrator.dispatch(raw_signal)
+
+        label = {"tp1": "TP1 Hit", "tp2": "TP2 Hit", "all_tp": "All TP Hit"}
+        pipelines = len(orchestrator.pipelines)
+        paused = sum(1 for ctx in orchestrator.pipelines.values() if ctx.paused)
+        await query.edit_message_text(
+            f"*{label[signal_type]}* for trade #{_last_inject_trade_id} injected.\n"
+            f"Dispatched to {pipelines - paused} active pipeline(s).",
+            parse_mode="Markdown",
+        )
+
+    else:
+        await query.edit_message_text(f"Unknown signal type: {signal_type}")
