@@ -493,7 +493,7 @@ def _get_any_client(context: ContextTypes.DEFAULT_TYPE):
 
 def _build_signal(price: float, trade_id: int) -> str:
     """Build a LONG signal around the current price that will fill immediately."""
-    entry = round(price * 1.001, 2)  # slightly above mid → limit buy likely fills
+    entry = round(price * 1.005, 2)  # 0.5% above mid → ensures limit buy fills
     sl = round(price * 0.97, 2)      # 3% below
     tp1 = round(price * 1.01, 2)     # +1%
     tp2 = round(price * 1.02, 2)     # +2%

@@ -158,15 +158,17 @@ async def test_approve_pending_trade_exchange_failure():
 
     with patch("src.telegram.handlers.approval.build_orders") as mock_build, \
          patch("src.telegram.handlers.approval.PositionManager") as MockPM:
+        from src.exchange.position_manager import OrderSubmissionError
         mock_build.return_value = MagicMock()
         mock_pm = MockPM.return_value
-        mock_pm.submit_trade.return_value = False
+        mock_pm.submit_trade.side_effect = OrderSubmissionError("Entry order rejected: insufficient margin")
 
         await signal_approval_callback(update, context)
 
         query = update.callback_query
         text = query.edit_message_text.call_args.kwargs.get("text", query.edit_message_text.call_args[0][0])
         assert "failed" in text.lower()
+        assert "insufficient margin" in text.lower()
         ctx.db.update_trade_status.assert_called_with(
             101, TradeStatus.CANCELED, close_reason="submission_failed"
         )

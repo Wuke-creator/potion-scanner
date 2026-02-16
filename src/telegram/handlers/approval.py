@@ -12,7 +12,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from src.exchange.order_builder import build_orders
-from src.exchange.position_manager import PositionManager
+from src.exchange.position_manager import OrderSubmissionError, PositionManager
 from src.orchestrator import Orchestrator
 from src.parser.signal_parser import ParsedSignal, RiskLevel, Side
 from src.state.models import TradeRecord, TradeStatus
@@ -101,19 +101,19 @@ async def signal_approval_callback(update: Update, context: ContextTypes.DEFAULT
         )
 
         pm = PositionManager(ctx.client, ctx.db)
-        success = pm.submit_trade(trade_set)
+        pm.submit_trade(trade_set)
 
-        if success:
-            await query.edit_message_text(
-                f"*Approved* — Trade #{trade_id} submitted to exchange.",
-                parse_mode="Markdown",
-            )
-        else:
-            ctx.db.update_trade_status(trade_id, TradeStatus.CANCELED, close_reason="submission_failed")
-            await query.edit_message_text(
-                f"*Approval failed* — Trade #{trade_id} could not be submitted. Trade canceled.",
-                parse_mode="Markdown",
-            )
+        await query.edit_message_text(
+            f"*Approved* — Trade #{trade_id} submitted to exchange.",
+            parse_mode="Markdown",
+        )
+    except OrderSubmissionError as e:
+        logger.error("Trade #%d submission failed: %s", trade_id, e)
+        ctx.db.update_trade_status(trade_id, TradeStatus.CANCELED, close_reason="submission_failed")
+        await query.edit_message_text(
+            f"*Approval failed* — {e}\nTrade #{trade_id} canceled.",
+            parse_mode="Markdown",
+        )
     except Exception as e:
         logger.exception("Error approving trade #%d", trade_id)
         ctx.db.update_trade_status(trade_id, TradeStatus.CANCELED, close_reason="approval_error")
@@ -189,19 +189,26 @@ async def confirm_close_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # action == "confirm_close"
-    if trade.status != TradeStatus.OPEN:
+    if trade.status not in (TradeStatus.OPEN, TradeStatus.PENDING):
         await query.edit_message_text(
-            f"Trade #{trade_id} is not open (status: {trade.status.value})."
+            f"Trade #{trade_id} is not open or pending (status: {trade.status.value})."
         )
         return
 
     try:
         pm = PositionManager(ctx.client, ctx.db)
-        pm.close_position(trade_id, trade.coin, reason="manual_telegram")
-        await query.edit_message_text(
-            f"*Position Closed* — Trade #{trade_id} ({trade.coin}) has been market-closed.",
-            parse_mode="Markdown",
-        )
+        if trade.status == TradeStatus.PENDING:
+            pm.cancel_trade(trade_id)
+            await query.edit_message_text(
+                f"*Trade Canceled* — Trade #{trade_id} ({trade.coin}) orders canceled.",
+                parse_mode="Markdown",
+            )
+        else:
+            pm.close_position(trade_id, trade.coin, reason="manual_telegram")
+            await query.edit_message_text(
+                f"*Position Closed* — Trade #{trade_id} ({trade.coin}) has been market-closed.",
+                parse_mode="Markdown",
+            )
     except Exception as e:
         logger.exception("Error closing trade #%d", trade_id)
         await query.edit_message_text(

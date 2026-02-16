@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 from src.config.settings import Config, StrategyPreset
 from src.exchange.hyperliquid import HyperliquidClient
 from src.exchange.order_builder import TradeOrderSet, build_orders
-from src.exchange.position_manager import PositionManager
+from src.exchange.position_manager import OrderSubmissionError, PositionManager
 from src.parser.classifier import MessageType, classify
 from src.parser.signal_parser import ParsedSignal, SignalParseError, parse_signal
 from src.parser.update_parser import (
@@ -174,8 +174,8 @@ class Pipeline:
 
         # Submit to exchange
         if self._config.strategy.auto_execute:
-            success = self._pm.submit_trade(trade_set)
-            if success:
+            try:
+                self._pm.submit_trade(trade_set)
                 logger.info(
                     "Trade #%d submitted: %s %s %s @ %s (lev=%dx, size=$%.2f)",
                     signal.trade_id, trade_set.coin, signal.side.value,
@@ -186,12 +186,12 @@ class Pipeline:
                         signal.trade_id, trade_set.coin, signal.side.value,
                         signal.entry, position_size_usd,
                     ))
-            else:
-                logger.error("Trade #%d submission failed", signal.trade_id)
+            except OrderSubmissionError as e:
+                logger.error("Trade #%d submission failed: %s", signal.trade_id, e)
                 self._db.update_trade_status(signal.trade_id, TradeStatus.CANCELED, close_reason="submission_failed")
                 if self._notifier:
                     self._notify(self._notifier.notify_trade_failed(
-                        signal.trade_id, trade_set.coin, "Exchange submission failed",
+                        signal.trade_id, trade_set.coin, str(e),
                     ))
         else:
             logger.info(

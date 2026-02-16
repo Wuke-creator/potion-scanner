@@ -251,6 +251,10 @@ async def trade_detail_callback(update: Update, context: ContextTypes.DEFAULT_TY
             keyboard_rows.append(
                 [InlineKeyboardButton("Close Position", callback_data=f"close_trade:{trade_id}")]
             )
+        elif trade.status == TradeStatus.PENDING:
+            keyboard_rows.append(
+                [InlineKeyboardButton("Cancel Trade", callback_data=f"close_trade:{trade_id}")]
+            )
         keyboard_rows.append(
             [InlineKeyboardButton("< Back to Trades", callback_data="back:trades")]
         )

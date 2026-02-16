@@ -244,7 +244,7 @@ class PositionManager:
             logger.info("Set leverage: %s %dx cross=%s", coin, trade_set.leverage, trade_set.is_cross)
         except Exception as e:
             logger.error("Failed to set leverage for %s: %s", coin, e)
-            return False
+            raise OrderSubmissionError(f"Failed to set leverage: {e}") from e
 
         # --- Submit entry order ---
         entry_row_id = self._db.record_order(
@@ -258,7 +258,7 @@ class PositionManager:
         if error:
             logger.error("Entry order rejected for #%d: %s", trade_id, error)
             self._db.update_order_status(entry_row_id, OrderStatus.REJECTED)
-            return False
+            raise OrderSubmissionError(f"Entry order rejected: {error}")
 
         entry_oid = _extract_oid(entry_result)
         if entry_oid:
