@@ -56,6 +56,6 @@ def decrypt(ciphertext: str) -> str:
 
 
 def reset_fernet() -> None:
-    """Reset the cached Fernet instance (useful for testing)."""
+    """⚠️  TESTING ONLY — Reset the cached Fernet instance."""
     global _fernet
     _fernet = None

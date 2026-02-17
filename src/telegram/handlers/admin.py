@@ -38,7 +38,7 @@ ADMIN_HELP_MESSAGE = (
     "*Communication*\n"
     "/broadcast <message> — Message all active users\n\n"
     "*Testing*\n"
-    "/inject — Inject test signal (for testing)\n\n"
+    "/inject — ⚠️ TESTING ONLY — Inject fake signal\n\n"
     "*Admin Access*\n"
     "/add\\_admin <telegram\\_id> — Grant admin access\n"
     "/remove\\_admin <telegram\\_id> — Revoke admin access\n"
@@ -476,7 +476,7 @@ async def list_admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ------------------------------------------------------------------
-# Test signal injection
+# ⚠️  TESTING ONLY — Signal injection for development/QA
 # ------------------------------------------------------------------
 
 # Track the last injected trade ID so TP/close signals target the right trade

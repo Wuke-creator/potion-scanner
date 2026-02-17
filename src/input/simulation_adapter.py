@@ -1,4 +1,8 @@
-"""Simulation adapter — replays saved signals from files for testing."""
+"""⚠️  TESTING ONLY — Simulation adapter.
+
+Replays saved signals from files for development/QA testing.
+Not used in production (production uses the file-watcher adapter).
+"""
 
 import asyncio
 import logging

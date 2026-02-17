@@ -45,8 +45,8 @@ class InputConfig:
 
     adapter: str = "simulation"
     signals_dir: str = "signals/incoming/"
-    simulation_dir: str = "signals/samples/"
-    simulation_delay_sec: float = 5.0
+    simulation_dir: str = "signals/samples/"       # ⚠️ TESTING ONLY — used by simulation adapter
+    simulation_delay_sec: float = 5.0               # ⚠️ TESTING ONLY — delay between replayed signals
 
 
 @dataclass
