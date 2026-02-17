@@ -191,7 +191,7 @@ def _make_trade_set(leverage=10):
 
 @pytest.mark.asyncio
 async def test_notify_new_signal_auto_execute_true(notifier, mock_bot):
-    """When auto_execute=true, no inline buttons."""
+    """When auto_execute=true, send notification (no buttons) regardless of calls view."""
     signal = _make_signal(trade_id=99)
     trade_set = _make_trade_set(leverage=5)
 
@@ -210,13 +210,20 @@ async def test_notify_new_signal_auto_execute_true(notifier, mock_bot):
 
 
 @pytest.mark.asyncio
-async def test_notify_new_signal_auto_execute_false(notifier, mock_bot):
-    """When auto_execute=false, Approve/Reject buttons should appear."""
+async def test_notify_new_signal_auto_execute_false_in_calls_view(mock_bot, mock_user_db):
+    """When auto_execute=false and user IS in calls view, send push + refresh."""
+    refresher = AsyncMock()
+    notifier = TelegramNotifier(
+        bot=mock_bot, user_db=mock_user_db, user_id="user-1",
+        calls_view_checker=lambda: True,
+        calls_view_refresher=refresher,
+    )
     signal = _make_signal(trade_id=77)
     trade_set = _make_trade_set(leverage=20)
 
     await notifier.notify_new_signal(signal, trade_set, position_size_usd=100.0, auto_execute=False)
 
+    # Push notification with approve/reject buttons
     text = _sent_text(mock_bot)
     assert "New Signal" in text
     assert "#77" in text
@@ -224,17 +231,42 @@ async def test_notify_new_signal_auto_execute_false(notifier, mock_bot):
 
     markup = _sent_markup(mock_bot)
     assert markup is not None
-
-    # Extract button labels from the inline keyboard
     buttons = markup.inline_keyboard[0]
     labels = [b.text for b in buttons]
     assert any("Approve" in l for l in labels)
     assert any("Reject" in l for l in labels)
 
-    # Check callback data
-    callback_data = [b.callback_data for b in buttons]
-    assert "signal:approve:77" in callback_data
-    assert "signal:reject:77" in callback_data
+    # Also refreshes the calls view
+    refresher.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_notify_new_signal_auto_execute_false_not_in_calls_view(mock_bot, mock_user_db):
+    """When auto_execute=false and user is NOT in calls view, skip notification."""
+    notifier = TelegramNotifier(
+        bot=mock_bot, user_db=mock_user_db, user_id="user-1",
+        calls_view_checker=lambda: False,
+    )
+    signal = _make_signal(trade_id=55)
+    trade_set = _make_trade_set(leverage=10)
+
+    await notifier.notify_new_signal(signal, trade_set, position_size_usd=200.0, auto_execute=False)
+
+    mock_bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_notify_new_signal_auto_execute_false_no_checker(mock_bot, mock_user_db):
+    """When auto_execute=false and no calls_view_checker is set, skip notification."""
+    notifier = TelegramNotifier(
+        bot=mock_bot, user_db=mock_user_db, user_id="user-1",
+    )
+    signal = _make_signal(trade_id=44)
+    trade_set = _make_trade_set(leverage=10)
+
+    await notifier.notify_new_signal(signal, trade_set, position_size_usd=150.0, auto_execute=False)
+
+    mock_bot.send_message.assert_not_called()
 
 
 # ------------------------------------------------------------------

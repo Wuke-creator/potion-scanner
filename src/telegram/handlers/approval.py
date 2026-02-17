@@ -17,6 +17,7 @@ from src.orchestrator import Orchestrator
 from src.parser.signal_parser import ParsedSignal, RiskLevel, Side
 from src.state.models import TradeRecord, TradeStatus
 from src.state.user_db import UserDatabase
+from src.telegram.handlers.menu import _build_calls_text, is_in_calls_view, set_calls_view_msg
 from src.telegram.handlers.trades import _format_trade_detail
 
 logger = logging.getLogger(__name__)
@@ -83,44 +84,48 @@ async def signal_approval_callback(update: Update, context: ContextTypes.DEFAULT
 
     if action == "reject":
         ctx.db.update_trade_status(trade_id, TradeStatus.CANCELED, close_reason="rejected")
-        await query.edit_message_text(
-            f"*Rejected* — Trade #{trade_id} canceled.",
-            parse_mode="Markdown",
-        )
-        return
+        status_text = f"❌ *Rejected* — Trade #{trade_id} canceled."
+    else:
+        # action == "approve"
+        try:
+            signal = _reconstruct_signal(trade)
+            trade_set = build_orders(
+                signal,
+                trade.position_size_usd,
+                ctx.pipeline._asset_meta,
+                tp_split=ctx.config.get_active_preset().tp_split,
+                max_leverage=ctx.config.strategy.max_leverage,
+            )
 
-    # action == "approve"
+            pm = PositionManager(ctx.client, ctx.db)
+            pm.submit_trade(trade_set)
+            status_text = f"✅ *Approved* — Trade #{trade_id} submitted to exchange."
+        except OrderSubmissionError as e:
+            logger.error("Trade #%d submission failed: %s", trade_id, e)
+            ctx.db.update_trade_status(trade_id, TradeStatus.CANCELED, close_reason="submission_failed")
+            status_text = f"⚠️ *Approval failed* — {e}\nTrade #{trade_id} canceled."
+        except Exception as e:
+            logger.exception("Error approving trade #%d", trade_id)
+            ctx.db.update_trade_status(trade_id, TradeStatus.CANCELED, close_reason="approval_error")
+            status_text = f"⚠️ *Approval failed* — {e}\nTrade #{trade_id} canceled."
+
+    # Delete the old message and send a fresh status + updated calls view
     try:
-        signal = _reconstruct_signal(trade)
-        trade_set = build_orders(
-            signal,
-            trade.position_size_usd,
-            ctx.pipeline._asset_meta,
-            tp_split=ctx.config.get_active_preset().tp_split,
-            max_leverage=ctx.config.strategy.max_leverage,
-        )
+        await query.message.delete()
+    except Exception:
+        pass
 
-        pm = PositionManager(ctx.client, ctx.db)
-        pm.submit_trade(trade_set)
+    await context.bot.send_message(
+        chat_id=chat_id, text=status_text, parse_mode="Markdown",
+    )
 
-        await query.edit_message_text(
-            f"*Approved* — Trade #{trade_id} submitted to exchange.",
-            parse_mode="Markdown",
+    # If user is still in calls view, re-send the full calls view
+    if is_in_calls_view(context.bot_data, chat_id):
+        text, keyboard = _build_calls_text(context, user_id)
+        msg = await context.bot.send_message(
+            chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=keyboard,
         )
-    except OrderSubmissionError as e:
-        logger.error("Trade #%d submission failed: %s", trade_id, e)
-        ctx.db.update_trade_status(trade_id, TradeStatus.CANCELED, close_reason="submission_failed")
-        await query.edit_message_text(
-            f"*Approval failed* — {e}\nTrade #{trade_id} canceled.",
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        logger.exception("Error approving trade #%d", trade_id)
-        ctx.db.update_trade_status(trade_id, TradeStatus.CANCELED, close_reason="approval_error")
-        await query.edit_message_text(
-            f"*Approval failed* — {e}\nTrade #{trade_id} canceled.",
-            parse_mode="Markdown",
-        )
+        set_calls_view_msg(context.bot_data, chat_id, msg.message_id)
 
 
 async def close_trade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -123,39 +123,70 @@ def format_account_info(
     )
 
 
-def format_calls_view(signals: list[dict]) -> str:
-    """Format recent signals for the calls view."""
-    if not signals:
+def _status_badge(status_value: str) -> str:
+    """Return an emoji + label for a trade status."""
+    mapping = {
+        "open": ("✅", "TAKEN"),
+        "closed": ("🏁", "CLOSED"),
+        "canceled": ("❌", "PASSED"),
+    }
+    icon, label = mapping.get(status_value, ("⏳", "PENDING"))
+    return f"{icon} {label}"
+
+
+def _format_signal_card(t: Any) -> str:
+    """Render one trade as a full signal card (matches provider format)."""
+    status = t.status.value if hasattr(t.status, "value") else str(t.status)
+    badge = _status_badge(status)
+    side_emoji = "📈" if t.side.upper() == "LONG" else "📉"
+    risk_emoji = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🔴"}.get(t.risk_level.upper(), "⚪")
+
+    # SL distance %
+    if t.entry_price:
+        sl_pct = ((t.stop_loss - t.entry_price) / t.entry_price) * 100
+    else:
+        sl_pct = 0.0
+
+    # TP distances %
+    tp_pcts = []
+    for tp_val in (t.tp1, t.tp2, t.tp3):
+        if t.entry_price:
+            tp_pcts.append(((tp_val - t.entry_price) / t.entry_price) * 100)
+        else:
+            tp_pcts.append(0.0)
+
+    return (
+        f"{'─' * 28}\n"
+        f"🔔 *SIGNAL #{t.trade_id}*  —  {badge}\n\n"
+        f"💱 Pair: `{t.pair}`\n"
+        f"{risk_emoji} Risk: {t.risk_level.upper()}\n"
+        f"📋 Type: {t.trade_type.upper()}  |  Size: {t.size_hint}\n"
+        f"{side_emoji} Side: *{t.side.upper()}*\n\n"
+        f"🎯 Entry: `{t.entry_price}`\n"
+        f"🛡 SL: `{t.stop_loss}`  ({sl_pct:+.2f}%)\n\n"
+        f"🏆 *Take Profit Targets:*\n"
+        f"  TP1: `{t.tp1}`  ({tp_pcts[0]:+.2f}%)\n"
+        f"  TP2: `{t.tp2}`  ({tp_pcts[1]:+.2f}%)\n"
+        f"  TP3: `{t.tp3}`  ({tp_pcts[2]:+.2f}%)\n\n"
+        f"📊 Leverage: {t.leverage}x"
+    )
+
+
+def format_calls_view(trades: list) -> str:
+    """Format recent trades for the calls view with full signal details."""
+    if not trades:
         return (
             "📡 *Calls View*\n\n"
             "_Signal approval mode — incoming signals appear here._\n\n"
             "No recent signals."
         )
 
-    lines = [
+    header = (
         "📡 *Calls View*\n\n"
-        "_Signal approval mode — approve or reject incoming trades._\n\n"
-        "📋 Recent signals:"
-    ]
-    for s in signals:
-        status = s.get("status", "pending")
-        if status == "open":
-            icon = "✅"
-            label = "Taken"
-        elif status in ("canceled", "rejected"):
-            icon = "❌"
-            label = "Passed"
-        elif status == "closed":
-            icon = "✅"
-            label = "Closed"
-        else:
-            icon = "⏳"
-            label = "Pending"
-
-        side = s.get("side", "").upper()
-        lines.append(f"{icon} *#{s['trade_id']}* {s['coin']} {side} — {label}")
-
-    return "\n".join(lines)
+        "_Signal approval mode — approve or reject incoming trades._"
+    )
+    cards = [_format_signal_card(t) for t in trades]
+    return header + "\n\n" + "\n\n".join(cards)
 
 
 def format_trading_hub(balance: dict[str, str] | None, positions: list | None, open_trades: int = 0) -> str:

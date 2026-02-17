@@ -491,42 +491,59 @@ def _get_any_client(context: ContextTypes.DEFAULT_TYPE):
     return None
 
 
-def _build_signal(price: float, trade_id: int) -> str:
-    """Build a LONG signal around the current price that will fill immediately."""
-    entry = round(price * 1.005, 2)  # 0.5% above mid → ensures limit buy fills
-    sl = round(price * 0.97, 2)      # 3% below
-    tp1 = round(price * 1.01, 2)     # +1%
-    tp2 = round(price * 1.02, 2)     # +2%
-    tp3 = round(price * 1.03, 2)     # +3%
+_INJECT_COINS = ["ETH", "BTC", "SOL", "XRP"]
+_INJECT_SIDES = ["LONG", "SHORT"]
+_INJECT_RISKS = ["LOW", "MEDIUM", "HIGH"]
+_INJECT_TYPES = ["SWING", "SCALP"]
+
+# Track last injected coin so TP signals reference the correct pair
+_last_inject_coin: str | None = None
+
+
+def _build_signal(price: float, trade_id: int, coin: str, side: str, leverage: int, risk: str, trade_type: str) -> str:
+    """Build a signal around the current price with randomized parameters."""
+    if side == "LONG":
+        entry = round(price * 1.005, 2)
+        sl = round(price * 0.97, 2)
+        tp1 = round(price * 1.01, 2)
+        tp2 = round(price * 1.02, 2)
+        tp3 = round(price * 1.03, 2)
+    else:
+        entry = round(price * 0.995, 2)
+        sl = round(price * 1.03, 2)
+        tp1 = round(price * 0.99, 2)
+        tp2 = round(price * 0.98, 2)
+        tp3 = round(price * 0.97, 2)
+
     return (
         f"TRADING SIGNAL ALERT\n\n"
-        f"PAIR: ETH/USDT #{trade_id}\n"
-        f"(LOW RISK)\n\n"
-        f"TYPE: SWING\n"
+        f"PAIR: {coin}/USDT #{trade_id}\n"
+        f"({risk} RISK)\n\n"
+        f"TYPE: {trade_type}\n"
         f"SIZE: 1-4%\n"
-        f"SIDE: LONG\n\n"
+        f"SIDE: {side}\n\n"
         f"ENTRY: {entry}\n"
         f"SL: {sl}          (-3.00%)\n\n"
         f"TAKE PROFIT TARGETS:\n\n"
         f"TP1: {tp1}      (1.00%)\n"
         f"TP2: {tp2}      (2.00%)\n"
         f"TP3: {tp3}      (3.00%)\n\n"
-        f"LEVERAGE: 3x\n\n"
+        f"LEVERAGE: {leverage}x\n\n"
         f"PROTECT YOUR CAPITAL, MANAGE RISK, LETS PRINT!"
     )
 
 
-def _build_tp_signal(tp_num: str, profit: str, trade_id: int) -> str:
+def _build_tp_signal(tp_num: str, profit: str, trade_id: int, coin: str) -> str:
     """Build a TP hit signal for the given trade."""
     if tp_num == "all":
         return (
             f"**\U0001f525ALL TAKE-PROFIT TARGETS HIT**\n\n"
-            f"**\U0001f4ddPAIR:** ETH/USDT #{trade_id}\n\n"
+            f"**\U0001f4ddPAIR:** {coin}/USDT #{trade_id}\n\n"
             f"**\U0001f4b0PROFIT:** {profit} \U0001f4c8"
         )
     return (
         f"**\u2705 TP TARGET {tp_num} HIT**\n\n"
-        f"**\U0001f4ddPAIR:** ETH/USDT #{trade_id}\n\n"
+        f"**\U0001f4ddPAIR:** {coin}/USDT #{trade_id}\n\n"
         f"**\U0001f4b0PROFIT:** {profit} \U0001f4c8"
     )
 
@@ -536,24 +553,27 @@ async def inject_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Handle /inject — show test signal buttons for quick injection."""
     global _last_inject_trade_id
 
-    # Show current price for context
+    # Show current prices for context
     client = _get_any_client(context)
-    price_info = ""
+    price_lines = []
     if client:
         try:
             mids = client.get_all_mids()
-            eth_price = float(mids.get("ETH", "0"))
-            if eth_price:
-                price_info = f"\nCurrent ETH: ${eth_price:,.2f}\n"
+            for coin in _INJECT_COINS:
+                p = float(mids.get(coin, "0"))
+                if p:
+                    price_lines.append(f"{coin}: ${p:,.2f}")
         except Exception:
             pass
+
+    price_info = "\n" + " | ".join(price_lines) + "\n" if price_lines else ""
 
     trade_id_info = ""
     if _last_inject_trade_id:
         trade_id_info = f"\nLast injected trade: #{_last_inject_trade_id}\n"
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("New Signal (ETH LONG)", callback_data="inject:signal")],
+        [InlineKeyboardButton("New Random Signal", callback_data="inject:signal")],
         [
             InlineKeyboardButton("TP1 Hit", callback_data="inject:tp1"),
             InlineKeyboardButton("TP2 Hit", callback_data="inject:tp2"),
@@ -562,6 +582,7 @@ async def inject_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ])
     await update.message.reply_text(
         f"*Test Signal Injection*\n{price_info}{trade_id_info}\n"
+        f"Coins: {', '.join(_INJECT_COINS)} | Leverage: 3-15x | LONG/SHORT\n"
         f"Select a signal to inject into the pipeline for all active users:",
         parse_mode="Markdown",
         reply_markup=keyboard,
@@ -585,34 +606,42 @@ async def inject_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     orchestrator = _get_orchestrator(context)
 
     if signal_type == "signal":
-        # Fetch live ETH price
+        global _last_inject_coin
+
         client = _get_any_client(context)
         if not client:
             await query.edit_message_text("No active pipelines — cannot fetch price.")
             return
 
+        import random
+        coin = random.choice(_INJECT_COINS)
+        side = random.choice(_INJECT_SIDES)
+        leverage = random.randint(3, 15)
+        risk = random.choice(_INJECT_RISKS)
+        trade_type = random.choice(_INJECT_TYPES)
+
         try:
             mids = client.get_all_mids()
-            eth_price = float(mids.get("ETH", "0"))
+            price = float(mids.get(coin, "0"))
         except Exception as e:
-            await query.edit_message_text(f"Failed to fetch ETH price: {e}")
+            await query.edit_message_text(f"Failed to fetch {coin} price: {e}")
             return
 
-        if not eth_price:
-            await query.edit_message_text("Could not get ETH price.")
+        if not price:
+            await query.edit_message_text(f"Could not get {coin} price.")
             return
 
-        import random
-        trade_id = random.randint(8000, 8999)
+        trade_id = random.randint(80000, 89999)
         _last_inject_trade_id = trade_id
+        _last_inject_coin = coin
 
-        raw_signal = _build_signal(eth_price, trade_id)
+        raw_signal = _build_signal(price, trade_id, coin, side, leverage, risk, trade_type)
         orchestrator.dispatch(raw_signal)
 
         pipelines = len(orchestrator.pipelines)
         paused = sum(1 for ctx in orchestrator.pipelines.values() if ctx.paused)
         await query.edit_message_text(
-            f"*New Signal #{trade_id}* injected (ETH @ ${eth_price:,.2f}).\n"
+            f"*New Signal #{trade_id}* injected ({coin} {side} {leverage}x @ ${price:,.2f}).\n"
             f"Dispatched to {pipelines - paused} active pipeline(s).",
             parse_mode="Markdown",
         )
@@ -628,7 +657,8 @@ async def inject_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "all_tp": ("all", "3.00%"),
         }
         tp_num, profit = tp_map[signal_type]
-        raw_signal = _build_tp_signal(tp_num, profit, _last_inject_trade_id)
+        coin = _last_inject_coin or "ETH"
+        raw_signal = _build_tp_signal(tp_num, profit, _last_inject_trade_id, coin)
         orchestrator.dispatch(raw_signal)
 
         label = {"tp1": "TP1 Hit", "tp2": "TP2 Hit", "all_tp": "All TP Hit"}

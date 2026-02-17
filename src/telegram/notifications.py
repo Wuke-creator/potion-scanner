@@ -7,7 +7,7 @@ fire-and-forget — notification failures are logged but never crash the pipelin
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -24,11 +24,20 @@ class TelegramNotifier:
     If no telegram_chat_id is found for the user, all methods silently skip.
     """
 
-    def __init__(self, bot: Bot, user_db: UserDatabase, user_id: str) -> None:
+    def __init__(
+        self,
+        bot: Bot,
+        user_db: UserDatabase,
+        user_id: str,
+        calls_view_checker: Callable[[], bool] | None = None,
+        calls_view_refresher: Callable[[], Any] | None = None,
+    ) -> None:
         self._bot = bot
         self._user_db = user_db
         self._user_id = user_id
         self._chat_id: int | None = user_db.get_telegram_chat_id(user_id)
+        self._calls_view_checker = calls_view_checker
+        self._calls_view_refresher = calls_view_refresher
 
     def _get_chat_id(self) -> int | None:
         """Return cached chat_id, refreshing once if initially None."""
@@ -40,8 +49,10 @@ class TelegramNotifier:
         """Send a message to the user's chat. Silently handles all errors."""
         chat_id = self._get_chat_id()
         if chat_id is None:
+            logger.debug("_send: no chat_id for user %s, skipping", self._user_id)
             return
 
+        logger.debug("_send: sending to chat_id=%s for user %s", chat_id, self._user_id)
         try:
             await self._bot.send_message(
                 chat_id=chat_id,
@@ -49,6 +60,7 @@ class TelegramNotifier:
                 parse_mode="Markdown",
                 reply_markup=reply_markup,
             )
+            logger.debug("_send: message sent successfully to user %s", self._user_id)
         except Exception:
             logger.exception("Failed to send notification to user %s", self._user_id)
 
@@ -63,8 +75,33 @@ class TelegramNotifier:
         position_size_usd: float,
         auto_execute: bool = True,
     ) -> None:
-        """New signal received — notify user with trade details."""
-        side_emoji = "📈 LONG" if signal.side.value == "long" else "📉 SHORT"
+        """New signal received — notify user with trade details.
+
+        Gating logic:
+        - auto_execute=True  → always send (informational, no buttons)
+        - auto_execute=False → only send if user is in Calls View
+          (otherwise the signal stays PENDING in the DB)
+        """
+        # Gate: when manual approval is needed, only notify if user is in calls view
+        if not auto_execute:
+            in_calls = (
+                self._calls_view_checker()
+                if self._calls_view_checker is not None
+                else False
+            )
+            logger.debug(
+                "notify_new_signal: user=%s auto_execute=%s in_calls=%s checker=%s",
+                self._user_id, auto_execute, in_calls,
+                self._calls_view_checker is not None,
+            )
+            if not in_calls:
+                logger.debug(
+                    "Skipping new-signal notification for user %s (not in calls view)",
+                    self._user_id,
+                )
+                return
+
+        side_emoji = "📈 LONG" if signal.side.value.upper() == "LONG" else "📉 SHORT"
         text = (
             f"🔔 *New Signal — Trade #{signal.trade_id}*\n\n"
             f"💱 Pair: {signal.pair}\n"
@@ -86,6 +123,15 @@ class TelegramNotifier:
             ])
 
         await self._send(text, reply_markup=reply_markup)
+
+        # Also refresh the calls view so it shows the new signal inline
+        if not auto_execute and self._calls_view_refresher is not None:
+            try:
+                await self._calls_view_refresher()
+            except Exception:
+                logger.exception(
+                    "Failed to refresh calls view for user %s", self._user_id,
+                )
 
     async def notify_trade_opened(
         self, trade_id: int, coin: str, side: str, entry_price: float, size_usd: float,

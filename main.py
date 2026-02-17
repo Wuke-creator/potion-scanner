@@ -68,8 +68,53 @@ async def run(config: Config) -> None:
         await telegram_bot.start()
 
         # Create notifier factory now that the bot is running
+        from src.telegram.handlers.menu import (
+            _build_calls_text,
+            get_calls_view_msg,
+            set_calls_view_msg,
+        )
+
         def _notifier_factory(uid: str) -> TelegramNotifier:
-            return TelegramNotifier(bot=telegram_bot.bot, user_db=user_db, user_id=uid)
+            chat_id = user_db.get_telegram_chat_id(uid)
+
+            def _checker() -> bool:
+                calls_set = telegram_bot._app.bot_data.get("calls_view_users", set())
+                return chat_id in calls_set
+
+            async def _refresher() -> None:
+                """Delete old calls-view message and send updated one."""
+                bot_data = telegram_bot._app.bot_data
+                bot = telegram_bot.bot
+                # Build a minimal context-like object for _build_calls_text
+                class _Ctx:
+                    pass
+                fake_ctx = _Ctx()
+                fake_ctx.bot_data = bot_data
+
+                text, keyboard = _build_calls_text(fake_ctx, uid)
+
+                # Delete old calls-view message
+                old_msg_id = get_calls_view_msg(bot_data, chat_id)
+                if old_msg_id:
+                    try:
+                        await bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
+                    except Exception:
+                        pass
+
+                # Send fresh calls view and track the new message id
+                msg = await bot.send_message(
+                    chat_id=chat_id, text=text,
+                    parse_mode="Markdown", reply_markup=keyboard,
+                )
+                set_calls_view_msg(bot_data, chat_id, msg.message_id)
+
+            return TelegramNotifier(
+                bot=telegram_bot.bot,
+                user_db=user_db,
+                user_id=uid,
+                calls_view_checker=_checker,
+                calls_view_refresher=_refresher,
+            )
 
         orchestrator._notifier_factory = _notifier_factory
 

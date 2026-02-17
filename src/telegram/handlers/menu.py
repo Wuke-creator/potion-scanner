@@ -82,6 +82,37 @@ def _resolve_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str | Non
 
 
 # ------------------------------------------------------------------
+# Calls-view tracking
+# ------------------------------------------------------------------
+
+def _enter_calls_view(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Mark *chat_id* as currently viewing the Calls screen."""
+    context.bot_data.setdefault("calls_view_users", set()).add(chat_id)
+
+
+def _leave_calls_view(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Remove *chat_id* from the calls-view set (if present)."""
+    context.bot_data.setdefault("calls_view_users", set()).discard(chat_id)
+    # Clean up tracked message id
+    context.bot_data.setdefault("calls_view_msg", {}).pop(chat_id, None)
+
+
+def set_calls_view_msg(bot_data: dict, chat_id: int, message_id: int) -> None:
+    """Store the message_id of the current Calls View message for *chat_id*."""
+    bot_data.setdefault("calls_view_msg", {})[chat_id] = message_id
+
+
+def get_calls_view_msg(bot_data: dict, chat_id: int) -> int | None:
+    """Return the stored Calls View message_id, or None."""
+    return bot_data.get("calls_view_msg", {}).get(chat_id)
+
+
+def is_in_calls_view(bot_data: dict, chat_id: int) -> bool:
+    """Return True if *chat_id* is currently in Calls View mode."""
+    return chat_id in bot_data.get("calls_view_users", set())
+
+
+# ------------------------------------------------------------------
 # Main menu text
 # ------------------------------------------------------------------
 
@@ -104,11 +135,14 @@ def _build_main_menu_text(user_db: UserDatabase, user_id: str) -> str:
         network = "Testnet"
 
     return (
+        f"{'━' * 30}\n"
         "🧪 *Welcome to Potion Perps!*\n"
-        f"Hi {display_name}!\n\n"
-        f"💼 Your Wallet: `{wallet}`\n"
-        f"🌐 Network: {network}\n\n"
-        "👉 Guide | Support | Socials"
+        f"{'━' * 30}\n\n"
+        f"Hey {display_name}! What would you like to do?\n\n"
+        f"💼 Wallet:    `{wallet}`\n"
+        f"🌐 Network:  {network}\n\n"
+        f"{'─' * 30}\n"
+        "📖 Guide  ·  💬 Support  ·  🌐 Socials"
     )
 
 
@@ -135,25 +169,17 @@ def _build_calls_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> tuple
     if not trade_db:
         return format_calls_view([]), calls_view_keyboard()
 
-    # Get all recent trades (last N)
-    all_trades = trade_db.list_trades()
-    # Sort by created_at descending
+    # Get all recent trades (last N) — combine open + completed
+    all_trades = trade_db.get_open_trades() + trade_db.get_completed_trades()
+    # Sort by created_at descending to pick the N most recent…
     all_trades.sort(key=lambda t: t.created_at, reverse=True)
     recent = all_trades[:CALLS_LIMIT]
+    # …then reverse so oldest is on top, newest at bottom (near buttons)
+    recent.reverse()
 
-    signals = []
-    pending_ids = []
-    for t in recent:
-        signals.append({
-            "trade_id": t.trade_id,
-            "coin": t.coin,
-            "side": t.side,
-            "status": t.status.value,
-        })
-        if t.status == TradeStatus.PENDING:
-            pending_ids.append(t.trade_id)
+    pending_ids = [t.trade_id for t in recent if t.status == TradeStatus.PENDING]
 
-    text = format_calls_view(signals)
+    text = format_calls_view(recent)
 
     # Build keyboard with approve/reject for pending signals
     keyboard_rows = []
@@ -304,6 +330,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # Close — delete the message
     if data == "menu:close":
+        _leave_calls_view(context, chat_id)
         try:
             await query.message.delete()
         except Exception:
@@ -320,42 +347,50 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     try:
         if data == "menu:main":
+            _leave_calls_view(context, chat_id)
             text = _build_main_menu_text(user_db, user_id)
             await query.edit_message_text(
                 text, parse_mode="Markdown", reply_markup=main_menu_keyboard(),
             )
 
         elif data == "menu:account":
+            _leave_calls_view(context, chat_id)
             text = _build_account_text(context, user_id)
             await query.edit_message_text(
                 text, parse_mode="Markdown", reply_markup=account_keyboard(),
             )
 
         elif data == "menu:calls":
+            _enter_calls_view(context, chat_id)
             text, keyboard = _build_calls_text(context, user_id)
             await query.edit_message_text(
                 text, parse_mode="Markdown", reply_markup=keyboard,
             )
+            set_calls_view_msg(context.bot_data, chat_id, query.message.message_id)
 
         elif data == "menu:trading":
+            _leave_calls_view(context, chat_id)
             text = _build_trading_hub_text(context, user_id)
             await query.edit_message_text(
                 text, parse_mode="Markdown", reply_markup=trading_hub_keyboard(),
             )
 
         elif data == "menu:stats":
+            _leave_calls_view(context, chat_id)
             text = _build_stats_text(context, user_id)
             await query.edit_message_text(
                 text, parse_mode="Markdown", reply_markup=stats_keyboard(),
             )
 
         elif data == "menu:dashboard":
+            _leave_calls_view(context, chat_id)
             text = _build_dashboard_text(context, user_id)
             await query.edit_message_text(
                 text, parse_mode="Markdown", reply_markup=dashboard_keyboard(),
             )
 
         elif data == "menu:config":
+            _leave_calls_view(context, chat_id)
             text = _build_config_text(context, user_id)
             is_active = _is_pipeline_active(context, user_id)
             await query.edit_message_text(

@@ -78,10 +78,13 @@ def _make_update_and_context(callback_data, chat_id=12345, user_id="user-1", tra
     query.data = callback_data
     query.answer = AsyncMock()
     query.edit_message_text = AsyncMock()
+    query.message = AsyncMock()
+    query.message.delete = AsyncMock()
 
     update = MagicMock()
     update.callback_query = query
     update.effective_chat.id = chat_id
+    update.effective_user.id = chat_id
 
     # User DB
     user_db = MagicMock()
@@ -115,6 +118,8 @@ def _make_update_and_context(callback_data, chat_id=12345, user_id="user-1", tra
         orchestrator.pipelines = {}
 
     context = MagicMock()
+    context.bot = AsyncMock()
+    context.bot.send_message = AsyncMock()
     context.bot_data = {
         "user_db": user_db,
         "orchestrator": orchestrator,
@@ -144,8 +149,9 @@ async def test_approve_pending_trade_success():
         mock_build.assert_called_once()
         mock_pm.submit_trade.assert_called_once()
         query = update.callback_query
-        query.edit_message_text.assert_called_once()
-        text = query.edit_message_text.call_args.kwargs.get("text", query.edit_message_text.call_args[0][0])
+        query.message.delete.assert_called_once()
+        # Status sent via context.bot.send_message
+        text = context.bot.send_message.call_args_list[0].kwargs["text"]
         assert "Approved" in text
         assert "#100" in text
 
@@ -166,7 +172,8 @@ async def test_approve_pending_trade_exchange_failure():
         await signal_approval_callback(update, context)
 
         query = update.callback_query
-        text = query.edit_message_text.call_args.kwargs.get("text", query.edit_message_text.call_args[0][0])
+        query.message.delete.assert_called_once()
+        text = context.bot.send_message.call_args_list[0].kwargs["text"]
         assert "failed" in text.lower()
         assert "insufficient margin" in text.lower()
         ctx.db.update_trade_status.assert_called_with(
@@ -186,7 +193,8 @@ async def test_approve_pending_trade_exception():
         await signal_approval_callback(update, context)
 
         query = update.callback_query
-        text = query.edit_message_text.call_args.kwargs.get("text", query.edit_message_text.call_args[0][0])
+        query.message.delete.assert_called_once()
+        text = context.bot.send_message.call_args_list[0].kwargs["text"]
         assert "failed" in text.lower()
         assert "Coin not found" in text
         ctx.db.update_trade_status.assert_called_with(
@@ -206,7 +214,8 @@ async def test_reject_pending_trade():
         103, TradeStatus.CANCELED, close_reason="rejected"
     )
     query = update.callback_query
-    text = query.edit_message_text.call_args.kwargs.get("text", query.edit_message_text.call_args[0][0])
+    query.message.delete.assert_called_once()
+    text = context.bot.send_message.call_args_list[0].kwargs["text"]
     assert "Rejected" in text
     assert "#103" in text
 

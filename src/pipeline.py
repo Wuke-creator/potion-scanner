@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 from src.config.settings import Config, StrategyPreset
 from src.exchange.hyperliquid import HyperliquidClient
 from src.exchange.order_builder import TradeOrderSet, build_orders
+from src.utils.symbol_mapper import potion_to_hyperliquid
 from src.exchange.position_manager import OrderSubmissionError, PositionManager
 from src.parser.classifier import MessageType, classify
 from src.parser.signal_parser import ParsedSignal, SignalParseError, parse_signal
@@ -105,10 +106,11 @@ class Pipeline:
         """Parse signal → size → build orders → submit."""
         signal = parse_signal(raw)
         preset = self._config.get_active_preset()
+        auto_execute = self._config.strategy.auto_execute
 
-        # Check if we already have this trade
+        # Check if we already have this trade (any status)
         existing = self._db.get_trade(signal.trade_id)
-        if existing and existing.status in (TradeStatus.OPEN, TradeStatus.PENDING):
+        if existing:
             logger.warning("Trade #%d already exists (status=%s), skipping", signal.trade_id, existing.status.value)
             return
 
@@ -120,8 +122,12 @@ class Pipeline:
                 self._config.strategy, self._config.risk,
             )
         except PositionSizeError as e:
-            logger.warning("Skipping trade #%d: %s", signal.trade_id, e)
-            return
+            if auto_execute:
+                logger.warning("Skipping trade #%d: %s", signal.trade_id, e)
+                return
+            # Manual mode: record anyway so user sees it in calls view
+            logger.info("Trade #%d below size minimum but recording as PENDING (auto_execute=OFF): %s", signal.trade_id, e)
+            position_size_usd = 0.0
 
         # Risk gate — check all limits before proceeding
         try:
@@ -133,22 +139,36 @@ class Pipeline:
                 new_position_usd=position_size_usd,
             )
         except RiskLimitBreached as e:
-            logger.warning("Skipping trade #%d — risk limit: %s", signal.trade_id, e)
-            return
+            if auto_execute:
+                logger.warning("Skipping trade #%d — risk limit: %s", signal.trade_id, e)
+                return
+            logger.info("Trade #%d exceeds risk limit but recording as PENDING (auto_execute=OFF): %s", signal.trade_id, e)
 
-        # Build orders
-        trade_set = build_orders(
-            signal, position_size_usd, self._asset_meta,
-            tp_split=preset.tp_split,
-            max_leverage=self._config.strategy.max_leverage,
-        )
+        # Build orders (needed for coin name, leverage capping, etc.)
+        trade_set = None
+        try:
+            trade_set = build_orders(
+                signal, max(position_size_usd, 10.0), self._asset_meta,
+                tp_split=preset.tp_split,
+                max_leverage=self._config.strategy.max_leverage,
+            )
+        except (ValueError, KeyError) as e:
+            if auto_execute:
+                logger.error("Trade #%d order build failed: %s", signal.trade_id, e)
+                return
+            logger.info("Trade #%d order build failed but recording as PENDING (auto_execute=OFF): %s", signal.trade_id, e)
+
+        # Derive fields — use trade_set if available, fall back to signal data
+        coin = trade_set.coin if trade_set else potion_to_hyperliquid(signal.pair)
+        leverage = trade_set.leverage if trade_set else min(signal.leverage, self._config.strategy.max_leverage)
+        position_size_coin = trade_set.entry.sz if trade_set else 0.0
 
         # Record trade in DB
         trade_record = TradeRecord(
             trade_id=signal.trade_id,
             user_id=self._db.user_id,
             pair=signal.pair,
-            coin=trade_set.coin,
+            coin=coin,
             side=signal.side.value,
             risk_level=signal.risk_level.value,
             trade_type=signal.trade_type,
@@ -158,22 +178,22 @@ class Pipeline:
             tp1=signal.tp1,
             tp2=signal.tp2,
             tp3=signal.tp3,
-            leverage=trade_set.leverage,
+            leverage=leverage,
             signal_leverage=signal.leverage,
             position_size_usd=position_size_usd,
-            position_size_coin=trade_set.entry.sz,
+            position_size_coin=position_size_coin,
         )
         self._db.create_trade(trade_record)
 
         # Notify new signal
         if self._notifier:
             self._notify(self._notifier.notify_new_signal(
-                signal, trade_set, position_size_usd,
-                auto_execute=self._config.strategy.auto_execute,
+                signal, trade_set or signal, position_size_usd,
+                auto_execute=auto_execute,
             ))
 
         # Submit to exchange
-        if self._config.strategy.auto_execute:
+        if auto_execute:
             try:
                 self._pm.submit_trade(trade_set)
                 logger.info(
