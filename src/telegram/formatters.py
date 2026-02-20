@@ -1,6 +1,19 @@
 """Message formatting utilities for Telegram bot responses."""
 
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
+
+_NY = ZoneInfo("America/New_York")
+
+
+def _format_time_et(dt: datetime | None) -> str:
+    """Format a UTC datetime as New York time (e.g. 'Feb 19, 5:43 PM ET')."""
+    if dt is None:
+        return ""
+    utc_dt = dt.replace(tzinfo=timezone.utc)
+    ny_dt = utc_dt.astimezone(_NY)
+    return ny_dt.strftime("%b %d, %-I:%M %p ET")
 
 
 def mask_address(address: str) -> str:
@@ -168,7 +181,8 @@ def _format_signal_card(t: Any) -> str:
         f"  TP1: `{t.tp1}`  ({tp_pcts[0]:+.2f}%)\n"
         f"  TP2: `{t.tp2}`  ({tp_pcts[1]:+.2f}%)\n"
         f"  TP3: `{t.tp3}`  ({tp_pcts[2]:+.2f}%)\n\n"
-        f"📊 Leverage: {t.leverage}x"
+        f"📊 Leverage: {t.leverage}x\n"
+        f"🕐 {_format_time_et(getattr(t, 'created_at', None))}"
     )
 
 
