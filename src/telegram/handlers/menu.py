@@ -286,6 +286,10 @@ _SCREEN_MAP = [
     ("📡 Calls View", "calls"),
     ("🛡 Risk Dashboard", "dashboard"),
     ("⚙️ Configuration", "config"),
+    ("💰 Account Balance", "trading"),  # Sub-views → refresh as trading hub
+    ("📂 Open Positions", "trading"),
+    ("📋 Active Trades", "trading"),
+    ("📋 Trade History", "trading"),
 ]
 
 
