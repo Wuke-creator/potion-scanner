@@ -215,9 +215,9 @@ class Pipeline:
                     ))
         else:
             logger.info(
-                "Trade #%d ready (auto_execute=false): %s %s %s @ %s (lev=%dx, size=$%.2f)",
-                signal.trade_id, trade_set.coin, signal.side.value,
-                trade_set.entry.sz, signal.entry, trade_set.leverage, position_size_usd,
+                "Trade #%d ready (auto_execute=false): %s %s @ %s (lev=%dx, size=$%.2f)",
+                signal.trade_id, coin, signal.side.value,
+                signal.entry, leverage, position_size_usd,
             )
 
     # ------------------------------------------------------------------

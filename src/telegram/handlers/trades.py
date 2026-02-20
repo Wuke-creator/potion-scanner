@@ -16,6 +16,7 @@ from src.telegram.middleware import registered_only
 logger = logging.getLogger(__name__)
 
 TRADES_PER_PAGE = 5
+HISTORY_MAX_TRADES = 15  # 3 pages × 5 trades
 
 
 def _get_trade_db(context: ContextTypes.DEFAULT_TYPE, user_id: str):
@@ -186,8 +187,9 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     closed = trade_db.get_completed_trades()
-    # Most recent first
+    # Most recent first, capped to last 15
     closed.sort(key=lambda t: t.closed_at or t.updated_at, reverse=True)
+    closed = closed[:HISTORY_MAX_TRADES]
     text, keyboard = _format_trade_list(closed, 0, "Trade History")
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
@@ -263,6 +265,7 @@ async def trade_detail_callback(update: Update, context: ContextTypes.DEFAULT_TY
         page = int(data.split(":")[1])
         closed = trade_db.get_completed_trades()
         closed.sort(key=lambda t: t.closed_at or t.updated_at, reverse=True)
+        closed = closed[:HISTORY_MAX_TRADES]
         text, keyboard = _format_trade_list(closed, page, "Trade History")
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
@@ -329,5 +332,6 @@ async def trading_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         closed = trade_db.get_completed_trades()
         closed.sort(key=lambda t: t.closed_at or t.updated_at, reverse=True)
+        closed = closed[:HISTORY_MAX_TRADES]
         text, keyboard = _format_trade_list(closed, 0, "Trade History")
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
