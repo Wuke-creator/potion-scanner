@@ -95,6 +95,9 @@ def _format_trade_detail(t: TradeRecord) -> str:
     if t.close_reason:
         lines.append(f"📋 Close Reason: {t.close_reason}")
 
+    if t.notes:
+        lines.append(f"\n📝 *Notes:* {t.notes}")
+
     if t.created_at:
         lines.append(f"\n📅 Opened: {str(t.created_at)[:19]}")
     if t.closed_at:
@@ -249,6 +252,10 @@ async def trade_detail_callback(update: Update, context: ContextTypes.DEFAULT_TY
             keyboard_rows.append(
                 [InlineKeyboardButton("🚫 Cancel Trade", callback_data=f"close_trade:{trade_id}")]
             )
+        note_label = "📝 Edit Note" if trade.notes else "📝 Add Note"
+        keyboard_rows.append(
+            [InlineKeyboardButton(note_label, callback_data=f"trade_note:{trade_id}")]
+        )
         keyboard_rows.append(
             [InlineKeyboardButton("⬅️ Back to Trades", callback_data="back:trades")]
         )
@@ -316,7 +323,33 @@ async def trading_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         except Exception as e:
             logger.error("Failed to fetch positions for user %s: %s", user_id, e)
             text = "📂 *Open Positions*\n\n⚠️ Failed to fetch positions."
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=trading_sub_keyboard())
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=trading_sub_keyboard())
+            return
+
+        # Build close buttons for each position
+        keyboard_rows: list[list[InlineKeyboardButton]] = []
+        if positions and trade_db:
+            open_trades = trade_db.get_open_trades()
+            trade_by_coin = {t.coin: t for t in open_trades}
+            for pos in positions:
+                coin = pos.get("coin", "")
+                if not coin:
+                    continue
+                if coin in trade_by_coin:
+                    tid = trade_by_coin[coin].trade_id
+                    keyboard_rows.append(
+                        [InlineKeyboardButton(f"🔴 Close {coin}", callback_data=f"close_trade:{tid}")]
+                    )
+                else:
+                    keyboard_rows.append(
+                        [InlineKeyboardButton(f"🔴 Close {coin}", callback_data=f"close_pos:{coin}")]
+                    )
+
+        # Add nav footer
+        from src.telegram.keyboards import _back_refresh_close
+        keyboard_rows.extend(_back_refresh_close("menu:trading", "⬅️ Trading"))
+        keyboard = InlineKeyboardMarkup(keyboard_rows)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
     elif data == "trading:trades":
         if not trade_db:
@@ -335,3 +368,53 @@ async def trading_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         closed = closed[:HISTORY_MAX_TRADES]
         text, keyboard = _format_trade_list(closed, 0, "Trade History")
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def trade_note_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle trade_note:{id} — prompt user to type a note."""
+    query = update.callback_query
+    await query.answer()
+
+    trade_id = int(query.data.split(":")[1])
+    context.user_data["awaiting_note"] = trade_id
+    await query.edit_message_text(
+        f"📝 *Add Note — Trade #{trade_id}*\n\nType your note and send it as a message.",
+        parse_mode="Markdown",
+    )
+
+
+async def trade_note_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle text input when user is adding a trade note."""
+    trade_id = context.user_data.get("awaiting_note")
+    if trade_id is None:
+        return
+
+    del context.user_data["awaiting_note"]
+
+    user_db: UserDatabase = context.bot_data["user_db"]
+    chat_id = update.effective_chat.id
+    user_id = user_db.get_user_by_telegram_chat_id(chat_id)
+    if not user_id:
+        await update.message.reply_text("❌ You're not registered.")
+        return
+
+    trade_db = _get_trade_db(context, user_id)
+    if not trade_db:
+        await update.message.reply_text("⚠️ Your trading pipeline is not active.")
+        return
+
+    notes = update.message.text.strip()
+    trade_db.update_trade_notes(trade_id, notes)
+
+    trade = trade_db.get_trade(trade_id)
+    if not trade:
+        await update.message.reply_text(f"❌ Trade #{trade_id} not found.")
+        return
+
+    text = _format_trade_detail(trade)
+    note_label = "📝 Edit Note" if trade.notes else "📝 Add Note"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(note_label, callback_data=f"trade_note:{trade_id}")],
+        [InlineKeyboardButton("⬅️ Back to Trades", callback_data="back:trades")],
+    ])
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)

@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS trades (
     closed_at       TEXT,
     close_reason    TEXT,
     pnl_pct         REAL,
+    notes           TEXT,
     PRIMARY KEY (user_id, trade_id)
 );
 """
@@ -115,6 +116,11 @@ class TradeDatabase:
             self._conn.execute(_ORDERS_DDL)
             for idx in _INDEXES_DDL:
                 self._conn.execute(idx)
+            # Migration: add notes column to existing databases
+            try:
+                self._conn.execute("ALTER TABLE trades ADD COLUMN notes TEXT")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
     @property
     def user_id(self) -> str:
@@ -238,6 +244,16 @@ class TradeDatabase:
         ).fetchone()
         return float(row["total"])
 
+    def update_trade_notes(self, trade_id: int, notes: str) -> None:
+        """Update the notes field of a trade."""
+        now = _now()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE trades SET notes = ?, updated_at = ? WHERE user_id = ? AND trade_id = ?",
+                (notes, now, self._user_id, trade_id),
+            )
+        logger.info("Updated notes for trade #%d", trade_id)
+
     # ------------------------------------------------------------------
     # Order operations
     # ------------------------------------------------------------------
@@ -332,6 +348,7 @@ class TradeDatabase:
             closed_at=_parse_dt(row["closed_at"]),
             close_reason=row["close_reason"],
             pnl_pct=row["pnl_pct"],
+            notes=row["notes"],
         )
 
     @staticmethod

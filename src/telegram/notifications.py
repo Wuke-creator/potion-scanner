@@ -247,6 +247,15 @@ class TelegramNotifier:
         )
         await self._send(text)
 
+    async def notify_pnl_alert(self, coin: str, side: str, pnl_pct: float, threshold_type: str) -> None:
+        """PnL threshold alert — profit or loss."""
+        emoji = "💹" if threshold_type == "profit" else "📉"
+        text = (
+            f"{emoji} *PnL Alert — {coin} {side}*\n\n"
+            f"Unrealized PnL: {pnl_pct:+.2f}%"
+        )
+        await self._send(text)
+
     async def notify_risk_warning(self, message: str) -> None:
         """Risk limit warning."""
         text = f"⚠️ *Risk Warning*\n\n{message}"

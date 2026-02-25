@@ -12,7 +12,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from src.exchange.order_builder import build_orders
-from src.exchange.position_manager import OrderSubmissionError, PositionManager
+from src.exchange.position_manager import OrderSubmissionError, PositionManager, _round_price
 from src.orchestrator import Orchestrator
 from src.parser.signal_parser import ParsedSignal, RiskLevel, Side
 from src.state.models import TradeRecord, TradeStatus
@@ -225,6 +225,85 @@ async def confirm_close_callback(update: Update, context: ContextTypes.DEFAULT_T
             )
     except Exception as e:
         logger.exception("Error closing trade #%d", trade_id)
+        await query.edit_message_text(
+            f"*Close failed* — {e}",
+            parse_mode="Markdown",
+        )
+
+
+async def close_position_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle close_pos:{coin} — confirmation dialog for raw exchange positions."""
+    query = update.callback_query
+    await query.answer()
+
+    coin = query.data.split(":")[1]
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Yes, close it", callback_data=f"confirm_close_pos:{coin}"),
+            InlineKeyboardButton("Cancel", callback_data="trading:positions"),
+        ]
+    ])
+
+    await query.edit_message_text(
+        f"*Close {coin} Position?*\n\nThis will market-close your {coin} position.",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
+async def confirm_close_pos_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle confirm_close_pos:{coin} — market-close a raw exchange position."""
+    query = update.callback_query
+    await query.answer()
+
+    coin = query.data.split(":")[1]
+
+    user_db: UserDatabase = context.bot_data["user_db"]
+    chat_id = update.effective_chat.id
+    user_id = user_db.get_user_by_telegram_chat_id(chat_id)
+    if not user_id:
+        await query.edit_message_text("You're not registered.")
+        return
+
+    orchestrator: Orchestrator | None = context.bot_data.get("orchestrator")
+    if not orchestrator:
+        await query.edit_message_text("Trading system is not active.")
+        return
+
+    ctx = orchestrator.pipelines.get(user_id)
+    if not ctx:
+        await query.edit_message_text("Your trading pipeline is not active.")
+        return
+
+    try:
+        positions = ctx.client.get_open_positions()
+        pos = next((p for p in positions if p["coin"] == coin), None)
+        if not pos or pos["size"] == 0:
+            await query.edit_message_text(
+                f"No open position found for {coin}.",
+                parse_mode="Markdown",
+            )
+            return
+
+        size = abs(pos["size"])
+        is_buy = pos["size"] < 0  # buy to close short
+        mids = ctx.client.get_all_mids()
+        mid = float(mids.get(coin, 0))
+        limit_px = _round_price(mid * 0.9 if not is_buy else mid * 1.1)
+
+        ctx.client.exchange.order(
+            coin, is_buy, size, limit_px,
+            {"limit": {"tif": "Ioc"}},
+            reduce_only=True,
+        )
+
+        await query.edit_message_text(
+            f"*Position Closed* — {coin} has been market-closed.",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.exception("Error closing position %s", coin)
         await query.edit_message_text(
             f"*Close failed* — {e}",
             parse_mode="Markdown",

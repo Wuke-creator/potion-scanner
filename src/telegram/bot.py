@@ -22,8 +22,10 @@ from src.telegram.handlers.account import (
     status_command,
 )
 from src.telegram.handlers.approval import (
+    close_position_callback,
     close_trade_callback,
     confirm_close_callback,
+    confirm_close_pos_callback,
     signal_approval_callback,
 )
 from src.telegram.handlers.admin import (
@@ -60,6 +62,8 @@ from src.telegram.handlers.trades import (
     history_command,
     stats_command,
     trade_detail_callback,
+    trade_note_callback,
+    trade_note_text_handler,
     trades_command,
     trading_callback,
 )
@@ -195,6 +199,12 @@ class TelegramBot:
         self._app.add_handler(CallbackQueryHandler(signal_approval_callback, pattern=r"^signal:(approve|reject):"))
         self._app.add_handler(CallbackQueryHandler(close_trade_callback, pattern=r"^close_trade:"))
         self._app.add_handler(CallbackQueryHandler(confirm_close_callback, pattern=r"^(confirm_close|cancel_close):"))
+        self._app.add_handler(CallbackQueryHandler(close_position_callback, pattern=r"^close_pos:"))
+        self._app.add_handler(CallbackQueryHandler(confirm_close_pos_callback, pattern=r"^confirm_close_pos:"))
+
+        # Trade notes
+        self._app.add_handler(CallbackQueryHandler(trade_note_callback, pattern=r"^trade_note:"))
+        self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, trade_note_text_handler), group=3)
 
         # Admin commands
         self._app.add_handler(CommandHandler("admin", admin_help_command))

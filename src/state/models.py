@@ -62,6 +62,7 @@ class TradeRecord:
     closed_at: datetime | None = None
     close_reason: str | None = None  # "all_tp_hit", "stop_hit", "manual", "canceled"
     pnl_pct: float | None = None     # Final P&L % (from signal provider or calculated)
+    notes: str | None = None          # User-provided trade journal notes
 
 
 @dataclass

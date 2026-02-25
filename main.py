@@ -131,9 +131,18 @@ async def run(config: Config) -> None:
         )
         await expiry_checker.start()
 
+        # Start PnL monitor background task
+        from src.telegram.pnl_monitor import PnLMonitor
+        pnl_monitor = PnLMonitor(
+            orchestrator=orchestrator,
+            user_db=user_db,
+        )
+        await pnl_monitor.start()
+
         logger.info("Telegram bot started with trade notifications")
     else:
         expiry_checker = None
+        pnl_monitor = None
         logger.info("Telegram bot disabled (no TELEGRAM_BOT_TOKEN in .env)")
 
     # --- Select input adapter ---
@@ -183,6 +192,8 @@ async def run(config: Config) -> None:
             await adapter_task
         except asyncio.CancelledError:
             pass
+        if pnl_monitor:
+            await pnl_monitor.stop()
         if expiry_checker:
             await expiry_checker.stop()
         if telegram_bot:
