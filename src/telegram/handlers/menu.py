@@ -5,6 +5,7 @@ Screens update in-place via edit_message_text (no new messages).
 """
 
 import logging
+from datetime import datetime, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
@@ -35,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 # Number of recent signals to show in calls view
 CALLS_LIMIT = 10
+# Maximum age for calls to appear in calls view
+CALLS_MAX_AGE = timedelta(days=3)
 
 
 # ------------------------------------------------------------------
@@ -171,6 +174,9 @@ def _build_calls_text(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> tuple
 
     # Get all recent trades (last N) — combine open + completed
     all_trades = trade_db.get_open_trades() + trade_db.get_completed_trades()
+    # Filter out calls older than 3 days
+    cutoff = datetime.utcnow() - CALLS_MAX_AGE
+    all_trades = [t for t in all_trades if t.created_at and t.created_at >= cutoff]
     # Sort by created_at descending to pick the N most recent…
     all_trades.sort(key=lambda t: t.created_at, reverse=True)
     recent = all_trades[:CALLS_LIMIT]
