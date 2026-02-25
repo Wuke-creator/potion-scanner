@@ -46,8 +46,11 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 # ------------------------------------------------------------------
 
 def account_keyboard() -> InlineKeyboardMarkup:
-    """Account submenu — read-only, just nav."""
-    return InlineKeyboardMarkup(_back_refresh_close("menu:main"))
+    """Account submenu — renew button + nav."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎟 Renew Access", callback_data="account:renew")],
+        *_back_refresh_close("menu:main"),
+    ])
 
 
 def calls_view_keyboard() -> InlineKeyboardMarkup:

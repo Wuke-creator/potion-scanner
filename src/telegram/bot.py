@@ -53,7 +53,7 @@ from src.telegram.handlers.config import (
     preset_command,
 )
 from src.telegram.handlers.help import cancel_command, help_command, start_command, start_register_callback, unknown_command
-from src.telegram.handlers.menu import menu_callback, menu_command
+from src.telegram.handlers.menu import account_renew_callback, menu_callback, menu_command, renew_code_text_handler, renew_command
 from src.telegram.middleware import dm_only_filter, global_error_handler, rate_limit_filter
 from src.telegram.handlers.registration import build_registration_handler
 from src.telegram.handlers.trades import (
@@ -117,6 +117,7 @@ class TelegramBot:
             BotCommand("stats", "Trading statistics"),
             BotCommand("status", "Risk dashboard"),
             BotCommand("config", "View & change settings"),
+            BotCommand("renew", "Renew access with a new code"),
             BotCommand("cancel", "Cancel current action"),
             BotCommand("admin", "Admin commands"),
         ])
@@ -155,11 +156,13 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("help", help_command))
         self._app.add_handler(CommandHandler("menu", menu_command))
         self._app.add_handler(CommandHandler("cancel", cancel_command))
+        self._app.add_handler(CommandHandler("renew", renew_command))
 
         # Registration conversation (must be before simple command handlers)
         self._app.add_handler(build_registration_handler())
 
         # Menu navigation callbacks
+        self._app.add_handler(CallbackQueryHandler(account_renew_callback, pattern=r"^account:renew$"))
         self._app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
         self._app.add_handler(CallbackQueryHandler(start_register_callback, pattern=r"^start:register$"))
 
@@ -176,8 +179,10 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("preset", preset_command))
         self._app.add_handler(CommandHandler("auto", auto_command))
         self._app.add_handler(CallbackQueryHandler(config_callback, pattern=r"^cfg:"))
+        # Text handler for renewal code input
+        self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, renew_code_text_handler), group=1)
         # Text handler for config value input (leverage, risk limits) — low priority
-        self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, config_text_handler), group=1)
+        self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, config_text_handler), group=2)
 
         # Trade views
         self._app.add_handler(CommandHandler("trades", trades_command))

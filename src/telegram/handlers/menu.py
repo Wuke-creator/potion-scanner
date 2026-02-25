@@ -420,6 +420,97 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             pass
 
 
+# ------------------------------------------------------------------
+# Renewal handlers
+# ------------------------------------------------------------------
+
+async def account_renew_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle account:renew button — prompt user for a new access code."""
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = update.effective_chat.id
+    user_id = _resolve_user(context, chat_id)
+    if not user_id:
+        await query.edit_message_text("You're not registered. Use /register to get started.")
+        return
+
+    context.user_data["awaiting_renew_code"] = True
+    await query.edit_message_text(
+        "🎟 *Renew Access*\n\nPlease enter your new access code (or /cancel to abort):",
+        parse_mode="Markdown",
+    )
+
+
+async def renew_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /renew — direct entry point for expired users to redeem a code."""
+    chat_id = update.effective_chat.id
+    user_db = _get_user_db(context)
+    user_id = user_db.get_user_by_telegram_chat_id(chat_id)
+    if not user_id:
+        await update.message.reply_text("You're not registered. Use /register to get started.")
+        return
+
+    context.user_data["awaiting_renew_code"] = True
+    context.user_data["user_id"] = user_id
+    await update.message.reply_text(
+        "🎟 *Renew Access*\n\nPlease enter your new access code (or /cancel to abort):",
+        parse_mode="Markdown",
+    )
+
+
+async def renew_code_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle text input when user is entering a renewal code."""
+    if not context.user_data.get("awaiting_renew_code"):
+        return
+
+    code = update.message.text.strip()
+    chat_id = update.effective_chat.id
+    user_db = _get_user_db(context)
+    user_id = context.user_data.get("user_id") or _resolve_user(context, chat_id)
+
+    if not user_id:
+        context.user_data.pop("awaiting_renew_code", None)
+        await update.message.reply_text("You're not registered. Use /register to get started.")
+        return
+
+    # Validate code
+    result = user_db.validate_invite_code(code)
+    if not result["valid"]:
+        await update.message.reply_text(
+            f"❌ Invalid code: {result['reason']}\n\nTry another code or /cancel to abort."
+        )
+        return
+
+    # Redeem
+    try:
+        expires_at = user_db.redeem_invite_code(code, user_id)
+    except Exception as e:
+        logger.error("Failed to redeem code for user %s: %s", user_id, e)
+        await update.message.reply_text("⚠️ Something went wrong redeeming the code. Try again.")
+        return
+
+    context.user_data.pop("awaiting_renew_code", None)
+
+    # Reactivate user if expired/inactive
+    user = user_db.get_user(user_id)
+    if user and user.status != "active":
+        user_db.set_user_status(user_id, "active")
+        orchestrator = _get_orchestrator(context)
+        if orchestrator:
+            try:
+                orchestrator.activate_user(user_id)
+            except Exception as e:
+                logger.error("Failed to activate user %s after renewal: %s", user_id, e)
+
+    expiry_display = expires_at[:10] if expires_at else "Unlimited"
+    await update.message.reply_text(
+        f"✅ *Access Renewed!*\n\n⏰ New expiry: {expiry_display}\n\n"
+        "Use /menu to open the main menu.",
+        parse_mode="Markdown",
+    )
+
+
 async def _refresh_screen(query, context, user_id, user_db, screen):
     """Re-render the detected screen."""
     if screen == "main":

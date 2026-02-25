@@ -125,13 +125,22 @@ def format_account_info(
     network = credentials.get("network", "testnet").capitalize()
     invite_code = user_config.get("invite_code", "N/A")
 
+    # Determine subscription status from expiry
+    if expires_at is None:
+        sub_line = "📋 Subscription: ♾ Unlimited"
+    else:
+        now = datetime.now(timezone.utc).isoformat()
+        if expires_at > now:
+            sub_line = f"📋 Subscription: ✅ Active\n⏰ Expires: {expires_at[:10]}"
+        else:
+            sub_line = f"📋 Subscription: ❌ Expired\n⏰ Expired: {expires_at[:10]}"
+
     return (
         "👤 *Account & Membership*\n\n"
         f"💼 Wallet: `{wallet}`\n"
         f"🔑 API Wallet: `{api_wallet}`\n"
         f"🌐 Network: {network}\n\n"
-        f"📋 Subscription: Active\n"
-        f"⏰ Expires: {format_expiry(expires_at)}\n"
+        f"{sub_line}\n"
         f"🎟 Code Used: {invite_code}"
     )
 
