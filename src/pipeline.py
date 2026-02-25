@@ -116,6 +116,7 @@ class Pipeline:
 
         # Calculate position size
         balance = self._get_balance_usd()
+        size_warning: str | None = None
         try:
             position_size_usd = calculate_position_size(
                 balance, signal.risk_level.value, preset,
@@ -124,10 +125,15 @@ class Pipeline:
         except PositionSizeError as e:
             if auto_execute:
                 logger.warning("Skipping trade #%d: %s", signal.trade_id, e)
+                if self._notifier:
+                    self._notify(self._notifier.notify_signal_skipped(
+                        signal.trade_id, signal.pair, str(e),
+                    ))
                 return
             # Manual mode: record anyway so user sees it in calls view
             logger.info("Trade #%d below size minimum but recording as PENDING (auto_execute=OFF): %s", signal.trade_id, e)
             position_size_usd = 0.0
+            size_warning = str(e)
 
         # Risk gate — check all limits before proceeding
         try:
@@ -141,6 +147,10 @@ class Pipeline:
         except RiskLimitBreached as e:
             if auto_execute:
                 logger.warning("Skipping trade #%d — risk limit: %s", signal.trade_id, e)
+                if self._notifier:
+                    self._notify(self._notifier.notify_signal_skipped(
+                        signal.trade_id, signal.pair, str(e),
+                    ))
                 return
             logger.info("Trade #%d exceeds risk limit but recording as PENDING (auto_execute=OFF): %s", signal.trade_id, e)
 
@@ -155,6 +165,10 @@ class Pipeline:
         except (ValueError, KeyError) as e:
             if auto_execute:
                 logger.error("Trade #%d order build failed: %s", signal.trade_id, e)
+                if self._notifier:
+                    self._notify(self._notifier.notify_signal_skipped(
+                        signal.trade_id, signal.pair, str(e),
+                    ))
                 return
             logger.info("Trade #%d order build failed but recording as PENDING (auto_execute=OFF): %s", signal.trade_id, e)
 
@@ -190,6 +204,7 @@ class Pipeline:
             self._notify(self._notifier.notify_new_signal(
                 signal, trade_set or signal, position_size_usd,
                 auto_execute=auto_execute,
+                warning=size_warning,
             ))
 
         # Submit to exchange

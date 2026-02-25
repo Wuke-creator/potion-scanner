@@ -68,12 +68,22 @@ class TelegramNotifier:
     # Notification methods
     # ------------------------------------------------------------------
 
+    async def notify_signal_skipped(self, trade_id: int, pair: str, reason: str) -> None:
+        """Signal received but could not be executed."""
+        text = (
+            f"⏭ *Signal Skipped — #{trade_id}*\n\n"
+            f"💱 Pair: {pair}\n"
+            f"⚠️ Reason: {reason}"
+        )
+        await self._send(text)
+
     async def notify_new_signal(
         self,
         signal: Any,
         trade_set: Any,
         position_size_usd: float,
         auto_execute: bool = True,
+        warning: str | None = None,
     ) -> None:
         """New signal received — notify user with trade details.
 
@@ -111,6 +121,9 @@ class TelegramNotifier:
             f"💰 Size: {format_usd(position_size_usd)}\n"
             f"📊 Leverage: {trade_set.leverage}x"
         )
+
+        if warning:
+            text += f"\n\n⚠️ {warning}"
 
         reply_markup = None
         if not auto_execute:

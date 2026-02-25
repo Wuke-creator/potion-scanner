@@ -87,27 +87,36 @@ async def signal_approval_callback(update: Update, context: ContextTypes.DEFAULT
         status_text = f"❌ *Rejected* — Trade #{trade_id} canceled."
     else:
         # action == "approve"
-        try:
-            signal = _reconstruct_signal(trade)
-            trade_set = build_orders(
-                signal,
-                trade.position_size_usd,
-                ctx.pipeline._asset_meta,
-                tp_split=ctx.config.get_active_preset().tp_split,
-                max_leverage=ctx.config.strategy.max_leverage,
+        # Block $0 trades — balance too small for minimum trade size
+        if trade.position_size_usd <= 0:
+            ctx.db.update_trade_status(trade_id, TradeStatus.CANCELED, close_reason="insufficient_size")
+            status_text = (
+                f"⚠️ *Cannot execute — Trade #{trade_id}*\n\n"
+                "Your balance is too small for the minimum trade size ($10).\n"
+                "Deposit more funds or adjust risk settings."
             )
+        else:
+            try:
+                signal = _reconstruct_signal(trade)
+                trade_set = build_orders(
+                    signal,
+                    trade.position_size_usd,
+                    ctx.pipeline._asset_meta,
+                    tp_split=ctx.config.get_active_preset().tp_split,
+                    max_leverage=ctx.config.strategy.max_leverage,
+                )
 
-            pm = PositionManager(ctx.client, ctx.db)
-            pm.submit_trade(trade_set)
-            status_text = f"✅ *Approved* — Trade #{trade_id} submitted to exchange."
-        except OrderSubmissionError as e:
-            logger.error("Trade #%d submission failed: %s", trade_id, e)
-            ctx.db.update_trade_status(trade_id, TradeStatus.CANCELED, close_reason="submission_failed")
-            status_text = f"⚠️ *Approval failed* — {e}\nTrade #{trade_id} canceled."
-        except Exception as e:
-            logger.exception("Error approving trade #%d", trade_id)
-            ctx.db.update_trade_status(trade_id, TradeStatus.CANCELED, close_reason="approval_error")
-            status_text = f"⚠️ *Approval failed* — {e}\nTrade #{trade_id} canceled."
+                pm = PositionManager(ctx.client, ctx.db)
+                pm.submit_trade(trade_set)
+                status_text = f"✅ *Approved* — Trade #{trade_id} submitted to exchange."
+            except OrderSubmissionError as e:
+                logger.error("Trade #%d submission failed: %s", trade_id, e)
+                ctx.db.update_trade_status(trade_id, TradeStatus.CANCELED, close_reason="submission_failed")
+                status_text = f"⚠️ *Approval failed* — {e}\nTrade #{trade_id} canceled."
+            except Exception as e:
+                logger.exception("Error approving trade #%d", trade_id)
+                ctx.db.update_trade_status(trade_id, TradeStatus.CANCELED, close_reason="approval_error")
+                status_text = f"⚠️ *Approval failed* — {e}\nTrade #{trade_id} canceled."
 
     # Delete the old message and send a fresh status + updated calls view
     try:
