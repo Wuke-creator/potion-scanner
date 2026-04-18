@@ -151,7 +151,10 @@ class CancelSurveyDM:
             logger.debug("CancelSurveyDM skip %s — within cooldown", user_id)
             return
 
-        url = self._build_url(after)
+        # Look up Whop user id (if the member has it linked) so the survey
+        # form / downstream Sheet can cross-reference both IDs.
+        whop_user_id = await self._lookup_whop_id(user_id)
+        url = self._build_url(after, whop_user_id=whop_user_id)
         embed = self._build_embed(after, url)
 
         try:
@@ -179,14 +182,44 @@ class CancelSurveyDM:
         # the survey response webhook once that's wired up.
         await self._enroll_in_winback(user_id, after.name)
 
-    def _build_url(self, member: discord.Member) -> str:
-        params = (
-            "?type=exit"
-            f"&member_id={quote_plus(str(member.id))}"
-            f"&username={quote_plus(member.name)}"
-            "&source=discord_role_removed"
-        )
-        return self._survey_url + "/" + params
+    def _build_url(
+        self, member: discord.Member, whop_user_id: str = "",
+    ) -> str:
+        """Compose the survey URL with member identifiers appended as query
+        params. ``member_id`` is always the Discord snowflake (kept for
+        backwards compat with the existing Netlify form). ``discord_user_id``
+        is a clearer alias for new form fields. ``whop_user_id`` is appended
+        only when we successfully resolved it via whop_members_db."""
+        parts = [
+            "type=exit",
+            f"member_id={quote_plus(str(member.id))}",
+            f"discord_user_id={quote_plus(str(member.id))}",
+            f"username={quote_plus(member.name)}",
+            "source=discord_role_removed",
+        ]
+        if whop_user_id:
+            parts.append(f"whop_user_id={quote_plus(whop_user_id)}")
+        return self._survey_url + "/?" + "&".join(parts)
+
+    async def _lookup_whop_id(self, discord_user_id: str) -> str:
+        """Resolve the Whop user id for a Discord user via whop_members_db.
+
+        Returns empty string if the roster hasn't been synced yet, the
+        member isn't in it, or the lookup raises. Cancel-survey DMs should
+        never fail because of a missing Whop id.
+        """
+        if self._whop_members_db is None or not discord_user_id:
+            return ""
+        try:
+            member = await self._whop_members_db.get_by_discord(discord_user_id)
+            if member is not None and member.whop_user_id:
+                return member.whop_user_id
+        except Exception:
+            logger.debug(
+                "CancelSurveyDM: whop id lookup failed for discord=%s",
+                discord_user_id,
+            )
+        return ""
 
     # Hosted on the Netlify site alongside the survey form. Bot embeds pull it
     # in as the thumbnail. Same file also acts as the site favicon + OG image,
