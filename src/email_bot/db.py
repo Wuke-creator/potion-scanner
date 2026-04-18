@@ -181,9 +181,9 @@ class EmailDB:
         so a user who re-cancels after re-joining gets a fresh sequence
         instead of overlapping delivery.
 
-        Per-sequence defaults:
-          winback: 3 emails at day 1 (soft touch), 4 (offer), 7 (last chance)
-          reengagement: 4 emails at days 1, 3, 5, 7 (classic re-engagement cadence)
+        Per-sequence defaults (both simplified to 3 emails 2026-04-18):
+          winback: day 1 (soft touch), 4 (offer), 7 (last chance)
+          reengagement: day 1 (miss you), 4 (what you missed + results), 7 (personal touch)
 
         Returns the list of inserted send IDs.
         """
@@ -191,7 +191,8 @@ class EmailDB:
         if sequence not in ("winback", "reengagement"):
             raise ValueError(f"unknown sequence: {sequence!r}")
         if day_offsets is None:
-            day_offsets = (1, 4, 7) if sequence == "winback" else (1, 3, 5, 7)
+            # Both sequences now share the 1/4/7 cadence per Drive spec update.
+            day_offsets = (1, 4, 7)
         now = now if now is not None else int(time.time())
 
         # Cancel any pending sends for this email first

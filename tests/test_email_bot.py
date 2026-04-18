@@ -83,25 +83,25 @@ class TestEmailDBSubscribers:
 @pytest.mark.asyncio
 class TestEmailDBScheduling:
     async def test_schedule_sequence_creates_rows(self, email_db: EmailDB):
-        """Winback: 3 emails (days 1/4/7). Reengagement: 4 emails (days 1/3/5/7)."""
+        """Winback and reengagement both run 3 emails at days 1/4/7."""
         await email_db.upsert_subscriber(_sub())
         winback_ids = await email_db.schedule_sequence(
             "user@example.com", "winback",
         )
         assert len(winback_ids) == 3
-        # Cancel the winback queue to set up a clean reengagement test
+        # Reengagement now matches winback cadence (3 emails)
         await email_db.schedule_sequence("user@example.com", "reengagement")
         counts = await email_db.count_by_status()
-        assert counts.get("pending", 0) == 4  # reengagement has 4 emails
+        assert counts.get("pending", 0) == 3
 
     async def test_schedule_sequence_cancels_previous(self, email_db: EmailDB):
         await email_db.upsert_subscriber(_sub())
         await email_db.schedule_sequence("user@example.com", "winback")
         await email_db.schedule_sequence("user@example.com", "reengagement")
         counts = await email_db.count_by_status()
-        # 3 original winback pending sends got canceled + 4 reengagement queued
+        # 3 original winback pending sends got canceled + 3 reengagement queued
         assert counts.get("canceled", 0) == 3
-        assert counts.get("pending", 0) == 4
+        assert counts.get("pending", 0) == 3
 
     async def test_due_sends_only_returns_pending_and_past_due(self, email_db: EmailDB):
         await email_db.upsert_subscriber(_sub())
@@ -160,12 +160,21 @@ class TestTemplates:
         email = render("winback", 5, _sub(reason="too_expensive"), _stats())
         assert email.subject
 
-    @pytest.mark.parametrize("day", [1, 3, 5, 7])
+    @pytest.mark.parametrize("day", [1, 4, 7])
     def test_reengagement_every_day_renders(self, day: int):
+        """New 2026-04-18 cadence: reengagement also fires on days 1, 4, 7."""
         email = render("reengagement", day, _sub(), _stats())
         assert email.subject
         assert email.text
         assert email.html.startswith("<")
+
+    def test_reengagement_day3_and_day5_legacy_still_render(self):
+        """Days 3 and 5 were deprecated 2026-04-18 but their renderers stay
+        mapped so in-flight pending sends scheduled before the change
+        don't crash on delivery."""
+        for day in (3, 5):
+            email = render("reengagement", day, _sub(), _stats())
+            assert email.subject
 
     def test_day1_winback_includes_live_stats(self):
         email = render("winback", 1, _sub(), _stats())

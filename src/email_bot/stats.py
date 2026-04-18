@@ -38,6 +38,16 @@ class StatsBundle:
     top_calls_7d: list[dict]         # up to 3 entries, sorted desc
     calls_30d_total: int
     top_call_30d: dict | None
+    top_calls_30d: list[dict] = None  # up to 5 entries, sorted desc; added
+                                      # 2026-04-18 to power Offer D/E + the
+                                      # reengagement Day 4 weekly snapshot
+
+    def __post_init__(self):
+        # Dataclass default_factory replacement. Using a default of None in
+        # the field signature to stay backwards-compatible with any test
+        # fixtures that instantiate StatsBundle without this field.
+        if self.top_calls_30d is None:
+            self.top_calls_30d = []
 
     def as_dict(self) -> dict:
         return {
@@ -47,6 +57,7 @@ class StatsBundle:
             "top_calls_7d": self.top_calls_7d,
             "calls_30d_total": self.calls_30d_total,
             "top_call_30d": self.top_call_30d,
+            "top_calls_30d": self.top_calls_30d,
         }
 
 
@@ -118,7 +129,7 @@ async def gather_stats(analytics_db_path: str) -> StatsBundle:
         calls_30d = await _count_signals_since(conn, cutoff_30d)
         wins_7d_50 = await _count_wins_over_pct_since(conn, cutoff_7d, 50.0)
         top_7d = await _top_calls_since(conn, cutoff_7d, 3)
-        top_30d = await _top_calls_since(conn, cutoff_30d, 1)
+        top_30d_list = await _top_calls_since(conn, cutoff_30d, 5)
     finally:
         await conn.close()
 
@@ -128,5 +139,6 @@ async def gather_stats(analytics_db_path: str) -> StatsBundle:
         top_call_7d=top_7d[0] if top_7d else None,
         top_calls_7d=top_7d,
         calls_30d_total=calls_30d,
-        top_call_30d=top_30d[0] if top_30d else None,
+        top_call_30d=top_30d_list[0] if top_30d_list else None,
+        top_calls_30d=top_30d_list,
     )

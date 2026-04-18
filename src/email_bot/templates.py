@@ -228,6 +228,11 @@ def _winback_day5_legacy(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
     reason = sub.exit_reason
     rejoin = sub.rejoin_url or "https://whop.com/potion"
 
+    # Default fallback: offers A/B/C/F use the plain-text lead run through
+    # `escape` + newline-to-p. Offers D and E override this with a pre-
+    # rendered top-5 bullets list by setting offer_lead_html directly.
+    offer_lead_html: str | None = None
+
     # Map reason to (subject, offer_text, offer_html, cta_label)
     if reason == "too_expensive":
         # Offer A
@@ -264,27 +269,56 @@ def _winback_day5_legacy(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         )
         cta = "Pause until the market picks up"
     elif reason == "quality_declined":
-        # Offer D (free 3 days)
+        # Offer D: top 5 calls + 3 free days. Updated 2026-04-18 to show a
+        # list of 5 calls pulled live from analytics rather than just the
+        # single top call, matching the refreshed Drive spec Doc 06 Offer D.
         subject = f"{name}, a look at the last 30 days"
-        top_30 = _top_line_30d(stats) or "strong calls across the board"
+        top_bullets_text = _top_calls_30d_bullets_text(stats)
+        top_bullets_html = _top_calls_30d_bullets_html(stats)
         offer_lead = (
-            f"Really appreciate your honest opinion. In the background "
-            f"we\u2019ve been making improvements.\n\n"
-            f"Here\u2019s the peak call from the past 30 days: {top_30}. "
+            f"Appreciate the honest feedback.\n\n"
+            f"In the background we\u2019ve been working on improvements. "
+            f"Here\u2019s a look at the top 5 calls from the past 30 days:\n\n"
+            f"{top_bullets_text}\n\n"
             f"We\u2019d like to give you 3 free days to see if it feels "
             f"different now. No pressure either way."
         )
-        cta = "Try 3 Days Free"
+        # Embed the HTML top-5 list into the offer when we render HTML
+        offer_lead_html = (
+            f"<p>Appreciate the honest feedback.</p>"
+            f"<p>In the background we\u2019ve been working on improvements. "
+            f"Here\u2019s a look at the top 5 calls from the past 30 days:</p>"
+            f"{top_bullets_html}"
+            f"<p>We\u2019d like to give you <strong>3 free days</strong> to "
+            f"see if it feels different now. No pressure either way.</p>"
+        )
+        cta = "Try 3 days free"
     elif reason == "found_alternative":
-        # Offer E (compare)
+        # Offer E: no discount, top-5 comparison + free 3-day trial. Updated
+        # 2026-04-18 to actually show the top 5 calls instead of just
+        # gesturing at them, matching Drive Doc 06 Offer E.
         subject = "A fair comparison"
-        top_30 = _top_line_30d(stats) or "our top calls this month"
+        top_bullets_text = _top_calls_30d_bullets_text(stats)
+        top_bullets_html = _top_calls_30d_bullets_html(stats)
         offer_lead = (
             f"Respect the honesty. We\u2019re not going to try to outbid "
-            f"anyone; instead, here\u2019s a look at our most profitable "
-            f"call this last month: {top_30}.\n\n"
-            f"No discount, just value. If it doesn\u2019t stack up, we wish "
-            f"you well. If you want to try both, there\u2019s a free 3-day trial."
+            f"anyone.\n\n"
+            f"Instead, here\u2019s a breakdown of our top calls from the last "
+            f"30 days so you can compare like for like:\n\n"
+            f"{top_bullets_text}\n\n"
+            f"No discount. Just the numbers.\n\n"
+            f"If it doesn\u2019t stack up, we wish you well. If you want to "
+            f"run them side by side, there\u2019s a free 3-day trial on us."
+        )
+        offer_lead_html = (
+            f"<p>Respect the honesty. We\u2019re not going to try to outbid "
+            f"anyone.</p>"
+            f"<p>Instead, here\u2019s a breakdown of our top calls from the "
+            f"last 30 days so you can compare like for like:</p>"
+            f"{top_bullets_html}"
+            f"<p>No discount. Just the numbers.</p>"
+            f"<p>If it doesn\u2019t stack up, we wish you well. If you want "
+            f"to run them side by side, there\u2019s a free 3-day trial on us.</p>"
         )
         cta = "Compare and decide"
     else:
@@ -304,9 +338,18 @@ def _winback_day5_legacy(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"No pressure, just wanted to be transparent about what\u2019s on the "
         f"table.\n"
     )
+    # Offers D and E set offer_lead_html to a pre-rendered block containing
+    # the top-5 calls list (with <ul> structure). Other offers use the plain
+    # escape + newline-to-paragraph fallback.
+    if offer_lead_html is None:
+        body_html_content = (
+            f"<p>{escape(offer_lead).replace(chr(10) + chr(10), '</p><p>')}</p>"
+        )
+    else:
+        body_html_content = offer_lead_html
     html_body = (
         f"<p>{escape(name)},</p>"
-        f"<p>{escape(offer_lead).replace(chr(10) + chr(10), '</p><p>')}</p>"
+        f"{body_html_content}"
         f"{_cta_button_html(cta, rejoin)}"
         f"<p style='color:#666;font-size:14px;'>No pressure, just wanted "
         f"to be transparent about what\u2019s on the table.</p>"
@@ -392,36 +435,139 @@ def _reengage_day1(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
     return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
 
 
-def _reengage_day3(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+def _weekly_results_bullets_text(stats: StatsBundle) -> str:
+    """Build a text-mode Weekly Results Snapshot from live analytics.
+
+    Picks up to 3 headline lines: the bot's top "we called" moment (from the
+    7-day top call), the best swing-call PnL, and the most notable Telegram
+    alert. Everything framed as "we called it", never attributed to a
+    specific member (per Luke's 2026-04-18 decision).
+    """
+    lines: list[str] = []
+    if stats.top_call_7d:
+        pnl = stats.top_call_7d.get("pnl_pct", 0.0)
+        pair = stats.top_call_7d.get("pair", "")
+        if pair:
+            lines.append(f"\u2022 We called {pair}: +{pnl:.0f}% peak gain")
+    if len(stats.top_calls_7d) > 1:
+        second = stats.top_calls_7d[1]
+        lines.append(
+            f"\u2022 {second['pair']} swing call: "
+            f"+{second['pnl_pct']:.0f}% in {max(1, second['days_ago'])} day(s)"
+        )
+    if len(stats.top_calls_7d) > 2:
+        third = stats.top_calls_7d[2]
+        lines.append(
+            f"\u2022 Telegram bot alert on {third['pair']}: "
+            f"caught the move early"
+        )
+    if not lines:
+        return "\u2022 Multiple high-conviction setups this week"
+    return "\n".join(lines)
+
+
+def _weekly_results_bullets_html(stats: StatsBundle) -> str:
+    """HTML version of the Weekly Results Snapshot, same data as the text
+    version wrapped in a <ul>."""
+    items: list[str] = []
+    if stats.top_call_7d:
+        pnl = stats.top_call_7d.get("pnl_pct", 0.0)
+        pair = stats.top_call_7d.get("pair", "")
+        if pair:
+            items.append(
+                f"<li>We called <strong>{escape(pair)}</strong>: "
+                f"+{pnl:.0f}% peak gain</li>"
+            )
+    if len(stats.top_calls_7d) > 1:
+        second = stats.top_calls_7d[1]
+        items.append(
+            f"<li><strong>{escape(second['pair'])}</strong> swing call: "
+            f"+{second['pnl_pct']:.0f}% in "
+            f"{max(1, second['days_ago'])} day(s)</li>"
+        )
+    if len(stats.top_calls_7d) > 2:
+        third = stats.top_calls_7d[2]
+        items.append(
+            f"<li>Telegram bot alert on "
+            f"<strong>{escape(third['pair'])}</strong>: "
+            f"caught the move early</li>"
+        )
+    if not items:
+        items.append("<li>Multiple high-conviction setups this week</li>")
+    return "<ul>" + "".join(items) + "</ul>"
+
+
+def _top_calls_30d_bullets_text(stats: StatsBundle) -> str:
+    """Text-mode bullet list of the top 5 calls from the last 30 days. Used
+    by Offer D + Offer E. Falls back to a generic line if analytics hasn't
+    produced enough data yet (new account, etc.)."""
+    rows = stats.top_calls_30d or []
+    if not rows:
+        return "\u2022 Multiple high-conviction calls this month"
+    out: list[str] = []
+    for call in rows[:5]:
+        pair = call.get("pair", "")
+        pnl = call.get("pnl_pct", 0.0)
+        days = max(1, call.get("days_ago", 0))
+        if pair:
+            out.append(f"\u2022 {pair}: +{pnl:.0f}% ({days} day(s) ago)")
+    return "\n".join(out) or "\u2022 Multiple high-conviction calls this month"
+
+
+def _top_calls_30d_bullets_html(stats: StatsBundle) -> str:
+    rows = stats.top_calls_30d or []
+    if not rows:
+        return "<ul><li>Multiple high-conviction calls this month</li></ul>"
+    items: list[str] = []
+    for call in rows[:5]:
+        pair = call.get("pair", "")
+        pnl = call.get("pnl_pct", 0.0)
+        days = max(1, call.get("days_ago", 0))
+        if pair:
+            items.append(
+                f"<li><strong>{escape(pair)}</strong>: +{pnl:.0f}% "
+                f"({days} day(s) ago)</li>"
+            )
+    if not items:
+        return "<ul><li>Multiple high-conviction calls this month</li></ul>"
+    return "<ul>" + "".join(items) + "</ul>"
+
+
+def _reengage_day4(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Day 4 reengagement: "You probably missed this" with Weekly Results
+    Snapshot. Replaced the old Day 3 slot in the 2026-04-18 schedule update.
+
+    Per Luke: callouts must be framed as "we called X", not attributed to a
+    specific member handle. The snapshot is built from live analytics via
+    _weekly_results_bullets_* helpers so it's fresh on every send.
+    """
     name = _pretty_name(sub)
-    bullets_text = _top_bullets(stats) or "• Several high-conviction setups just this week"
-    bullets_html = _top_bullets_html(stats) or (
-        "<ul><li>Several high-conviction setups just this week</li></ul>"
-    )
+    snapshot_text = _weekly_results_bullets_text(stats)
+    snapshot_html = _weekly_results_bullets_html(stats)
     rejoin = sub.rejoin_url or "https://whop.com/potion"
 
-    subject = "You probably missed this"
+    subject = "You probably missed this,"
     text = (
         f"Hey {name},\n\n"
-        f"Quick one \u2014 since you\u2019ve been away, here\u2019s a few things you "
+        f"Quick one, since you\u2019ve been away, here\u2019s few things that you "
         f"missed:\n\n"
-        f"WEEKLY RESULTS SNAPSHOT\n"
-        f"{bullets_text}\n\n"
+        f"Weekly Results Snapshot\n"
+        f"{snapshot_text}\n\n"
         f"Most members don\u2019t even realize how much is inside until they "
-        f"start using it properly. Might be worth taking another look.\n\n"
-        f"Jump back in: {rejoin}\n\n"
+        f"start using it properly. Take another look.\n\n"
         f"If you need any help feel free to open a ticket and get live "
-        f"support from our team: {TICKETS_CHANNEL}\n"
+        f"support from our team: {TICKETS_CHANNEL}\n\n"
+        f"Reclaim your seat: {rejoin}\n"
     )
     html_body = (
         f"<p>Hey {escape(name)},</p>"
-        f"<p>Quick one, since you\u2019ve been away, here\u2019s a few things "
-        f"you missed:</p>"
-        f"<p><strong>Weekly results snapshot:</strong></p>"
-        f"{bullets_html}"
+        f"<p>Quick one, since you\u2019ve been away, here\u2019s few things "
+        f"that you missed:</p>"
+        f"<p><strong>Weekly Results Snapshot</strong></p>"
+        f"{snapshot_html}"
         f"<p>Most members don\u2019t even realize how much is inside until "
-        f"they start using it properly. Might be worth taking another look.</p>"
-        f"{_cta_button_html('Jump back in', rejoin)}"
+        f"they start using it properly. Take another look.</p>"
+        f"{_cta_button_html('Reclaim your seat', rejoin)}"
         f"<p style='color:#666;font-size:14px;'>If you need any help feel "
         f"free to <a href='{escape(TICKETS_CHANNEL)}'>open a ticket</a> and "
         f"get live support from our team.</p>"
@@ -429,7 +575,11 @@ def _reengage_day3(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
     return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
 
 
-def _reengage_day5(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+def _reengage_day5_legacy(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """DEPRECATED 2026-04-18. Reengagement cadence simplified to 1/4/7,
+    matching the winback cadence. This renderer stays mapped so in-flight
+    day=5 reengagement sends scheduled before the change don't crash on
+    delivery."""
     name = _pretty_name(sub)
     rejoin = sub.rejoin_url or "https://whop.com/potion"
     subject = "New features while you were away"
@@ -466,7 +616,8 @@ def _reengage_day5(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
 def _reengage_day7(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
     name = _pretty_name(sub)
     rejoin = sub.rejoin_url or "https://whop.com/potion"
-    subject = "You missed the last train"
+    # Subject updated 2026-04-18 per Drive spec doc 01 Task 6.
+    subject = "Don\u2019t miss the last Train bound for Potion Elite"
     text = (
         f"Hey {name},\n\n"
         f"We get it, something comes in the way and you can\u2019t be present "
@@ -518,9 +669,14 @@ _WINBACK_RENDERERS = {
 }
 
 _REENGAGE_RENDERERS = {
+    # Luke's 2026-04-18 simplification: 3 emails at days 1, 4, 7 (same
+    # cadence as winback). Day 3 and Day 5 legacy renderers retained so
+    # pending sends scheduled before the change don't crash on delivery.
     1: _reengage_day1,
-    3: _reengage_day3,
-    5: _reengage_day5,
+    3: _reengage_day4,  # Day 3 was renamed to Day 4; keep Day 3 key firing
+                        # the new renderer so in-flight Day 3 sends still land
+    4: _reengage_day4,
+    5: _reengage_day5_legacy,
     7: _reengage_day7,
 }
 
