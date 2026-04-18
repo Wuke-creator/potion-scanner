@@ -1,14 +1,21 @@
-"""DM the exit survey to members who lose the Elite role.
+"""DM the exit survey AND enroll in winback on Elite role removal.
 
-Subscribes to ``discord.Client.on_member_update`` and watches for the Elite
-role transitioning from present to absent. When that fires, the cancelled
-member is DM'd a personalised link to the cancellation feedback survey
-hosted at ``CANCEL_SURVEY_URL``. Discord ID + username are appended to the
-URL so submissions can be cross-referenced back to who left.
+Single source of truth for "member cancelled": the Discord Elite role
+transitioning from present to absent (set by Whop's automatic role sync).
+When that fires we:
+
+  1. DM the member a personalised exit-survey link (CANCEL_SURVEY_URL
+     with ?member_id=X&username=Y&source=discord_role_removed appended)
+  2. Look up their email (whop_members roster first, verified_users as
+     fallback) and enroll them in the 3-email winback sequence
+
+This replaces the older Whop cancellation-webhook flow entirely, so
+WHOP_WEBHOOK_SECRET is no longer required.
 
 State is tracked in SQLite (``data/cancel_survey_dms.db``) to prevent
 double-DMing on role flickers (admin removes-then-re-adds within minutes,
-or the bot reconnects and re-emits stale member_update events).
+or the bot reconnects and re-emits stale member_update events). The same
+dedupe prevents double-enrolling in the email sequence.
 
 Requires the ``Server Members`` privileged intent enabled in the Discord
 developer portal AND ``intents.members = True`` on the discord.Client. If
@@ -20,10 +27,16 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import quote_plus
 
 import aiosqlite
 import discord
+
+if TYPE_CHECKING:
+    from src.automations.whop_members_db import WhopMembersDB
+    from src.email_bot.db import EmailDB
+    from src.verification.db import VerificationDB
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +67,10 @@ class CancelSurveyDM:
         survey_url: str,
         db_path: str = "data/cancel_survey_dms.db",
         cooldown_seconds: int = 7 * 24 * 60 * 60,
+        rejoin_url: str = "https://whop.com/potion",
+        whop_members_db: "WhopMembersDB | None" = None,
+        verification_db: "VerificationDB | None" = None,
+        email_db: "EmailDB | None" = None,
     ):
         if elite_role_id <= 0:
             raise ValueError("elite_role_id required and must be > 0")
@@ -65,6 +82,10 @@ class CancelSurveyDM:
         self._survey_url = survey_url.rstrip("/")
         self._db_path = db_path
         self._cooldown = int(cooldown_seconds)
+        self._rejoin_url = rejoin_url
+        self._whop_members_db = whop_members_db
+        self._verification_db = verification_db
+        self._email_db = email_db
         self._db: aiosqlite.Connection | None = None
         self._registered = False
 
@@ -131,11 +152,11 @@ class CancelSurveyDM:
             return
 
         url = self._build_url(after)
-        message = self._build_message(after, url)
+        embed = self._build_embed(after, url)
 
         try:
             channel = await after.create_dm()
-            await channel.send(message)
+            await channel.send(embed=embed)
             await self._record_sent(user_id, after.name, delivered=True)
             logger.info(
                 "CancelSurveyDM sent to %s (%s) — survey url logged in DM",
@@ -152,6 +173,12 @@ class CancelSurveyDM:
                 user_id, after.name, e,
             )
 
+        # Enroll in winback email sequence. Runs regardless of whether the
+        # survey DM landed (they still cancelled; the email is our second
+        # touch). exit_reason starts as "other" and can be updated later via
+        # the survey response webhook once that's wired up.
+        await self._enroll_in_winback(user_id, after.name)
+
     def _build_url(self, member: discord.Member) -> str:
         params = (
             "?type=exit"
@@ -161,16 +188,111 @@ class CancelSurveyDM:
         )
         return self._survey_url + "/" + params
 
-    def _build_message(self, member: discord.Member, url: str) -> str:
+    # Hosted on the Netlify site alongside the survey form. Bot embeds pull it
+    # in as the thumbnail. Same file also acts as the site favicon + OG image,
+    # so upload once at potion-feedback.netlify.app/potion-logo.png.
+    _LOGO_URL = "https://potion-feedback.netlify.app/potion-logo.png"
+    _POTION_PURPLE = 0x6b4fbb
+
+    def _build_embed(self, member: discord.Member, url: str) -> discord.Embed:
+        """Rich Discord embed for the exit survey DM.
+
+        Uses the Potion logo as thumbnail so the DM looks branded, not spammy.
+        The title links directly to the survey so a single click / tap on
+        the embed header takes the user there. Description keeps the same
+        copy as the old plaintext version for consistency.
+        """
         name = member.display_name or member.name
-        return (
-            f"Hey {name},\n\n"
-            "Your Potion access just ended. Before you go, we'd love a quick "
-            "line on what didn't work. Takes 20 seconds and the team reads "
-            "every reply.\n\n"
-            f"{url}\n\n"
-            "Whatever you share goes straight to us. No follow-up sales pitch."
+        embed = discord.Embed(
+            title="Sorry to see you go",
+            url=url,
+            description=(
+                f"Hey {name},\n\n"
+                "Your Potion access just ended. Before you go, we'd love a "
+                "quick line on what didn't work. Takes 20 seconds and the "
+                "team reads every reply.\n\n"
+                f"**[Open the survey]({url})**\n\n"
+                "Whatever you share goes straight to us. No follow-up sales "
+                "pitch."
+            ),
+            color=self._POTION_PURPLE,
         )
+        embed.set_thumbnail(url=self._LOGO_URL)
+        embed.set_footer(text="Potion Alpha Team")
+        return embed
+
+    async def _enroll_in_winback(self, discord_user_id: str, username: str) -> None:
+        """Look up email for this Discord user and enroll in winback sequence.
+
+        Source priority:
+          1. whop_members (full Elite roster, 126k members) — covers every
+             paying member whether or not they've verified on Telegram
+          2. verified_users (Telegram-verified subset) — fallback for
+             members whose Discord isn't linked in Whop
+
+        Silent skip if:
+          - email_db is None (automations disabled)
+          - no email source is wired
+          - discord_user_id not found in either source
+          - the email is blank
+
+        All error handling is defensive: cancellation tracking should never
+        crash the on_member_update listener.
+        """
+        if self._email_db is None:
+            return
+
+        email = ""
+        try:
+            if self._whop_members_db is not None:
+                member = await self._whop_members_db.get_by_discord(discord_user_id)
+                if member is not None and member.email:
+                    email = member.email
+            if not email and self._verification_db is not None:
+                verified_users = await self._verification_db.list_active()
+                for user in verified_users:
+                    if user.discord_user_id == discord_user_id and user.email:
+                        email = user.email
+                        break
+        except Exception:
+            logger.exception(
+                "CancelSurveyDM email lookup failed for discord=%s",
+                discord_user_id,
+            )
+            return
+
+        if not email:
+            logger.info(
+                "CancelSurveyDM: no email on file for discord=%s (%s), "
+                "skipping winback enroll",
+                discord_user_id, username,
+            )
+            return
+
+        try:
+            from src.email_bot.db import Subscriber  # local to avoid cycles
+
+            sub = Subscriber(
+                email=email,
+                name=username,
+                trigger_type="cancellation",
+                exit_reason="other",  # updated later via survey response webhook
+                rejoin_url=self._rejoin_url,
+                created_at=int(time.time()),
+            )
+            await self._email_db.upsert_subscriber(sub)
+            send_ids = await self._email_db.schedule_sequence(
+                email=email, sequence="winback",
+            )
+            logger.info(
+                "CancelSurveyDM: enrolled %s (%s) in winback sequence, "
+                "%d emails queued",
+                email, username, len(send_ids),
+            )
+        except Exception:
+            logger.exception(
+                "CancelSurveyDM winback enroll failed for %s", email,
+            )
 
     async def _already_sent_recently(self, user_id: str) -> bool:
         if self._db is None:

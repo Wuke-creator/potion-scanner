@@ -295,8 +295,18 @@ async def run(config: Config) -> None:
                     survey_url=survey_url,
                     db_path=config.automations.cancel_survey_db_path,
                     cooldown_seconds=config.automations.cancel_survey_cooldown_seconds,
+                    # Winback enrollment wiring: on role removal, look up
+                    # email (whop_members roster first, verified_users as
+                    # fallback) and schedule the 3-email sequence. This
+                    # replaces the old WHOP_WEBHOOK_SECRET flow.
+                    rejoin_url=config.email_bot.rejoin_url,
+                    whop_members_db=whop_members_db,
+                    verification_db=verification.db,
+                    email_db=email_db,
                 )
-                logger.info("Cancel survey DM watcher armed")
+                logger.info(
+                    "Cancel survey DM watcher armed (with winback enrollment)",
+                )
             except (ValueError, TypeError) as e:
                 logger.warning("CancelSurveyDM init failed: %s", e)
         else:
