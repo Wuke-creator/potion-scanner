@@ -73,6 +73,10 @@ class DiscordListener:
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guilds = True
+        # Server Members privileged intent: required for on_member_update
+        # (cancel-survey DM watcher needs it). Must also be enabled in the
+        # Discord developer portal under Bot -> Privileged Gateway Intents.
+        intents.members = True
         self._client = discord.Client(intents=intents)
 
         self._setup_handlers()

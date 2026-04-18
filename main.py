@@ -24,6 +24,7 @@ from telegram import Bot
 
 from src.analytics import AnalyticsDB
 from src.automations import ActivityDB
+from src.automations.cancel_survey_dm import CancelSurveyDM
 from src.automations.channel_feeler import ChannelFeeler
 from src.automations.feature_launch import FeatureLaunchBroadcaster
 from src.automations.inactivity_detector import InactivityDetector
@@ -177,6 +178,7 @@ async def run(config: Config) -> None:
     whop_email_sync_cron: WhopEmailSyncCron | None = None
     whop_reviews_db: WhopReviewsDB | None = None
     whop_reviews_sync: WhopReviewsSync | None = None
+    cancel_survey_dm: CancelSurveyDM | None = None
     if config.automations.enabled and activity_db is not None:
         launch_broadcaster = FeatureLaunchBroadcaster(
             telegram_bot=telegram_bot,
@@ -279,6 +281,30 @@ async def run(config: Config) -> None:
                 "WHOP_COMPANY_ID + WHOP_REVIEWS_CHANNEL_ID",
             )
 
+        # Cancel survey DM: watch for Elite role removals and DM the
+        # cancelled member a personalised exit-survey link. Skipped (logged)
+        # if either the Elite role ID or the survey URL is missing.
+        survey_url = config.automations.cancel_survey_url
+        elite_role_id_str = config.discord_oauth.elite_role_id
+        if survey_url and elite_role_id_str:
+            try:
+                cancel_survey_dm = CancelSurveyDM(
+                    client=listener.client,
+                    elite_role_id=int(elite_role_id_str),
+                    guild_id=config.discord.guild_id,
+                    survey_url=survey_url,
+                    db_path=config.automations.cancel_survey_db_path,
+                    cooldown_seconds=config.automations.cancel_survey_cooldown_seconds,
+                )
+                logger.info("Cancel survey DM watcher armed")
+            except (ValueError, TypeError) as e:
+                logger.warning("CancelSurveyDM init failed: %s", e)
+        else:
+            logger.info(
+                "CancelSurveyDM skipped: need DISCORD_ELITE_ROLE_ID + "
+                "CANCEL_SURVEY_URL"
+            )
+
         logger.info("Automations enabled")
 
     # --- Discord slash commands (build LAST so launch_broadcaster is available) ---
@@ -318,6 +344,8 @@ async def run(config: Config) -> None:
         await whop_email_sync_cron.start()
     if whop_reviews_sync is not None:
         await whop_reviews_sync.start()
+    if cancel_survey_dm is not None:
+        await cancel_survey_dm.open()
     listener_task = asyncio.create_task(listener.start(), name="discord_listener")
     consumer_task = asyncio.create_task(
         _consume_queue(queue, router, shutdown), name="queue_consumer",
@@ -378,6 +406,11 @@ async def run(config: Config) -> None:
                 await whop_reviews_db.close()
             except Exception:
                 logger.exception("Whop reviews DB close error")
+        if cancel_survey_dm is not None:
+            try:
+                await cancel_survey_dm.close()
+            except Exception:
+                logger.exception("Cancel survey DM close error")
         if email_worker is not None:
             try:
                 await email_worker.stop()

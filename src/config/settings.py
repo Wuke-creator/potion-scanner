@@ -200,6 +200,12 @@ class AutomationsConfig:
     whop_reviews_interval_seconds: int = 900
     whop_reviews_ping_on_low_stars: bool = False
 
+    # Cancel survey DM: when a member loses the Elite role, DM them the
+    # exit feedback survey link. Skipped if either field is empty.
+    cancel_survey_url: str = ""  # CANCEL_SURVEY_URL env var
+    cancel_survey_db_path: str = "data/cancel_survey_dms.db"
+    cancel_survey_cooldown_seconds: int = 7 * 24 * 60 * 60  # 7 days
+
 
 @dataclass
 class Config:
@@ -464,6 +470,18 @@ def load_config(
         ),
         whop_reviews_ping_on_low_stars=bool(
             automations_yaml.get("whop_reviews_ping_on_low_stars", False)
+        ),
+        cancel_survey_url=os.getenv(
+            "CANCEL_SURVEY_URL",
+            automations_yaml.get("cancel_survey_url", ""),
+        ).strip(),
+        cancel_survey_db_path=automations_yaml.get(
+            "cancel_survey_db_path", "data/cancel_survey_dms.db",
+        ),
+        cancel_survey_cooldown_seconds=int(
+            automations_yaml.get(
+                "cancel_survey_cooldown_seconds", 7 * 24 * 60 * 60,
+            )
         ),
     )
 
