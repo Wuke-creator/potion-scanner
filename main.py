@@ -1,243 +1,416 @@
-"""Potion Perps Bot — Entry point.
+"""Potion Discord → Telegram Signals Bot — entry point.
 
-Loads config, initializes the multi-user orchestrator, starts the admin API,
-and runs the signal processing loop with the configured input adapter.
-Handles graceful shutdown via SIGTERM/SIGINT.
+Wires together, in order:
+
+  1. Verification subsystem (Whop OAuth + SQLite DB + OAuth callback
+     server + Telegram command handlers + 24h reverify cron)
+  2. Dispatcher (rate-limited DM fan-out to all active verified users)
+  3. Router (classify + parse + format, hands each alert to dispatcher)
+  4. Discord listener (multi-channel, pushes messages onto an async queue)
+  5. Queue consumer that pulls from the Discord queue into the router
+
+Single asyncio event loop, single process. Shutdown is graceful:
+SIGINT/SIGTERM sets an event, everything drains and stops in reverse
+order.
 """
+
+from __future__ import annotations
 
 import asyncio
 import logging
 import signal
 
-from src.api.admin import AdminAPI
+from telegram import Bot
+
+from src.analytics import AnalyticsDB
+from src.automations import ActivityDB
+from src.automations.channel_feeler import ChannelFeeler
+from src.automations.feature_launch import FeatureLaunchBroadcaster
+from src.automations.inactivity_detector import InactivityDetector
+from src.automations.value_reminder import ValueReminder
+from src.automations.whop_email_sync import WhopEmailSync, WhopEmailSyncCron
+from src.automations.whop_members_db import WhopMembersDB
+from src.automations.whop_reviews_sync import WhopReviewsDB, WhopReviewsSync
 from src.config import Config, load_config
-from src.health import HealthServer
-from src.input.cli_adapter import CLIAdapter
-from src.input.simulation_adapter import SimulationAdapter
-from src.orchestrator import Orchestrator
-from src.state.user_db import UserDatabase
+from src.discord_listener import DiscordListener, IncomingMessage
+from src.dispatcher import Dispatcher
+from src.email_bot import EmailDB
+from src.email_bot.discord_commands import EmailSlashCommands
+from src.email_bot.sender import ResendClient
+from src.email_bot.webhook import EmailWebhookHandlers
+from src.email_bot.worker import EmailWorker
+from src.router import Router
 from src.utils.logger import setup_logging
+
+logger = logging.getLogger(__name__)
+
+
+async def _consume_queue(
+    queue: asyncio.Queue[IncomingMessage],
+    router: Router,
+    shutdown: asyncio.Event,
+) -> None:
+    """Pull messages off the Discord queue and hand them to the router."""
+    while not shutdown.is_set():
+        try:
+            message = await asyncio.wait_for(queue.get(), timeout=1.0)
+        except asyncio.TimeoutError:
+            continue
+        await router.handle(message)
 
 
 async def run(config: Config) -> None:
-    """Main loop: initialize orchestrator, start services, process signals."""
-    logger = logging.getLogger(__name__)
-
-    shutdown_event = asyncio.Event()
-
-    # --- Register signal handlers ---
+    shutdown = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, shutdown_event.set)
+        try:
+            loop.add_signal_handler(sig, shutdown.set)
+        except NotImplementedError:
+            # Windows: add_signal_handler isn't implemented on asyncio loops.
+            # KeyboardInterrupt will still unwind the top-level asyncio.run().
+            pass
 
-    # --- Initialize user database & orchestrator ---
-    user_db = UserDatabase(db_path=config.database.path)
-    orchestrator = Orchestrator(global_config=config, user_db=user_db)
+    telegram_bot = Bot(token=config.telegram.bot_token)
 
-    # --- Start orchestrator (loads active users or falls back to single-user) ---
-    orchestrator.start()
+    # --- Analytics: track signal counts + PnL events ---
+    analytics = AnalyticsDB(db_path="data/analytics.db")
+    await analytics.open()
 
-    # --- Start health server ---
-    health_server = HealthServer(port=config.health.port)
-    if config.health.enabled:
-        await health_server.start()
-        logger.info("Health server listening on port %d", config.health.port)
+    # --- Verification subsystem (commands read analytics for /data) ---
+    from src.verification.runtime import build_verification_runtime
 
-    # --- Start admin API ---
-    admin_api = AdminAPI(
-        user_db=user_db,
-        on_user_activate=_make_activate_callback(orchestrator),
-        on_user_deactivate=_make_deactivate_callback(orchestrator),
-        on_kill=_make_kill_callback(orchestrator),
-        on_resume=_make_resume_callback(orchestrator),
+    verification = await build_verification_runtime(
+        config=config, telegram_bot=telegram_bot, analytics=analytics,
     )
-    await admin_api.start()
 
-    # --- Start Telegram bot (if token configured) ---
-    telegram_bot = None
-    if config.telegram.bot_token:
-        from src.telegram.bot import TelegramBot
-        from src.telegram.notifications import TelegramNotifier
+    # --- Dispatcher: fan out alerts as DMs to all active verified users ---
+    dispatcher = Dispatcher(
+        bot=telegram_bot,
+        db=verification.db,
+        config=config.dispatcher,
+    )
 
-        telegram_bot = TelegramBot(
-            token=config.telegram.bot_token,
-            user_db=user_db,
-            config=config,
-            orchestrator=orchestrator,
+    # --- Router: classify + parse + format, enqueue to dispatcher ---
+    router = Router(
+        discord_cfg=config.discord,
+        dispatcher=dispatcher,
+        analytics=analytics,
+    )
+
+    # --- Automations: shared activity tracker (feeds Features 2 + 4) ---
+    activity_db: ActivityDB | None = None
+    whop_members_db: WhopMembersDB | None = None
+    if config.automations.enabled:
+        activity_db = ActivityDB(db_path=config.automations.activity_db_path)
+        await activity_db.open()
+        # Whop member roster (full Elite audience for email features).
+        # Opened regardless of whether the Whop API key is set; if it's not,
+        # the table stays empty and email features fall back to the
+        # Telegram-verified subset.
+        whop_members_db = WhopMembersDB(
+            db_path=config.automations.whop_members_db_path,
         )
-        await telegram_bot.start()
+        await whop_members_db.open()
 
-        # Create notifier factory now that the bot is running
-        from src.telegram.handlers.menu import (
-            _build_calls_text,
-            get_calls_view_msg,
-            set_calls_view_msg,
-        )
-
-        def _notifier_factory(uid: str) -> TelegramNotifier:
-            chat_id = user_db.get_telegram_chat_id(uid)
-
-            def _checker() -> bool:
-                calls_set = telegram_bot._app.bot_data.get("calls_view_users", set())
-                return chat_id in calls_set
-
-            async def _refresher() -> None:
-                """Delete old calls-view message and send updated one."""
-                bot_data = telegram_bot._app.bot_data
-                bot = telegram_bot.bot
-                # Build a minimal context-like object for _build_calls_text
-                class _Ctx:
-                    pass
-                fake_ctx = _Ctx()
-                fake_ctx.bot_data = bot_data
-
-                text, keyboard = _build_calls_text(fake_ctx, uid)
-
-                # Delete old calls-view message
-                old_msg_id = get_calls_view_msg(bot_data, chat_id)
-                if old_msg_id:
-                    try:
-                        await bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
-                    except Exception:
-                        pass
-
-                # Send fresh calls view and track the new message id
-                msg = await bot.send_message(
-                    chat_id=chat_id, text=text,
-                    parse_mode="Markdown", reply_markup=keyboard,
-                )
-                set_calls_view_msg(bot_data, chat_id, msg.message_id)
-
-            return TelegramNotifier(
-                bot=telegram_bot.bot,
-                user_db=user_db,
-                user_id=uid,
-                calls_view_checker=_checker,
-                calls_view_refresher=_refresher,
+    # Build the listener with (optionally) the activity hook attached
+    async def _record_activity(discord_user_id: str, channel_id: int) -> None:
+        if activity_db is None:
+            return
+        try:
+            await activity_db.record_post(discord_user_id, channel_id)
+        except Exception:
+            logger.exception(
+                "Failed to record activity for user=%s channel=%d",
+                discord_user_id, channel_id,
             )
 
-        orchestrator._notifier_factory = _notifier_factory
-
-        # Re-attach notifiers to any pipelines already activated
-        for uid, ctx in orchestrator.pipelines.items():
-            ctx.pipeline._notifier = _notifier_factory(uid)
-
-        # Start expiry checker background task
-        from src.telegram.expiry_checker import ExpiryChecker
-        expiry_checker = ExpiryChecker(
-            bot=telegram_bot.bot,
-            user_db=user_db,
-            orchestrator=orchestrator,
-        )
-        await expiry_checker.start()
-
-        # Start PnL monitor background task
-        from src.telegram.pnl_monitor import PnLMonitor
-        pnl_monitor = PnLMonitor(
-            orchestrator=orchestrator,
-            user_db=user_db,
-        )
-        await pnl_monitor.start()
-
-        logger.info("Telegram bot started with trade notifications")
-    else:
-        expiry_checker = None
-        pnl_monitor = None
-        logger.info("Telegram bot disabled (no TELEGRAM_BOT_TOKEN in .env)")
-
-    # --- Select input adapter ---
-    adapter_name = config.input.adapter
-    if adapter_name == "cli":
-        adapter = CLIAdapter()
-    elif adapter_name == "simulation":
-        adapter = SimulationAdapter(
-            signals_dir=config.input.simulation_dir,
-            delay_sec=config.input.simulation_delay_sec,
-        )
-    elif adapter_name == "discord":
-        from src.input.discord_adapter import DiscordAdapter
-        adapter = DiscordAdapter(
-            bot_token=config.discord.bot_token,
-            channel_id=config.discord.channel_id,
-            source_bot_name=config.discord.source_bot_name,
-        )
-    else:
-        logger.error("Unknown adapter: %s (use 'cli', 'simulation', or 'discord')", adapter_name)
-        return
-
-    logger.info(
-        "Starting with adapter=%s, %d active pipeline(s)",
-        adapter_name, len(orchestrator.pipelines),
+    # --- Discord listener: push messages onto an async queue ---
+    queue: asyncio.Queue[IncomingMessage] = asyncio.Queue()
+    listener = DiscordListener(
+        bot_token=config.discord.bot_token,
+        monitored_channel_ids=config.discord.channel_ids(),
+        queue=queue,
+        activity_hook=_record_activity if activity_db is not None else None,
+        activity_channel_ids=set(config.automations.activity_tracking_channel_ids),
     )
 
-    # --- Run ---
-    adapter_task = asyncio.create_task(adapter.start())
+    # --- Email bot DB + sender (construction only; registration later) ---
+    email_db: EmailDB | None = None
+    email_sender: ResendClient | None = None
+    email_worker: EmailWorker | None = None
+    if config.email_bot.enabled:
+        if not config.email_bot.resend_api_key:
+            logger.warning(
+                "EMAIL_BOT_ENABLED=true but RESEND_API_KEY is empty; "
+                "email bot disabled"
+            )
+        else:
+            email_db = EmailDB(db_path=config.email_bot.db_path)
+            await email_db.open()
+            email_sender = ResendClient(
+                api_key=config.email_bot.resend_api_key,
+                from_address=config.email_bot.resend_from_address,
+            )
+            email_worker = EmailWorker(
+                db=email_db,
+                sender=email_sender,
+                analytics_db_path="data/analytics.db",
+                poll_interval_sec=config.email_bot.worker_poll_sec,
+                max_per_cycle=config.email_bot.worker_max_per_cycle,
+            )
+            # Register aiohttp webhook routes on the shared OAuth callback app
+            webhook_handlers = EmailWebhookHandlers(
+                db=email_db,
+                whop_webhook_secret=config.email_bot.whop_webhook_secret,
+                admin_secret=config.email_bot.admin_webhook_secret,
+                rejoin_url_default=config.email_bot.rejoin_url,
+            )
+            webhook_handlers.register(verification.callback_server.app)
+            logger.info("Email bot enabled (Resend + Whop webhook)")
+
+    # --- Automations crons (optional, controlled by AUTOMATIONS_ENABLED) ---
+    launch_broadcaster: FeatureLaunchBroadcaster | None = None
+    inactivity_detector: InactivityDetector | None = None
+    value_reminder: ValueReminder | None = None
+    channel_feeler: ChannelFeeler | None = None
+    whop_email_sync: WhopEmailSync | None = None
+    whop_email_sync_cron: WhopEmailSyncCron | None = None
+    whop_reviews_db: WhopReviewsDB | None = None
+    whop_reviews_sync: WhopReviewsSync | None = None
+    if config.automations.enabled and activity_db is not None:
+        launch_broadcaster = FeatureLaunchBroadcaster(
+            telegram_bot=telegram_bot,
+            verification_db=verification.db,
+            resend_client=email_sender,
+            cta_url=config.automations.launch_cta_url,
+            whop_members_db=whop_members_db,
+        )
+
+        if email_db is not None:
+            inactivity_detector = InactivityDetector(
+                activity_db=activity_db,
+                email_db=email_db,
+                threshold_days=config.automations.inactivity_threshold_days,
+                interval_hours=config.automations.inactivity_detector_interval_hours,
+                rejoin_url=config.automations.launch_cta_url,
+                whop_members_db=whop_members_db,
+                verification_db=verification.db,
+            )
+        else:
+            logger.info("Feature 2 (inactivity) skipped: email bot not enabled")
+
+        value_reminder = ValueReminder(
+            telegram_bot=telegram_bot,
+            verification_db=verification.db,
+            analytics_db=analytics,
+            cycle_days=config.automations.value_reminder_cycle_days,
+            interval_hours=config.automations.value_reminder_poll_interval_hours,
+        )
+
+        if email_sender is not None and config.automations.feeler_channel_variants:
+            channel_feeler = ChannelFeeler(
+                activity_db=activity_db,
+                resend_client=email_sender,
+                variant_by_channel=config.automations.feeler_channel_variants,
+                low_engagement_threshold=config.automations.feeler_low_engagement_threshold,
+                window_days=config.automations.feeler_window_days,
+                cooldown_days=config.automations.feeler_cooldown_days,
+                interval_hours=config.automations.feeler_detector_interval_hours,
+                cta_url_by_variant={
+                    "telegram_bot": config.automations.launch_cta_url,
+                    "tools": config.automations.launch_cta_url,
+                    "concierge": config.automations.launch_cta_url,
+                },
+                whop_members_db=whop_members_db,
+                verification_db=verification.db,
+            )
+        else:
+            logger.info(
+                "Feature 4 (channel feeler) skipped: need Resend + "
+                "feeler_channel_variants configured"
+            )
+
+        # Whop -> verified_users.email backfill. Runs once at startup (optional)
+        # and on a 24h cron. Also exposed via the /sync-emails slash command.
+        if config.automations.whop_api_key and config.automations.whop_company_id:
+            whop_email_sync = WhopEmailSync(
+                verification_db=verification.db,
+                api_key=config.automations.whop_api_key,
+                company_id=config.automations.whop_company_id,
+                api_base=config.automations.whop_api_base,
+                members_db=whop_members_db,
+            )
+            whop_email_sync_cron = WhopEmailSyncCron(
+                sync=whop_email_sync,
+                interval_hours=config.automations.email_sync_interval_hours,
+            )
+            logger.info("Whop email sync enabled")
+        else:
+            logger.info(
+                "Whop email sync skipped: need WHOP_API_KEY + WHOP_COMPANY_ID"
+            )
+
+        # Whop reviews -> Discord staff channel relay. Needs the API key + a
+        # target channel ID. Skipped (with a log line) if either is missing so
+        # the bot still boots for people who don't want the feature.
+        if (
+            config.automations.whop_api_key
+            and config.automations.whop_company_id
+            and config.automations.whop_reviews_channel_id
+        ):
+            whop_reviews_db = WhopReviewsDB(
+                db_path=config.automations.whop_reviews_db_path,
+            )
+            await whop_reviews_db.open()
+            whop_reviews_sync = WhopReviewsSync(
+                db=whop_reviews_db,
+                api_key=config.automations.whop_api_key,
+                company_id=config.automations.whop_company_id,
+                api_base=config.automations.whop_api_base,
+                discord_client=listener.client,
+                channel_id=config.automations.whop_reviews_channel_id,
+                interval_seconds=config.automations.whop_reviews_interval_seconds,
+                ping_on_low_stars=config.automations.whop_reviews_ping_on_low_stars,
+            )
+            logger.info("Whop reviews scanner enabled")
+        else:
+            logger.info(
+                "Whop reviews scanner skipped: need WHOP_API_KEY + "
+                "WHOP_COMPANY_ID + WHOP_REVIEWS_CHANNEL_ID",
+            )
+
+        logger.info("Automations enabled")
+
+    # --- Discord slash commands (build LAST so launch_broadcaster is available) ---
+    if email_db is not None and config.email_bot.discord_admin_user_ids:
+        slash = EmailSlashCommands(
+            db=email_db,
+            guild_id=config.discord.guild_id,
+            admin_user_ids=set(config.email_bot.discord_admin_user_ids),
+            default_rejoin_url=config.email_bot.rejoin_url,
+            launch_broadcaster=launch_broadcaster,
+            whop_email_sync=whop_email_sync,
+        )
+        slash.register(listener.client)
+        logger.info("Discord slash commands registered")
+    elif email_db is not None:
+        logger.warning(
+            "Email bot enabled but DISCORD_ADMIN_USER_IDS empty; "
+            "slash commands will not be registered"
+        )
+
+    # --- Start everything in dependency order ---
+    await verification.start()
+    await dispatcher.start()
+    if email_worker is not None:
+        await email_worker.start()
+    if inactivity_detector is not None:
+        await inactivity_detector.start()
+    if value_reminder is not None:
+        await value_reminder.start()
+    if channel_feeler is not None:
+        await channel_feeler.start()
+    if whop_email_sync is not None and config.automations.email_sync_on_startup:
+        # Kick off a startup sync but don't block startup on it. Failures are
+        # logged inside run_once().
+        asyncio.create_task(whop_email_sync.run_once(), name="whop_email_sync_startup")
+    if whop_email_sync_cron is not None:
+        await whop_email_sync_cron.start()
+    if whop_reviews_sync is not None:
+        await whop_reviews_sync.start()
+    listener_task = asyncio.create_task(listener.start(), name="discord_listener")
+    consumer_task = asyncio.create_task(
+        _consume_queue(queue, router, shutdown), name="queue_consumer",
+    )
+
+    active_user_count = await verification.db.count_active()
+    logger.info(
+        "Bot started — monitoring %d channel(s), %d verified user(s), "
+        "dispatcher rate=%.1f/s",
+        len(config.discord.channels),
+        active_user_count,
+        config.dispatcher.rate_per_sec,
+    )
 
     try:
-        while not shutdown_event.is_set():
-            try:
-                raw_message = await asyncio.wait_for(adapter.queue.get(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
-            if not raw_message.strip():
-                continue
-            logger.info("--- Incoming message (%d chars) ---", len(raw_message))
-            orchestrator.dispatch(raw_message, health_server)
-    except Exception:
-        logger.exception("Unexpected error in main loop")
+        await shutdown.wait()
     finally:
-        logger.info("Shutting down...")
-        adapter_task.cancel()
+        logger.info("Shutdown requested")
+        consumer_task.cancel()
         try:
-            await adapter_task
-        except asyncio.CancelledError:
-            pass
-        if pnl_monitor:
-            await pnl_monitor.stop()
-        if expiry_checker:
-            await expiry_checker.stop()
-        if telegram_bot:
-            await telegram_bot.stop()
-        await admin_api.stop()
-        await health_server.stop()
-        orchestrator.stop()
-        user_db.close()
+            await listener.stop()
+        except Exception:
+            logger.exception("Listener stop error")
+        listener_task.cancel()
+        for task in (listener_task, consumer_task):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        try:
+            await dispatcher.stop()
+        except Exception:
+            logger.exception("Dispatcher stop error")
+        for cron, name in (
+            (whop_reviews_sync, "whop_reviews_sync"),
+            (whop_email_sync_cron, "whop_email_sync_cron"),
+            (channel_feeler, "channel_feeler"),
+            (value_reminder, "value_reminder"),
+            (inactivity_detector, "inactivity_detector"),
+        ):
+            if cron is not None:
+                try:
+                    await cron.stop()
+                except Exception:
+                    logger.exception("%s stop error", name)
+        if activity_db is not None:
+            try:
+                await activity_db.close()
+            except Exception:
+                logger.exception("Activity DB close error")
+        if whop_members_db is not None:
+            try:
+                await whop_members_db.close()
+            except Exception:
+                logger.exception("Whop members DB close error")
+        if whop_reviews_db is not None:
+            try:
+                await whop_reviews_db.close()
+            except Exception:
+                logger.exception("Whop reviews DB close error")
+        if email_worker is not None:
+            try:
+                await email_worker.stop()
+            except Exception:
+                logger.exception("Email worker stop error")
+        if email_sender is not None:
+            try:
+                await email_sender.close()
+            except Exception:
+                logger.exception("Email sender close error")
+        if email_db is not None:
+            try:
+                await email_db.close()
+            except Exception:
+                logger.exception("Email DB close error")
+        try:
+            await verification.stop()
+        except Exception:
+            logger.exception("Verification stop error")
+        try:
+            await analytics.close()
+        except Exception:
+            logger.exception("Analytics close error")
         logger.info("Shutdown complete")
 
 
-def _make_activate_callback(orchestrator: Orchestrator):
-    """Create an async callback for user activation."""
-    async def callback(user_id: str) -> None:
-        orchestrator.activate_user(user_id)
-    return callback
-
-
-def _make_deactivate_callback(orchestrator: Orchestrator):
-    """Create an async callback for user deactivation."""
-    async def callback(user_id: str) -> None:
-        orchestrator.deactivate_user(user_id)
-    return callback
-
-
-def _make_kill_callback(orchestrator: Orchestrator):
-    """Create an async callback for the kill switch."""
-    async def callback() -> dict:
-        return orchestrator.kill_all()
-    return callback
-
-
-def _make_resume_callback(orchestrator: Orchestrator):
-    """Create an async callback to resume after kill switch."""
-    async def callback() -> None:
-        orchestrator.resume()
-    return callback
-
-
 def main() -> None:
-    """Parse args and run."""
     config = load_config()
     setup_logging(config.logging)
-    asyncio.run(run(config))
+    try:
+        asyncio.run(run(config))
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

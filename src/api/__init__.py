@@ -1,1 +1,0 @@
-"""Admin REST API package."""

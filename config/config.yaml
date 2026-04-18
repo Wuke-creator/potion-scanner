@@ -1,0 +1,98 @@
+# Potion Discord → Telegram broadcaster — runtime config
+# Secrets and IDs that change per environment live in .env (see .env.example).
+# Channel IDs are read from env vars listed in `id_env`, ref links from `ref_link_env`.
+
+discord:
+  channels:
+    - key: perp_bot
+      name: "Perp Bot Calls"
+      display_name: "Perps Bot"
+      source_type: perps
+      id_env: PERP_BOT_CHANNEL_ID
+      ref_link_env: REF_LINK_PERPS
+
+    - key: manual_perp
+      name: "Manual Perp Calls"
+      display_name: "Potion Perps"
+      source_type: perps
+      id_env: MANUAL_PERP_CHANNEL_ID
+      ref_link_env: REF_LINK_PERPS
+
+    - key: prediction
+      name: "Prediction Calls"
+      display_name: "Elite Scans"
+      source_type: memecoin
+      id_env: PREDICTION_CHANNEL_ID
+      ref_link_env: REF_LINK_MEMECOIN
+
+dispatcher:
+  # Telegram's global bot limit is ~30 msgs/sec across chats — stay under.
+  rate_per_sec: 25
+  max_concurrent: 25
+  per_send_timeout_sec: 15
+  queue_max_size: 10000
+
+discord_oauth:
+  api_base: https://discord.com/api
+  authorize_url: https://discord.com/api/oauth2/authorize
+  token_url: https://discord.com/api/oauth2/token
+  scope: identify email guilds.members.read
+  elite_signup_url: https://whop.com/potion
+
+oauth:
+  host: 0.0.0.0
+  port: 8080
+
+verification:
+  db_path: data/verified.db
+  pending_ttl_seconds: 600           # 10 minutes for pending OAuth state
+  reverify_interval_seconds: 86400   # 24h re-check
+  reverify_sleep_between_users_ms: 500
+
+email_bot:
+  # Enabled via env var EMAIL_BOT_ENABLED=true. These are the tunables.
+  from_address: "Potion <team@potion.gg>"
+  rejoin_url: https://whop.com/potion
+  db_path: data/email.db
+  worker_poll_sec: 60
+  worker_max_per_cycle: 50
+
+automations:
+  # Enabled via env var AUTOMATIONS_ENABLED=true.
+  # When off, the listener still runs but no cron fires.
+  activity_db_path: data/activity.db
+  # List of Discord channel IDs to record message posts from.
+  # Bot needs View Channel + Read Message History on each.
+  # Also settable via ACTIVITY_TRACKING_CHANNEL_IDS=id1,id2,id3 env var.
+  activity_tracking_channel_ids: []
+
+  # Feature 2: inactivity detector
+  inactivity_threshold_days: 14
+  inactivity_detector_interval_hours: 24
+
+  # Feature 3: monthly value reminder (Telegram DM)
+  value_reminder_cycle_days: 30
+  value_reminder_poll_interval_hours: 1
+
+  # Feature 4: channel-level feeler email
+  # Map channel_id -> variant ("telegram_bot" | "tools" | "concierge")
+  # so the right Drive Task 19 A/B/C copy fires when that channel is underused.
+  feeler_channel_variants: {}
+  feeler_low_engagement_threshold: 5
+  feeler_window_days: 14
+  feeler_cooldown_days: 30
+  feeler_detector_interval_hours: 24
+
+  # Feature 1: feature launch
+  launch_cta_url: https://whop.com/potion
+
+  # Whop API (for email lookup by Discord user ID + full member roster)
+  whop_api_base: https://api.whop.com
+  whop_members_db_path: data/whop_members.db
+  email_sync_on_startup: true
+  email_sync_interval_hours: 24
+
+logging:
+  level: INFO
+  file: logs/bot.log
+  format: json   # use "console" for local dev

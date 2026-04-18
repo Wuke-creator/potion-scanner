@@ -1,18 +1,27 @@
-# Core
-hyperliquid-python-sdk
-pydantic
-pyyaml
-python-dotenv
-aiosqlite
-structlog
-cryptography
-aiohttp
-discord.py
-python-telegram-bot>=20.7
+# Pinned versions (audited 2026-04-16). Update deliberately, not automatically.
 
-# File watching
-watchdog
+# Discord listener
+discord.py==2.7.1
+
+# Telegram broadcaster + bot commands
+python-telegram-bot==22.7
+
+# Whop OAuth callback server (HTTP) and outbound HTTP client
+aiohttp==3.13.5
+
+# Verified-users persistence
+aiosqlite==0.22.1
+
+# Refresh-token encryption at rest
+cryptography==46.0.7
+
+# Config + secrets
+PyYAML==6.0.3
+python-dotenv==1.2.2
+
+# Structured logging
+structlog==25.5.0
 
 # Testing
-pytest
-pytest-asyncio
+pytest==9.0.3
+pytest-asyncio==1.3.0

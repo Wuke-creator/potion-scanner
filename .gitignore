@@ -173,10 +173,7 @@ __marimo__/
 
 # === Project-specific ===
 
-# Config (active, not example)
-config/config.yaml
-
-# Database
+# Database (runtime)
 *.db
 data/
 

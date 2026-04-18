@@ -3,14 +3,63 @@
 Configures structlog as a formatter on stdlib logging handlers so all
 existing `logging.getLogger(__name__)` calls across the codebase output
 structured JSON (or colored console) with zero code changes.
+
+Includes a secret-redaction processor that catches any accidental token
+leaks in log events or exception tracebacks.
 """
 
 import logging
+import os
+import re
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import structlog
+
+
+def _build_redaction_patterns() -> list[tuple[re.Pattern, str]]:
+    """Build compiled regex patterns to redact known secrets from log output.
+
+    Reads token values from env vars at setup time and compiles exact-match
+    patterns. If a token appears anywhere in a log event string, it gets
+    replaced with [REDACTED].
+    """
+    patterns = []
+    secret_env_vars = [
+        "DISCORD_BOT_TOKEN",
+        "DISCORD_OAUTH_CLIENT_SECRET",
+        "TELEGRAM_BOT_TOKEN",
+        "OAUTH_STATE_SECRET",
+        "WHOP_REFRESH_TOKEN_ENCRYPTION_KEY",
+        # Added 2026-04-18 after security audit: these were leaking into
+        # logs during error traces (Resend 401 responses, Whop API errors,
+        # webhook auth failures respectively).
+        "RESEND_API_KEY",
+        "WHOP_API_KEY",
+        "WHOP_WEBHOOK_SECRET",
+        "ADMIN_WEBHOOK_SECRET",
+    ]
+    for var in secret_env_vars:
+        val = os.getenv(var, "")
+        if val and len(val) > 8:
+            patterns.append(
+                (re.compile(re.escape(val)), f"[REDACTED:{var}]")
+            )
+    return patterns
+
+
+_REDACT_PATTERNS: list[tuple[re.Pattern, str]] = []
+
+
+def _redact_secrets(logger, method_name, event_dict):
+    """structlog processor that strips known secret values from all fields."""
+    for key, value in list(event_dict.items()):
+        if isinstance(value, str):
+            for pattern, replacement in _REDACT_PATTERNS:
+                value = pattern.sub(replacement, value)
+            event_dict[key] = value
+    return event_dict
 
 
 def setup_logging(logging_config) -> None:
@@ -19,6 +68,9 @@ def setup_logging(logging_config) -> None:
     Args:
         logging_config: LoggingConfig with level, file, and format fields.
     """
+    global _REDACT_PATTERNS
+    _REDACT_PATTERNS = _build_redaction_patterns()
+
     log_level = getattr(logging, logging_config.level.upper(), logging.INFO)
 
     # Shared structlog processors for both renderers
@@ -29,6 +81,7 @@ def setup_logging(logging_config) -> None:
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.format_exc_info,
         structlog.processors.UnicodeDecoder(),
+        _redact_secrets,
     ]
 
     # Choose renderer based on config

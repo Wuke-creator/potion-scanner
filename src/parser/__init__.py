@@ -1,5 +1,5 @@
 from .classifier import MessageType, classify
-from .signal_parser import ParsedSignal, SignalParseError, parse_signal
+from .signal_parser import ParsedSignal, RiskLevel, Side, SignalParseError, parse_signal
 from .update_parser import (
     AllTpHit,
     Breakeven,
@@ -30,6 +30,8 @@ __all__ = [
     "MessageType",
     "ParsedSignal",
     "Preparation",
+    "RiskLevel",
+    "Side",
     "SignalParseError",
     "SlUpdate",
     "StopHit",

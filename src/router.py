@@ -1,0 +1,276 @@
+"""Router — classify each incoming Discord message and forward to Telegram.
+
+The router is the only place where business logic lives:
+
+  1. Look up the source channel route (gives us the ref link + source type).
+  2. Classify the message via the parser.
+  3. If it's a structured TRADING SIGNAL ALERT, parse fully and format with
+     all fields populated.
+  4. If it's a known lifecycle event (TP hit, breakeven, etc.), forward as
+     a "trade update" with the event label.
+  5. If it's NOISE or PREPARATION, drop it (don't spam the Elite group).
+  6. If it doesn't match any known type but the channel allows free-form
+     messages (Manual Perp Calls, Prediction Calls), forward verbatim.
+  7. Send the formatted message via the broadcaster.
+
+The router never raises — every error is logged and the message is dropped.
+This keeps the listener loop alive even when the parser hits an unexpected
+format.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from src.analytics import AnalyticsDB
+from src.config import ChannelRoute, DiscordConfig
+from src.discord_listener import IncomingMessage
+from src.dispatcher import Dispatcher
+from src.formatter import (
+    build_signal_keyboard,
+    format_lifecycle_event,
+    format_parsed_signal,
+    format_unknown_message,
+    label_for_source_type,
+)
+from src.parser import MessageType, SignalParseError, classify, parse_signal
+from src.parser.update_parser import (
+    UpdateParseError,
+    parse_all_tp_hit,
+    parse_breakeven,
+    parse_canceled,
+    parse_stop_hit,
+    parse_tp_hit,
+    parse_trade_closed,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# Channels where we forward unrecognized messages verbatim (humans posting).
+# In these channels, NOISE-classified messages are still forwarded — the
+# classifier was tuned for the Potion Perps Bot template, not human posts.
+_FREEFORM_SOURCE_TYPES = {"memecoin"}  # prediction & memecoin spot calls
+
+
+# Lifecycle events we DO forward (with a friendly label)
+_LIFECYCLE_LABELS: dict[MessageType, str] = {
+    MessageType.TP_HIT: "Take Profit Hit",
+    MessageType.ALL_TP_HIT: "All Take Profits Hit",
+    MessageType.BREAKEVEN: "Stop Loss to Breakeven",
+    MessageType.STOP_HIT: "Stop Loss Hit",
+    MessageType.TRADE_CLOSED: "Trade Closed",
+    MessageType.MANUAL_UPDATE: "Manual Update",
+    MessageType.CANCELED: "Trade Canceled",
+}
+
+# Always-dropped: PREPARATION posts (just teasers, not actionable)
+_ALWAYS_DROP = {MessageType.PREPARATION}
+
+
+class Router:
+    """Routes parsed Discord messages to the DM fan-out dispatcher."""
+
+    def __init__(
+        self,
+        discord_cfg: DiscordConfig,
+        dispatcher: Dispatcher,
+        analytics: AnalyticsDB | None = None,
+    ):
+        self._discord_cfg = discord_cfg
+        self._dispatcher = dispatcher
+        self._analytics = analytics
+
+    async def handle(self, message: IncomingMessage) -> None:
+        """Process one incoming message end to end. Never raises."""
+        try:
+            await self._handle(message)
+        except Exception:
+            logger.exception(
+                "Router crashed on message from channel=%d", message.channel_id,
+            )
+
+    async def _handle(self, message: IncomingMessage) -> None:
+        route = self._discord_cfg.channel_by_id(message.channel_id)
+        if route is None:
+            logger.debug(
+                "Message from unmonitored channel %d — ignored", message.channel_id,
+            )
+            return
+
+        msg_type = classify(message.content)
+        logger.info(
+            "Classified message from #%s as %s", route.name, msg_type.value,
+        )
+
+        # Record analytics for lifecycle events before dropping anything.
+        # Signal alerts are recorded later inside _build_text once fully parsed.
+        await self._record_lifecycle_event(msg_type, message.content, route)
+
+        if msg_type in _ALWAYS_DROP:
+            logger.debug("Dropping %s message from #%s", msg_type.value, route.name)
+            return
+
+        # NOISE drops only on perps channels (memecoin channels forward verbatim
+        # because the classifier wasn't trained on human-written predictions).
+        if msg_type == MessageType.NOISE and route.source_type not in _FREEFORM_SOURCE_TYPES:
+            logger.debug("Dropping NOISE in non-freeform channel #%s", route.name)
+            return
+
+        result = await self._build_text(msg_type, message, route)
+        if result is None:
+            return
+
+        text, pair, keyboard = result
+        await self._dispatcher.dispatch(
+            text=text, source_key=route.key, pair=pair, keyboard=keyboard,
+        )
+        logger.info("Enqueued %s from #%s for fan-out", msg_type.value, route.name)
+
+    async def _build_text(
+        self,
+        msg_type: MessageType,
+        message: IncomingMessage,
+        route: ChannelRoute,
+    ) -> tuple[str, str, object] | None:
+        """Returns (text, pair, keyboard) or None to drop the message.
+
+        ``pair`` is the token pair string (e.g. "ETH/USDT") used by the
+        dispatcher for muted-token filtering. Empty string when unknown.
+        ``keyboard`` is an InlineKeyboardMarkup or None.
+        """
+        source_label = label_for_source_type(route.source_type)
+
+        if msg_type == MessageType.SIGNAL_ALERT:
+            try:
+                signal = parse_signal(message.content)
+            except SignalParseError as e:
+                logger.warning(
+                    "Could not parse SIGNAL_ALERT from #%s (%s): forwarding raw",
+                    route.name,
+                    e,
+                )
+                text = format_unknown_message(
+                    raw_message=message.content,
+                    ref_link=route.ref_link,
+                    channel_name=route.name,
+                    source_type_label=source_label,
+                )
+                return (text, "", None)
+            # Record the signal for analytics (idempotent on trade_id + channel)
+            if self._analytics is not None:
+                try:
+                    await self._analytics.record_signal(
+                        trade_id=signal.trade_id,
+                        channel_key=route.key,
+                        pair=signal.pair,
+                        side=signal.side.value,
+                        entry=signal.entry,
+                        leverage=signal.leverage,
+                    )
+                except Exception:
+                    logger.exception("Analytics: failed to record signal")
+            text = format_parsed_signal(
+                signal=signal,
+                ref_link=route.ref_link,
+                channel_name=route.name,
+                source_type_label=source_label,
+            )
+            keyboard = build_signal_keyboard(
+                ref_link=route.ref_link, pair=signal.pair,
+            )
+            return (text, signal.pair, keyboard)
+
+        if msg_type in _LIFECYCLE_LABELS:
+            text = format_lifecycle_event(
+                label=_LIFECYCLE_LABELS[msg_type],
+                raw_message=message.content,
+                ref_link=route.ref_link,
+                channel_name=route.name,
+                source_type_label=source_label,
+            )
+            return (text, "", None)
+
+        # Unknown / free-form fallback. Forward verbatim only for human-driven channels.
+        if route.source_type in _FREEFORM_SOURCE_TYPES:
+            text = format_unknown_message(
+                raw_message=message.content,
+                ref_link=route.ref_link,
+                channel_name=route.name,
+                source_type_label=source_label,
+            )
+            return (text, "", None)
+
+        logger.debug(
+            "Unrecognized message in non-freeform channel #%s: dropped", route.name,
+        )
+        return None
+
+    async def _record_lifecycle_event(
+        self,
+        msg_type: MessageType,
+        content: str,
+        route: ChannelRoute,
+    ) -> None:
+        """Record a lifecycle event to analytics. Swallows parse errors."""
+        if self._analytics is None:
+            return
+
+        trade_id: int | None = None
+        event_type: str | None = None
+        tp_number: int | None = None
+        pnl_pct: float | None = None
+
+        try:
+            if msg_type == MessageType.TP_HIT:
+                parsed = parse_tp_hit(content)
+                trade_id = parsed.trade_id
+                event_type = "tp_hit"
+                tp_number = parsed.tp_number
+                pnl_pct = parsed.profit_pct
+            elif msg_type == MessageType.ALL_TP_HIT:
+                parsed = parse_all_tp_hit(content)
+                trade_id = parsed.trade_id
+                event_type = "all_tp_hit"
+                tp_number = 3
+                pnl_pct = parsed.profit_pct
+            elif msg_type == MessageType.BREAKEVEN:
+                parsed = parse_breakeven(content)
+                trade_id = parsed.trade_id
+                event_type = "breakeven"
+                tp_number = parsed.tp_secured
+            elif msg_type == MessageType.STOP_HIT:
+                parsed = parse_stop_hit(content)
+                trade_id = parsed.trade_id
+                event_type = "stop_hit"
+                pnl_pct = parsed.loss_pct
+            elif msg_type == MessageType.CANCELED:
+                parsed = parse_canceled(content)
+                trade_id = parsed.trade_id
+                event_type = "canceled"
+            elif msg_type == MessageType.TRADE_CLOSED:
+                parsed = parse_trade_closed(content)
+                trade_id = parsed.trade_id
+                event_type = "trade_closed"
+            else:
+                return
+        except UpdateParseError as e:
+            logger.debug(
+                "Analytics: skipping %s event (parse failed: %s)",
+                msg_type.value, e,
+            )
+            return
+
+        if trade_id is None or event_type is None:
+            return
+
+        try:
+            await self._analytics.record_event(
+                trade_id=trade_id,
+                channel_key=route.key,
+                event_type=event_type,
+                tp_number=tp_number,
+                pnl_pct=pnl_pct,
+            )
+        except Exception:
+            logger.exception("Analytics: failed to record event %s", event_type)

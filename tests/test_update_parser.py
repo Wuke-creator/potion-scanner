@@ -21,7 +21,7 @@ SAMPLES_DIR = Path("signals/samples")
 
 
 def _load(filename: str) -> str:
-    return (SAMPLES_DIR / filename).read_text().strip()
+    return (SAMPLES_DIR / filename).read_text(encoding="utf-8").strip()
 
 
 # ------------------------------------------------------------------
