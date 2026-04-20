@@ -295,17 +295,21 @@ async def run(config: Config) -> None:
                     survey_url=survey_url,
                     db_path=config.automations.cancel_survey_db_path,
                     cooldown_seconds=config.automations.cancel_survey_cooldown_seconds,
-                    # Winback enrollment wiring: on role removal, look up
-                    # email (whop_members roster first, verified_users as
-                    # fallback) and schedule the 3-email sequence. This
-                    # replaces the old WHOP_WEBHOOK_SECRET flow.
+                    # On Elite role removal, three things fire in parallel:
+                    #   1. Discord DM the survey link (built via embed)
+                    #   2. Enroll in 3-email winback sequence (whop_members
+                    #      email lookup, verified_users fallback)
+                    #   3. Email the survey link directly via Resend
+                    # Together they replace the old WHOP_WEBHOOK_SECRET flow.
                     rejoin_url=config.email_bot.rejoin_url,
                     whop_members_db=whop_members_db,
                     verification_db=verification.db,
                     email_db=email_db,
+                    resend_client=email_sender,
+                    from_name="Potion Alpha Team",
                 )
                 logger.info(
-                    "Cancel survey DM watcher armed (with winback enrollment)",
+                    "Cancel survey DM watcher armed (with winback + email)",
                 )
             except (ValueError, TypeError) as e:
                 logger.warning("CancelSurveyDM init failed: %s", e)

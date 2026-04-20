@@ -1,21 +1,26 @@
-"""DM the exit survey AND enroll in winback on Elite role removal.
+"""DM the exit survey, enroll in winback, AND email the survey link.
 
 Single source of truth for "member cancelled": the Discord Elite role
 transitioning from present to absent (set by Whop's automatic role sync).
-When that fires we:
+When that fires we do three things in parallel:
 
   1. DM the member a personalised exit-survey link (CANCEL_SURVEY_URL
-     with ?member_id=X&username=Y&source=discord_role_removed appended)
+     with ?discord_user_id=X&whop_user_id=Y&username=Z&source=discord_role_removed
+     appended)
   2. Look up their email (whop_members roster first, verified_users as
      fallback) and enroll them in the 3-email winback sequence
+  3. Email the SAME survey link so inbox-checkers who've disengaged from
+     Discord still see the feedback prompt
 
 This replaces the older Whop cancellation-webhook flow entirely, so
 WHOP_WEBHOOK_SECRET is no longer required.
 
 State is tracked in SQLite (``data/cancel_survey_dms.db``) to prevent
-double-DMing on role flickers (admin removes-then-re-adds within minutes,
-or the bot reconnects and re-emits stale member_update events). The same
-dedupe prevents double-enrolling in the email sequence.
+double-sending on role flickers (admin removes-then-re-adds within minutes,
+or the bot reconnects and re-emits stale member_update events). The
+``sent_dms`` table records both the DM state (``delivered``) and the email
+state (``survey_email_sent``) per member so each channel dedupes
+independently but uses one row per user.
 
 Requires the ``Server Members`` privileged intent enabled in the Discord
 developer portal AND ``intents.members = True`` on the discord.Client. If
@@ -26,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import time
+from html import escape as _html_escape
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import quote_plus
@@ -36,6 +42,7 @@ import discord
 if TYPE_CHECKING:
     from src.automations.whop_members_db import WhopMembersDB
     from src.email_bot.db import EmailDB
+    from src.email_bot.sender import ResendClient
     from src.verification.db import VerificationDB
 
 logger = logging.getLogger(__name__)
@@ -71,6 +78,8 @@ class CancelSurveyDM:
         whop_members_db: "WhopMembersDB | None" = None,
         verification_db: "VerificationDB | None" = None,
         email_db: "EmailDB | None" = None,
+        resend_client: "ResendClient | None" = None,
+        from_name: str = "Potion Alpha Team",
     ):
         if elite_role_id <= 0:
             raise ValueError("elite_role_id required and must be > 0")
@@ -86,11 +95,19 @@ class CancelSurveyDM:
         self._whop_members_db = whop_members_db
         self._verification_db = verification_db
         self._email_db = email_db
+        self._resend = resend_client
+        self._from_name = from_name
         self._db: aiosqlite.Connection | None = None
         self._registered = False
 
     async def open(self) -> None:
-        """Open the tracker DB and register the on_member_update handler."""
+        """Open the tracker DB and register the on_member_update handler.
+
+        Creates the ``sent_dms`` table if missing and runs the 2026-04-19
+        migration that adds the ``survey_email_sent`` column so role
+        flickers can't double-email. SQLite rejects ALTER if the column
+        already exists, so we swallow that specific error.
+        """
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self._db_path)
         await self._db.execute(
@@ -99,15 +116,26 @@ class CancelSurveyDM:
                 discord_user_id TEXT PRIMARY KEY,
                 username TEXT,
                 sent_at INTEGER NOT NULL,
-                delivered INTEGER NOT NULL DEFAULT 1
+                delivered INTEGER NOT NULL DEFAULT 1,
+                survey_email_sent INTEGER NOT NULL DEFAULT 0
             )
             """
         )
+        # Migration for DBs created before survey_email_sent landed.
+        try:
+            await self._db.execute(
+                "ALTER TABLE sent_dms "
+                "ADD COLUMN survey_email_sent INTEGER NOT NULL DEFAULT 0"
+            )
+        except aiosqlite.OperationalError:
+            pass  # column already exists on fresh DBs
         await self._db.commit()
         self._register_handler()
         logger.info(
-            "CancelSurveyDM ready (role=%s, guild=%s, url=%s, cooldown=%ds)",
+            "CancelSurveyDM ready (role=%s, guild=%s, url=%s, cooldown=%ds, "
+            "email=%s)",
             self._elite_role_id, self._guild_id, self._survey_url, self._cooldown,
+            "on" if self._resend is not None else "off",
         )
 
     async def close(self) -> None:
@@ -176,11 +204,22 @@ class CancelSurveyDM:
                 user_id, after.name, e,
             )
 
-        # Enroll in winback email sequence. Runs regardless of whether the
-        # survey DM landed (they still cancelled; the email is our second
-        # touch). exit_reason starts as "other" and can be updated later via
-        # the survey response webhook once that's wired up.
-        await self._enroll_in_winback(user_id, after.name)
+        # Resolve the member's email once and reuse it for both the winback
+        # enroll and the new survey-email step. Keeps both steps consistent
+        # and saves a DB round-trip.
+        email = await self._resolve_email(user_id)
+
+        # Step 2: enroll in winback email sequence (Day 1/4/7). Runs
+        # regardless of whether the survey DM landed; the email is our
+        # second touch. exit_reason starts as "other" and can be updated
+        # later via the survey response webhook once that's wired up.
+        await self._enroll_in_winback(user_id, after.name, email=email)
+
+        # Step 3: email the survey link. Reaches the inbox even when the
+        # user has abandoned Discord; typical of real cancellations.
+        await self._send_survey_email(
+            user_id=user_id, username=after.name, email=email, url=url,
+        )
 
     def _build_url(
         self, member: discord.Member, whop_user_id: str = "",
@@ -254,8 +293,8 @@ class CancelSurveyDM:
         embed.set_footer(text="Potion Alpha Team")
         return embed
 
-    async def _enroll_in_winback(self, discord_user_id: str, username: str) -> None:
-        """Look up email for this Discord user and enroll in winback sequence.
+    async def _resolve_email(self, discord_user_id: str) -> str:
+        """Look up the member's email via whop_members then verified_users.
 
         Source priority:
           1. whop_members (full Elite roster, 126k members) — covers every
@@ -263,22 +302,18 @@ class CancelSurveyDM:
           2. verified_users (Telegram-verified subset) — fallback for
              members whose Discord isn't linked in Whop
 
-        Silent skip if:
-          - email_db is None (automations disabled)
-          - no email source is wired
-          - discord_user_id not found in either source
-          - the email is blank
-
-        All error handling is defensive: cancellation tracking should never
-        crash the on_member_update listener.
+        Returns an empty string if no email can be resolved. Used by both
+        ``_enroll_in_winback`` and ``_send_survey_email`` so they agree on
+        which email to use. Errors are logged and swallowed so the
+        on_member_update listener never crashes because of a missing
+        member or a DB hiccup.
         """
-        if self._email_db is None:
-            return
-
         email = ""
         try:
             if self._whop_members_db is not None:
-                member = await self._whop_members_db.get_by_discord(discord_user_id)
+                member = await self._whop_members_db.get_by_discord(
+                    discord_user_id,
+                )
                 if member is not None and member.email:
                     email = member.email
             if not email and self._verification_db is not None:
@@ -292,8 +327,22 @@ class CancelSurveyDM:
                 "CancelSurveyDM email lookup failed for discord=%s",
                 discord_user_id,
             )
-            return
+        return email
 
+    async def _enroll_in_winback(
+        self, discord_user_id: str, username: str, *, email: str = "",
+    ) -> None:
+        """Enroll a cancelled user in the 3-email winback sequence.
+
+        Silent skip if:
+          - email_db is None (automations disabled)
+          - the email is blank (no address to send to)
+
+        All error handling is defensive: cancellation tracking should never
+        crash the on_member_update listener.
+        """
+        if self._email_db is None:
+            return
         if not email:
             logger.info(
                 "CancelSurveyDM: no email on file for discord=%s (%s), "
@@ -327,6 +376,105 @@ class CancelSurveyDM:
                 "CancelSurveyDM winback enroll failed for %s", email,
             )
 
+    async def _send_survey_email(
+        self,
+        *,
+        user_id: str,
+        username: str,
+        email: str,
+        url: str,
+    ) -> None:
+        """Send a one-shot exit-survey email with the same Netlify survey
+        link the Discord DM uses.
+
+        Silent skip when:
+          - resend_client is None (email delivery not configured)
+          - email resolution returned blank
+          - we already emailed this user inside the cooldown window
+            (checked via ``sent_dms.survey_email_sent``)
+
+        Winback emails fire separately via ``_enroll_in_winback``; this
+        message is a single immediate touch specifically asking for survey
+        feedback, not part of the scheduled sequence.
+        """
+        if self._resend is None:
+            logger.debug(
+                "CancelSurveyDM: resend_client not wired, skipping survey email",
+            )
+            return
+        if not email:
+            logger.info(
+                "CancelSurveyDM: no email on file for discord=%s (%s), "
+                "skipping survey email",
+                user_id, username,
+            )
+            return
+        if await self._already_emailed(user_id):
+            logger.debug(
+                "CancelSurveyDM: survey email already sent to %s, skipping",
+                user_id,
+            )
+            return
+
+        subject = "One quick question before you go"
+        greeting_name = username or "there"
+        safe_name = _html_escape(greeting_name)
+        safe_url = _html_escape(url)
+
+        text_body = (
+            f"Hey {greeting_name},\n\n"
+            "Your Potion access just ended. Before you go, would you give "
+            "us 20 seconds on what didn't work? The team reads every "
+            "reply.\n\n"
+            f"Open the survey: {url}\n\n"
+            "Whatever you share goes straight to us. No follow-up sales "
+            "pitch.\n\n"
+            "Potion Alpha Team\n"
+        )
+        html_body = (
+            '<!doctype html><html><body style="font-family:system-ui,'
+            'sans-serif;max-width:560px;margin:0 auto;padding:24px;'
+            'color:#222;line-height:1.5;">'
+            f"<p>Hey {safe_name},</p>"
+            "<p>Your Potion access just ended. Before you go, would you "
+            "give us 20 seconds on what didn't work? The team reads every "
+            "reply.</p>"
+            f'<p style="margin:32px 0;"><a href="{safe_url}" '
+            'style="background:#6b4fbb;color:white;padding:14px 28px;'
+            'text-decoration:none;border-radius:8px;font-weight:bold;'
+            'display:inline-block;">Open the survey</a></p>'
+            '<p style="color:#666;font-size:14px;">Whatever you share goes '
+            "straight to us. No follow-up sales pitch.</p>"
+            "<p>Potion Alpha Team</p>"
+            "</body></html>"
+        )
+
+        try:
+            result = await self._resend.send(
+                to=email,
+                subject=subject,
+                html=html_body,
+                text=text_body,
+                from_name=self._from_name,
+            )
+        except Exception:
+            logger.exception(
+                "CancelSurveyDM: survey email send crashed for %s", email,
+            )
+            return
+
+        if getattr(result, "ok", False):
+            await self._mark_survey_emailed(user_id)
+            logger.info(
+                "CancelSurveyDM: survey email sent to %s (%s)",
+                email, username,
+            )
+        else:
+            err = getattr(result, "error", "unknown error")
+            logger.warning(
+                "CancelSurveyDM: survey email failed for %s: %s", email, err,
+            )
+
     async def _already_sent_recently(self, user_id: str) -> bool:
         if self._db is None:
             return False
@@ -342,14 +490,65 @@ class CancelSurveyDM:
     async def _record_sent(
         self, user_id: str, username: str, *, delivered: bool,
     ) -> None:
+        """Upsert the DM send record.
+
+        Preserves ``survey_email_sent`` across updates: if a previous row
+        exists with the email already flagged, the value is carried forward
+        rather than reset. This keeps DM cooldown and email cooldown
+        independent but stored in one row.
+        """
         if self._db is None:
             return
+        async with self._db.execute(
+            "SELECT survey_email_sent FROM sent_dms WHERE discord_user_id = ?",
+            (user_id,),
+        ) as cur:
+            prior = await cur.fetchone()
+        email_flag = int(prior[0]) if prior else 0
         await self._db.execute(
             """
             INSERT OR REPLACE INTO sent_dms
-              (discord_user_id, username, sent_at, delivered)
-            VALUES (?, ?, ?, ?)
+              (discord_user_id, username, sent_at, delivered, survey_email_sent)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (user_id, username, int(time.time()), 1 if delivered else 0),
+            (user_id, username, int(time.time()),
+             1 if delivered else 0, email_flag),
+        )
+        await self._db.commit()
+
+    async def _already_emailed(self, user_id: str) -> bool:
+        """True when we've already sent the survey email to this user
+        within the cooldown window. Independent from DM dedupe."""
+        if self._db is None:
+            return False
+        async with self._db.execute(
+            "SELECT survey_email_sent, sent_at FROM sent_dms "
+            "WHERE discord_user_id = ?",
+            (user_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None or not int(row[0]):
+            return False
+        return (int(time.time()) - int(row[1])) < self._cooldown
+
+    async def _mark_survey_emailed(self, user_id: str) -> None:
+        """Record that the survey email has been sent to this user.
+
+        Uses an UPSERT so it works whether the DM happened first (normal
+        case, row exists) or the email send beat the DM to the DB write
+        (race condition, row may not exist yet).
+        """
+        if self._db is None:
+            return
+        now = int(time.time())
+        await self._db.execute(
+            """
+            INSERT INTO sent_dms
+              (discord_user_id, username, sent_at, delivered, survey_email_sent)
+            VALUES (?, '', ?, 0, 1)
+            ON CONFLICT(discord_user_id) DO UPDATE SET
+              survey_email_sent = 1
+            """,
+            (user_id, now),
         )
         await self._db.commit()

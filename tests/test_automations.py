@@ -530,3 +530,97 @@ class TestActivityHookIntegration:
         )
         # Should not raise
         assert listener.client is not None
+
+
+# ---------------------------------------------------------------------------
+# CancelSurveyDM — survey email side (2026-04-19 addition)
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def cancel_survey(tmp_path: Path):
+    """Build a CancelSurveyDM with all deps wired, without registering the
+    Discord handler. We call the private methods directly to test the
+    survey-email branch without needing a real discord.Client."""
+    from src.automations.cancel_survey_dm import CancelSurveyDM
+
+    # Fake discord.Client that satisfies the type hint without actually
+    # subscribing to gateway events.
+    fake_client = MagicMock()
+    resend = MagicMock()
+    resend.send = AsyncMock(return_value=SendResult(ok=True, resend_id="re_xyz"))
+
+    dm = CancelSurveyDM(
+        client=fake_client,
+        elite_role_id=12345,
+        guild_id=0,
+        survey_url="https://potion-feedback.netlify.app",
+        db_path=str(tmp_path / "cancel_survey.db"),
+        cooldown_seconds=60 * 60 * 24 * 7,  # 7 days (default)
+        rejoin_url="https://whop.com/potion",
+        resend_client=resend,
+        from_name="Potion Alpha Team",
+    )
+    await dm.open()
+    # Freeze the registered flag so the fake client doesn't try to attach
+    # real on_member_update listeners during tests.
+    dm._registered = True
+    yield dm, resend
+    await dm.close()
+
+
+@pytest.mark.asyncio
+class TestCancelSurveyEmail:
+    async def test_sends_survey_email_happy_path(self, cancel_survey):
+        """When resend_client + email are both present, the survey email
+        goes out once with the survey URL in the body."""
+        dm, resend = cancel_survey
+        await dm._send_survey_email(
+            user_id="discord_123",
+            username="luke_test",
+            email="luke@example.com",
+            url="https://potion-feedback.netlify.app/?type=exit&discord_user_id=discord_123",
+        )
+        assert resend.send.await_count == 1
+        call_kwargs = resend.send.await_args.kwargs
+        assert call_kwargs["to"] == "luke@example.com"
+        assert "discord_user_id=discord_123" in call_kwargs["html"]
+        assert "discord_user_id=discord_123" in call_kwargs["text"]
+        assert call_kwargs["from_name"] == "Potion Alpha Team"
+
+    async def test_skips_when_email_blank(self, cancel_survey):
+        """No email on file means no send and no DB row flipped."""
+        dm, resend = cancel_survey
+        await dm._send_survey_email(
+            user_id="discord_456",
+            username="no_email_user",
+            email="",
+            url="https://potion-feedback.netlify.app/?type=exit",
+        )
+        assert resend.send.await_count == 0
+        # survey_email_sent dedupe should NOT be flagged for this user
+        assert await dm._already_emailed("discord_456") is False
+
+    async def test_cooldown_prevents_double_email(self, cancel_survey):
+        """Second call within cooldown window is a no-op on the Resend
+        client; dedupe checks survey_email_sent before sending again."""
+        dm, resend = cancel_survey
+        url = "https://potion-feedback.netlify.app/?type=exit&discord_user_id=discord_789"
+        await dm._send_survey_email(
+            user_id="discord_789",
+            username="flicker_user",
+            email="user@example.com",
+            url=url,
+        )
+        assert resend.send.await_count == 1
+        # Simulate a role flicker: role removed again within the 7-day
+        # cooldown. Should NOT re-fire the email.
+        await dm._send_survey_email(
+            user_id="discord_789",
+            username="flicker_user",
+            email="user@example.com",
+            url=url,
+        )
+        assert resend.send.await_count == 1, (
+            "second send inside cooldown should have been deduped"
+        )
