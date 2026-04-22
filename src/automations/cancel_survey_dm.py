@@ -39,6 +39,8 @@ from urllib.parse import quote_plus
 import aiosqlite
 import discord
 
+from src.whop_api import create_one_time_promo
+
 if TYPE_CHECKING:
     from src.automations.whop_members_db import WhopMembersDB
     from src.email_bot.db import EmailDB
@@ -80,6 +82,9 @@ class CancelSurveyDM:
         email_db: "EmailDB | None" = None,
         resend_client: "ResendClient | None" = None,
         from_name: str = "Potion Alpha Team",
+        promo_api_key: str = "",
+        whop_company_id: str = "",
+        promo_ttl_days: int = 30,
     ):
         if elite_role_id <= 0:
             raise ValueError("elite_role_id required and must be > 0")
@@ -97,6 +102,9 @@ class CancelSurveyDM:
         self._email_db = email_db
         self._resend = resend_client
         self._from_name = from_name
+        self._promo_api_key = promo_api_key
+        self._whop_company_id = whop_company_id
+        self._promo_ttl_days = int(promo_ttl_days)
         self._db: aiosqlite.Connection | None = None
         self._registered = False
 
@@ -182,7 +190,16 @@ class CancelSurveyDM:
         # Look up Whop user id (if the member has it linked) so the survey
         # form / downstream Sheet can cross-reference both IDs.
         whop_user_id = await self._lookup_whop_id(user_id)
-        url = self._build_url(after, whop_user_id=whop_user_id)
+
+        # Mint per-user single-use promo codes for each discount offer.
+        # Runs in parallel; any individual failure just leaves that code
+        # empty (frontend falls back to the hardcoded default for that
+        # offer). Skipped entirely if no promo API key is configured.
+        promo_codes = await self._generate_promo_codes(user_id)
+
+        url = self._build_url(
+            after, whop_user_id=whop_user_id, promo_codes=promo_codes,
+        )
         embed = self._build_embed(after, url)
 
         try:
@@ -222,13 +239,18 @@ class CancelSurveyDM:
         )
 
     def _build_url(
-        self, member: discord.Member, whop_user_id: str = "",
+        self,
+        member: discord.Member,
+        whop_user_id: str = "",
+        promo_codes: dict[str, str] | None = None,
     ) -> str:
-        """Compose the survey URL with member identifiers appended as query
-        params. ``member_id`` is always the Discord snowflake (kept for
-        backwards compat with the existing Netlify form). ``discord_user_id``
-        is a clearer alias for new form fields. ``whop_user_id`` is appended
-        only when we successfully resolved it via whop_members_db."""
+        """Compose the survey URL with member identifiers + promo codes
+        appended as query params. ``member_id`` is always the Discord
+        snowflake (kept for backwards compat with the existing Netlify
+        form). ``discord_user_id`` is a clearer alias. ``whop_user_id`` is
+        appended only when resolved via whop_members_db. ``promo_codes``
+        is a dict of ``{offer_key: generated_code}`` that the frontend
+        reads to display per-user single-use codes."""
         parts = [
             "type=exit",
             f"member_id={quote_plus(str(member.id))}",
@@ -238,7 +260,73 @@ class CancelSurveyDM:
         ]
         if whop_user_id:
             parts.append(f"whop_user_id={quote_plus(whop_user_id)}")
+        if promo_codes:
+            # Frontend reads promo_{offer_key} params; missing ones fall
+            # back to hardcoded defaults per OFFERS table.
+            for offer_key, code in promo_codes.items():
+                if code:
+                    parts.append(
+                        f"promo_{offer_key}={quote_plus(code)}",
+                    )
         return self._survey_url + "/?" + "&".join(parts)
+
+    # Map from the frontend's OFFERS keys (keyed by exit reason) to the
+    # discount parameters we mint per-cancellation. Reasons that don't map
+    # to a code (pause, not_using, fulfillment) are absent here — those
+    # offers are non-discount CTAs.
+    _PROMO_OFFERS = {
+        "welcome20": {"base": "WELCOME20", "amount": 20, "duration": 1},
+        "stay30":    {"base": "STAY30",    "amount": 100, "duration": 1},
+        "comeback25":{"base": "COMEBACK25","amount": 25, "duration": 1},
+    }
+
+    async def _generate_promo_codes(self, discord_user_id: str) -> dict[str, str]:
+        """Mint a unique single-use promo code for each discount offer.
+
+        Returns a dict ``{offer_key: code}`` for every offer that Whop
+        accepted. Keys that fail (network error, 4xx) are simply omitted —
+        the frontend falls back to the hardcoded placeholder for those.
+
+        No-ops (returns empty dict) if ``promo_api_key`` or
+        ``whop_company_id`` weren't configured, so the feature can be
+        enabled/disabled by env var alone without touching code.
+        """
+        if not self._promo_api_key or not self._whop_company_id:
+            return {}
+
+        async def _mint(offer_key: str, spec: dict) -> tuple[str, str | None]:
+            code = await create_one_time_promo(
+                api_key=self._promo_api_key,
+                company_id=self._whop_company_id,
+                base_code=spec["base"],
+                amount_off=spec["amount"],
+                duration_months=spec["duration"],
+                discord_user_id=discord_user_id,
+                reason_tag=offer_key,
+                ttl_days=self._promo_ttl_days,
+            )
+            return offer_key, code
+
+        # Fire all three in parallel; Whop rate limits at ~2 req/s but three
+        # simultaneous calls land fine.
+        results = await asyncio.gather(
+            *[_mint(k, spec) for k, spec in self._PROMO_OFFERS.items()],
+            return_exceptions=True,
+        )
+        codes: dict[str, str] = {}
+        for r in results:
+            if isinstance(r, Exception):
+                logger.warning("Promo mint crashed: %s", r)
+                continue
+            key, code = r
+            if code:
+                codes[key] = code
+        if codes:
+            logger.info(
+                "CancelSurveyDM minted %d/%d promos for %s",
+                len(codes), len(self._PROMO_OFFERS), discord_user_id,
+            )
+        return codes
 
     async def _lookup_whop_id(self, discord_user_id: str) -> str:
         """Resolve the Whop user id for a Discord user via whop_members_db.

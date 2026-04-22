@@ -307,6 +307,14 @@ async def run(config: Config) -> None:
                     email_db=email_db,
                     resend_client=email_sender,
                     from_name="Potion Alpha Team",
+                    # Per-user single-use promo codes: bot mints one code
+                    # per discount offer (WELCOME20 / STAY30 / COMEBACK25)
+                    # via Whop API before sending the DM. Codes travel in
+                    # the URL so the survey form can display them without
+                    # hardcoded values. Disabled if promo_api_key blank.
+                    promo_api_key=config.automations.whop_promo_api_key,
+                    whop_company_id=config.automations.whop_company_id,
+                    promo_ttl_days=config.automations.cancel_survey_promo_ttl_days,
                 )
                 logger.info(
                     "Cancel survey DM watcher armed (with winback + email)",

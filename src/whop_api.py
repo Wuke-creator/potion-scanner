@@ -38,12 +38,128 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
+import string
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiohttp
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Promo code creation (standalone helper)
+# ---------------------------------------------------------------------------
+
+async def create_one_time_promo(
+    *,
+    api_key: str,
+    company_id: str,
+    base_code: str,
+    amount_off: float,
+    duration_months: int = 1,
+    base_currency: str = "usd",
+    discord_user_id: str = "",
+    reason_tag: str = "",
+    ttl_days: int = 30,
+    api_base: str = "https://api.whop.com",
+) -> str | None:
+    """Mint a single-use percentage-discount promo code via Whop's v2 API.
+
+    The resulting code is ``{base_code}-{6-char-random}`` so each cancelling
+    member gets a unique string. ``stock=1`` and ``one_per_customer=True``
+    mean a leaked code can only be redeemed once total, so sharing it
+    benefits nobody for long.
+
+    The cancelling member's ``discord_user_id`` and the survey ``reason``
+    go into the Whop ``metadata`` field so redemptions can be traced back.
+
+    Args:
+        api_key: Whop API key with ``promo_code:create`` +
+            ``access_pass:basic:read`` scopes (separate from the read-only
+            key used by membership sync).
+        company_id: Whop company id, e.g. ``biz_pn9Fq67uJNjgj1``.
+        base_code: Short tag for the offer, e.g. ``WELCOME20``. The random
+            suffix is appended.
+        amount_off: Percentage off, 1-100. ``100`` = free cycle.
+        duration_months: Number of billing cycles the discount applies.
+        base_currency: ISO 4217 lowercase, e.g. ``usd``.
+        discord_user_id: Snowflake of the cancelling member (for metadata).
+        reason_tag: Survey reason value, e.g. ``too_expensive`` (for metadata).
+        ttl_days: Expiry in days from now. ``0`` disables.
+        api_base: Override for the API host (tests).
+
+    Returns:
+        The full generated code on success (e.g. ``WELCOME20-A8K2X9``), or
+        ``None`` if Whop rejected the request or the network timed out.
+        Callers should fall back to a generic message when None is returned
+        so a broken promo API never prevents the survey DM going out.
+    """
+    if not api_key or not company_id or not base_code:
+        return None
+
+    # 6 chars, uppercase + digits. 36^6 = ~2.2B combinations so collisions
+    # in a 30-day TTL window are effectively impossible at our volume.
+    suffix = "".join(
+        secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6)
+    )
+    code = f"{base_code}-{suffix}"
+
+    expires_at: str | None = None
+    if ttl_days > 0:
+        expires_at = (
+            datetime.now(timezone.utc) + timedelta(days=ttl_days)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    payload: dict[str, Any] = {
+        "amount_off": amount_off,
+        "base_currency": base_currency,
+        "code": code,
+        "company_id": company_id,
+        "new_users_only": False,
+        "promo_duration_months": duration_months,
+        "promo_type": "percentage",
+        "one_per_customer": True,
+        "stock": 1,
+        "metadata": {
+            "discord_user_id": discord_user_id,
+            "reason": reason_tag,
+            "source": "cancel_survey_dm",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    }
+    if expires_at:
+        payload["expires_at"] = expires_at
+
+    timeout = aiohttp.ClientTimeout(total=10)
+    try:
+        async with aiohttp.ClientSession(
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            timeout=timeout,
+        ) as session:
+            async with session.post(
+                f"{api_base.rstrip('/')}/api/v2/promo_codes",
+                json=payload,
+            ) as resp:
+                if resp.status >= 400:
+                    body = await resp.text()
+                    logger.warning(
+                        "Whop promo_codes.create %d: %s (code=%s reason=%s)",
+                        resp.status, body[:300], code, reason_tag,
+                    )
+                    return None
+                return code
+    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+        logger.warning(
+            "Whop promo_codes.create network error: %s (code=%s)", e, code,
+        )
+        return None
 
 
 @dataclass

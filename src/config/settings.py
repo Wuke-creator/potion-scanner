@@ -206,6 +206,14 @@ class AutomationsConfig:
     cancel_survey_db_path: str = "data/cancel_survey_dms.db"
     cancel_survey_cooldown_seconds: int = 7 * 24 * 60 * 60  # 7 days
 
+    # Whop promo code generator (separate key from WHOP_API_KEY, scoped to
+    # promo_code:create + access_pass:basic:read). Bot mints a unique
+    # stock=1 code per cancelling member so leaked codes die after one use.
+    # Leave blank to disable per-user codes and fall back to the
+    # hardcoded OFFERS table in the frontend.
+    whop_promo_api_key: str = ""  # WHOP_PROMO_API_KEY env var
+    cancel_survey_promo_ttl_days: int = 30
+
 
 @dataclass
 class Config:
@@ -482,6 +490,13 @@ def load_config(
             automations_yaml.get(
                 "cancel_survey_cooldown_seconds", 7 * 24 * 60 * 60,
             )
+        ),
+        whop_promo_api_key=os.getenv(
+            "WHOP_PROMO_API_KEY",
+            automations_yaml.get("whop_promo_api_key", ""),
+        ).strip(),
+        cancel_survey_promo_ttl_days=int(
+            automations_yaml.get("cancel_survey_promo_ttl_days", 30),
         ),
     )
 
