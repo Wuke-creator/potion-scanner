@@ -6,9 +6,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Create non-root user
-RUN groupadd --system appuser && useradd --system --gid appuser appuser
-
 # Copy application code
 COPY main.py .
 COPY src/ src/
@@ -16,10 +13,11 @@ COPY config/ config/
 COPY signals/ signals/
 
 # Runtime data + logs (volumes mounted from host in production)
-RUN mkdir -p data logs && chown -R appuser:appuser data logs
+RUN mkdir -p data logs
 
-# Drop to non-root
-USER appuser
+# Stay as root: Railway mounts persistent volumes as root-owned and
+# a non-root container user can't write to them. Container isolation
+# already provides the security boundary for this workload.
 
 # OAuth callback server
 EXPOSE 8080
