@@ -183,6 +183,9 @@ data/.encryption_key
 # Logs
 logs/
 
+# Stress test output (kept locally for review, not committed)
+stress_*.out
+
 # OS
 .DS_Store
 Thumbs.db

@@ -63,6 +63,18 @@ class FakeDB:
     async def list_active_user_ids(self) -> list[int]:
         return list(self.active_ids)
 
+    async def list_subscribed_user_ids(self, channel_key: str) -> list[int]:
+        """Dispatcher hot path after the /settings-per-channel rollout.
+
+        Simulate 100% of active users being subscribed to every channel so the
+        stress test measures the full fan-out cost rather than a filtered slice.
+        """
+        return list(self.active_ids)
+
+    async def is_token_muted(self, user_id: int, pair: str) -> bool:
+        """No muted tokens in the stress harness — always send."""
+        return False
+
     async def update_after_recheck(
         self,
         telegram_user_id: int,
