@@ -39,6 +39,11 @@ def _build_redaction_patterns() -> list[tuple[re.Pattern, str]]:
         "WHOP_API_KEY",
         "WHOP_WEBHOOK_SECRET",
         "ADMIN_WEBHOOK_SECRET",
+        # Added 2026-04-23: promo code API key used by CancelSurveyDM to
+        # mint per-member offer codes. Excluding it risks leaking the key
+        # if Whop's promo endpoint ever returns a 401 with the Authorization
+        # header echoed in the error body.
+        "WHOP_PROMO_API_KEY",
     ]
     for var in secret_env_vars:
         val = os.getenv(var, "")
