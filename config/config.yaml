@@ -4,16 +4,9 @@
 
 discord:
   channels:
-    - key: perp_bot
-      name: "Perp Bot Calls"
-      display_name: "Perps Bot"
-      source_type: perps
-      id_env: PERP_BOT_CHANNEL_ID
-      ref_link_env: REF_LINK_PERPS
-
     - key: manual_perp
-      name: "Manual Perp Calls"
-      display_name: "Potion Perps"
+      name: "Perp Calls"
+      display_name: "Perp Calls"
       source_type: perps
       id_env: MANUAL_PERP_CHANNEL_ID
       ref_link_env: REF_LINK_PERPS
