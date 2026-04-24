@@ -39,6 +39,13 @@ discord:
       id_env: BONDS_CHANNEL_ID
       ref_link_env: REF_LINK_PERPS
 
+    - key: wallet_tracker
+      name: "Wallet Tracker"
+      display_name: "Wallet Tracker"
+      source_type: memecoin
+      id_env: WALLET_TRACKER_CHANNEL_ID
+      ref_link_env: REF_LINK_MEMECOIN
+
 dispatcher:
   # Telegram's global bot limit is ~30 msgs/sec across chats — stay under.
   rate_per_sec: 25
