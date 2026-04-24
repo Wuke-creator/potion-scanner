@@ -98,6 +98,23 @@ class Router:
             )
             return
 
+        # Mirror mode: pass the message body through to Telegram unchanged.
+        # No classification, no parsing, no header/footer wrap, no ref link
+        # appended, no keyboard. For channels whose format doesn't fit the
+        # structured perp or memecoin templates (e.g. third-party alert bots).
+        if route.source_type == "mirror":
+            logger.info(
+                "Mirror-forwarding %d chars from #%s",
+                len(message.content), route.name,
+            )
+            await self._dispatcher.dispatch(
+                text=message.content,
+                source_key=route.key,
+                pair="",
+                keyboard=None,
+            )
+            return
+
         msg_type = classify(message.content)
         logger.info(
             "Classified message from #%s as %s", route.name, msg_type.value,

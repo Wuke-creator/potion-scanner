@@ -28,6 +28,11 @@ class ConfigError(Exception):
 # Source-type identifiers used for ref-link routing
 SOURCE_PERPS = "perps"
 SOURCE_MEMECOIN = "memecoin"
+# Mirror mode: pass the Discord message through to Telegram verbatim. No
+# classification, no parsing, no formatting wrap, no ref link appended.
+# Used for channels whose message format doesn't match the structured perp
+# or memecoin templates (e.g. third-party alert bots posting rich embeds).
+SOURCE_MIRROR = "mirror"
 
 
 @dataclass
@@ -258,10 +263,10 @@ def _build_channel_routes(yaml_channels: list[dict]) -> list[ChannelRoute]:
             raise ConfigError(f"channel {key!r} missing id_env")
         if not ref_link_env:
             raise ConfigError(f"channel {key!r} missing ref_link_env")
-        if source_type not in (SOURCE_PERPS, SOURCE_MEMECOIN):
+        if source_type not in (SOURCE_PERPS, SOURCE_MEMECOIN, SOURCE_MIRROR):
             raise ConfigError(
-                f"channel {key!r} source_type must be {SOURCE_PERPS!r} or {SOURCE_MEMECOIN!r}, "
-                f"got {source_type!r}"
+                f"channel {key!r} source_type must be {SOURCE_PERPS!r}, "
+                f"{SOURCE_MEMECOIN!r}, or {SOURCE_MIRROR!r}, got {source_type!r}"
             )
 
         channel_id = _env_int(channel_id_env)

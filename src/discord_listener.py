@@ -12,6 +12,7 @@ developer portal.
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 from dataclasses import dataclass
 
@@ -29,6 +30,35 @@ class IncomingMessage:
     author_name: str
     author_is_bot: bool
     content: str
+
+
+def _serialize_embed(embed: discord.Embed) -> str:
+    """Flatten a Discord embed into a plain-text block usable by downstream
+    Telegram senders. Uses minimal Telegram-HTML for structure (bold titles,
+    italic footer) so the important fields are still visually distinct.
+
+    Captures: author, title, description, fields (name/value pairs), footer,
+    url. Skips thumbnails and images (Telegram DM can't easily inline them).
+    """
+    parts: list[str] = []
+    if embed.author and embed.author.name:
+        parts.append(html.escape(str(embed.author.name)))
+    if embed.title:
+        parts.append(f"<b>{html.escape(str(embed.title))}</b>")
+    if embed.description:
+        parts.append(html.escape(str(embed.description)))
+    for field in embed.fields or []:
+        fname = html.escape(str(field.name)) if field.name else ""
+        fval = html.escape(str(field.value)) if field.value else ""
+        if fname and fval:
+            parts.append(f"<b>{fname}:</b> {fval}")
+        elif fval:
+            parts.append(fval)
+    if embed.footer and embed.footer.text:
+        parts.append(f"<i>{html.escape(str(embed.footer.text))}</i>")
+    if embed.url:
+        parts.append(html.escape(str(embed.url)))
+    return "\n".join(p for p in parts if p)
 
 
 class DiscordListener:
@@ -130,6 +160,15 @@ class DiscordListener:
                 return
 
             text = (message.content or "").strip()
+            # If plain content is empty but the message carries embeds
+            # (common for third-party alert bots like Onsight), serialize
+                        # the first embed into text so the router has something to
+            # forward. Multiple embeds are concatenated with a blank line.
+            if not text and message.embeds:
+                embed_blocks = [
+                    _serialize_embed(e) for e in message.embeds if e is not None
+                ]
+                text = "\n\n".join(b for b in embed_blocks if b).strip()
             if not text:
                 return
 

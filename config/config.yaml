@@ -35,7 +35,7 @@ discord:
     - key: bonds
       name: "Bonds"
       display_name: "Bonds"
-      source_type: perps
+      source_type: mirror
       id_env: BONDS_CHANNEL_ID
       ref_link_env: REF_LINK_PERPS
 
