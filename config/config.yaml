@@ -32,6 +32,13 @@ discord:
       id_env: PINGU_CHARTS_CHANNEL_ID
       ref_link_env: REF_LINK_PERPS
 
+    - key: bonds
+      name: "Bonds"
+      display_name: "Bonds"
+      source_type: perps
+      id_env: BONDS_CHANNEL_ID
+      ref_link_env: REF_LINK_PERPS
+
 dispatcher:
   # Telegram's global bot limit is ~30 msgs/sec across chats — stay under.
   rate_per_sec: 25
