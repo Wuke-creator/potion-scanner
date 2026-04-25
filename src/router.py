@@ -124,6 +124,14 @@ class Router:
         # at the token's Padre page with Orangie's ref code. Competitor
         # brand links (GMGN, AXIOM, BonkBot, etc.) are stripped out.
         if route.key == "wallet_tracker":
+            # Drop TRANSFER alerts — they're wallet-to-wallet movements, not
+            # trading signals. Users only want BUY/SELL actions.
+            first_line = (message.content or "").split("\n", 1)[0]
+            if "TRANSFER" in first_line.upper():
+                logger.info(
+                    "Skipping TRANSFER alert from #Wallet Tracker (not a BUY/SELL)"
+                )
+                return
             try:
                 alert = parse_wallet_tracker(message.content)
             except Exception:
