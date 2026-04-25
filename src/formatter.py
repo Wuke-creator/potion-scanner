@@ -295,6 +295,7 @@ def format_wallet_tracker_alert(
     channel_name: str,
     source_url: str = "",
     timestamp: str | None = None,
+    count: int = 1,
 ) -> str:
     """Build a clean, structured Telegram alert from a parsed Onsight
     wallet-tracker message.
@@ -305,6 +306,10 @@ def format_wallet_tracker_alert(
     deeplinks credit Orangie via the URL rewriter that runs separately.
 
     Excludes competitor brand links (GMGN/Trojan/AXIOM/etc.) entirely.
+
+    When ``count > 1`` the header shows a ``(×N buys)`` indicator and the
+    Spent / Amount rows are labeled as 'Total' to make clear the numbers
+    are summed across a consolidated batch of rapid same-trader buys.
     """
     direction_icon = "\U0001f7e2" if (alert.action or "").upper() == "BUY" else "\U0001f534"
     pnl_icon = "\U0001f4c8" if alert.pnl_positive else "\U0001f4c9"
@@ -313,8 +318,15 @@ def format_wallet_tracker_alert(
     token = escape(alert.token or "?")
     action = escape(alert.action or "?")
 
+    action_word = "buys" if (alert.action or "").upper() == "BUY" else "sells"
+    multi = count > 1
+
+    header = f"<b>{action} {token}</b>"
+    if multi:
+        header = f"{header} <i>(×{count} {action_word})</i>"
+
     lines: list[str] = [
-        f"{direction_icon} <b>{action} {token}</b>",
+        f"{direction_icon} {header}",
     ]
 
     if alert.platform:
@@ -333,21 +345,25 @@ def format_wallet_tracker_alert(
         lines.append(f"\U0001f464 Trader: <b>{escape(alert.trader)}</b>")
     lines.append("")
 
+    spent_label = "Total Spent" if multi else "Spent"
+    amount_label = "Total Amount" if multi else "Amount"
+    price_label = "Avg Price" if multi else "Price"
+
     if alert.spent_sol or alert.spent_usd:
         spent_parts = []
         if alert.spent_sol:
             spent_parts.append(f"<b>{escape(alert.spent_sol)}</b> SOL")
         if alert.spent_usd:
             spent_parts.append(f"(${escape(alert.spent_usd)})")
-        lines.append(f"\U0001f4b0 Spent: {' '.join(spent_parts)}")
+        lines.append(f"\U0001f4b0 {spent_label}: {' '.join(spent_parts)}")
 
     if alert.received_amount:
         lines.append(
-            f"\U0001f4e6 Amount: <b>{escape(alert.received_amount)}</b> {token}"
+            f"\U0001f4e6 {amount_label}: <b>{escape(alert.received_amount)}</b> {token}"
         )
 
     if alert.price:
-        lines.append(f"\U0001f4b5 Price: <code>${escape(alert.price)}</code>")
+        lines.append(f"\U0001f4b5 {price_label}: <code>${escape(alert.price)}</code>")
 
     if alert.market_cap or alert.age:
         meta = []

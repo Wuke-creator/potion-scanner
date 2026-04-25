@@ -37,6 +37,7 @@ from src.formatter import (
 )
 from src.parser import MessageType, SignalParseError, classify, parse_signal
 from src.parser.wallet_tracker_parser import parse_wallet_tracker
+from src.automations.wallet_tracker_debouncer import WalletTrackerDebouncer
 from src.parser.update_parser import (
     UpdateParseError,
     parse_all_tp_hit,
@@ -83,6 +84,39 @@ class Router:
         self._discord_cfg = discord_cfg
         self._dispatcher = dispatcher
         self._analytics = analytics
+        # Debouncer for rapid same-trader same-token same-action buys on
+        # the Wallet Tracker channel. Instantiated lazily (needs a stable
+        # emit callback bound to this router instance).
+        self._wallet_debouncer = WalletTrackerDebouncer(
+            emit_fn=self._emit_wallet_tracker_alert,
+            idle_timeout_sec=30.0,
+            max_hold_sec=120.0,
+        )
+
+    async def _emit_wallet_tracker_alert(
+        self, alert, count: int,
+    ) -> None:
+        """Debouncer callback: format + dispatch a (possibly consolidated)
+        Wallet Tracker alert. Looks up the channel config at emit time
+        since debouncer doesn't carry channel state across batches."""
+        # Resolve wallet_tracker route for channel_name + source URL
+        route = self._discord_cfg.channel_by_key("wallet_tracker")
+        channel_name = route.name if route else "Wallet Tracker"
+        channel_id = route.channel_id if route else 0
+        source_url = self._build_discord_channel_url(channel_id)
+        text = format_wallet_tracker_alert(
+            alert=alert,
+            channel_name=channel_name,
+            source_url=source_url,
+            count=count,
+        )
+        keyboard = build_wallet_tracker_keyboard(ca=alert.ca)
+        await self._dispatcher.dispatch(
+            text=text,
+            source_key="wallet_tracker",
+            pair="",
+            keyboard=keyboard,
+        )
 
     async def handle(self, message: IncomingMessage) -> None:
         """Process one incoming message end to end. Never raises."""
@@ -152,20 +186,14 @@ class Router:
                 logger.exception("Wallet tracker parse crashed; falling back")
                 alert = None
             if alert is not None and alert.parsed_ok:
-                source_url = self._build_discord_channel_url(message.channel_id)
-                text = format_wallet_tracker_alert(
-                    alert=alert,
-                    channel_name=route.name,
-                    source_url=source_url,
-                )
-                keyboard = build_wallet_tracker_keyboard(ca=alert.ca)
                 logger.info(
                     "Wallet-tracker structured: action=%s token=%s trader=%s",
                     alert.action, alert.token, alert.trader,
                 )
-                await self._dispatcher.dispatch(
-                    text=text, source_key=route.key, pair="", keyboard=keyboard,
-                )
+                # Hand to the debouncer instead of dispatching directly.
+                # Rapid same-trader/same-token/same-action events get
+                # consolidated into a single '(×N buys)' alert.
+                await self._wallet_debouncer.add(alert)
                 return
             # Parse failed (unknown format) → fall through to the normal
             # memecoin freeform path so we still forward something.
