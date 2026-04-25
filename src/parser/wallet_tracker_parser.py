@@ -130,8 +130,7 @@ _TRADER_RE = re.compile(
     re.MULTILINE,
 )
 
-# Solana address (base58, 32-44 chars, no l/I/0/O). Match within a Solscan
-# token URL first, then on its own line, then anywhere.
+# Solana address (base58, 32-44 chars, no l/I/0/O).
 _SOLSCAN_TOKEN_RE = re.compile(
     r"solscan\.io/token/([1-9A-HJ-NP-Za-km-z]{32,44})", re.IGNORECASE,
 )
@@ -140,23 +139,55 @@ _BASE58_LINE_RE = re.compile(
 )
 _BASE58_ANY_RE = re.compile(r"\b([1-9A-HJ-NP-Za-km-z]{32,44})\b")
 
+# Addresses that are NEVER the "target token" in a wallet-tracker alert.
+# These show up in swap sentences as the quote currency but we don't want
+# Trade-on-Terminal buttons pointing at wrapped SOL.
+_IGNORE_CAS = {
+    "So11111111111111111111111111111111111111112",  # wSOL native mint
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+}
+
 
 def _extract_ca(stripped: str, raw: str) -> str:
-    """Find the contract address in the message.
+    """Find the real target-token contract address.
 
-    Tries (in order): solscan.io/token/<CA>, standalone base58 line,
-    any base58 token of plausible length. Searches the RAW (markdown-still-
-    intact) text first so we don't lose the CA inside a stripped link.
+    Strategy (ordered by reliability):
+      1. Standalone base58 line in the stripped body — Onsight alerts print
+         the target CA on its own line after the swap sentence, so this is
+         the most reliable signal.
+      2. Solscan token URLs, taking the LAST one (the target token usually
+         appears after the quote currency in the swap sentence).
+      3. Any base58 token of plausible length that isn't in the ignore set.
+
+    SOL/USDC/USDT mint addresses are filtered out at every step because
+    they appear as the QUOTE currency in the swap sentence, not the target
+    token. Confusing them for the target would point the Trade button at
+    wSOL/stablecoin pages.
     """
-    m = _SOLSCAN_TOKEN_RE.search(raw) or _SOLSCAN_TOKEN_RE.search(stripped)
-    if m:
-        return m.group(1)
-    m = _BASE58_LINE_RE.search(stripped)
-    if m:
-        return m.group(1)
-    m = _BASE58_ANY_RE.search(stripped)
-    if m:
-        return m.group(1)
+    # 1. Standalone-line CA (most reliable)
+    for m in _BASE58_LINE_RE.finditer(stripped):
+        ca = m.group(1)
+        if ca not in _IGNORE_CAS:
+            return ca
+
+    # 2. Solscan token URLs — take the LAST one that isn't in the ignore
+    # set. The quote currency (SOL/USDC) usually appears first in the swap
+    # sentence, so the last URL is more likely the target token.
+    solscan_matches = list(_SOLSCAN_TOKEN_RE.finditer(raw)) or list(
+        _SOLSCAN_TOKEN_RE.finditer(stripped)
+    )
+    for m in reversed(solscan_matches):
+        ca = m.group(1)
+        if ca not in _IGNORE_CAS:
+            return ca
+
+    # 3. Any base58 in the text, skipping known quote-currency mints
+    for m in _BASE58_ANY_RE.finditer(stripped):
+        ca = m.group(1)
+        if ca not in _IGNORE_CAS:
+            return ca
+
     return ""
 
 
