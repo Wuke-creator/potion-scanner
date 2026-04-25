@@ -23,6 +23,32 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _format_price_for_display(price_str: str) -> str:
+    """Normalize a price string to plain-decimal form for Telegram display.
+
+    Onsight wallet tracker messages sometimes carry the price in scientific
+    notation like '6.5e-7' or '3.94e-06', which is hard to scan in a
+    Telegram message. Convert to plain decimal ('0.00000065') with enough
+    precision to capture the leading significant digits.
+
+    If the input isn't a parseable number, return as-is (defensive: never
+    drop content the parser captured).
+    """
+    if not price_str:
+        return ""
+    try:
+        eff = float(price_str.replace(",", "").strip())
+    except (ValueError, AttributeError):
+        return price_str
+    if eff <= 0:
+        return price_str
+    if eff >= 1:
+        return f"{eff:,.4f}".rstrip("0").rstrip(".")
+    if eff >= 0.0001:
+        return f"{eff:.6f}".rstrip("0").rstrip(".")
+    return f"{eff:.12f}".rstrip("0").rstrip(".")
+
+
 # Referral-key rewriting. Onsight-style alert bots often hyperlink tokens /
 # tools to trade.padre.gg using a competing affiliate's ref code (e.g.
 # ?rk=raybot). When Potion Scanner forwards these to our Telegram audience,
@@ -363,7 +389,8 @@ def format_wallet_tracker_alert(
         )
 
     if alert.price:
-        lines.append(f"\U0001f4b5 {price_label}: <code>${escape(alert.price)}</code>")
+        display_price = _format_price_for_display(alert.price)
+        lines.append(f"\U0001f4b5 {price_label}: <code>${escape(display_price)}</code>")
 
     if alert.market_cap or alert.age:
         meta = []

@@ -88,6 +88,27 @@ def _format_amount(n: float) -> str:
     return f"{n:.6f}".rstrip("0").rstrip(".")
 
 
+def _format_price_decimal(eff: float) -> str:
+    """Format a token price as a plain decimal string (no scientific
+    notation), with enough precision to capture the leading significant
+    digits of memecoin-scale tiny values. Trailing zeros stripped.
+
+    Examples:
+        3.94e-6   -> "0.00000394"
+        6.5e-7    -> "0.00000065"
+        0.123     -> "0.123"
+        1.50      -> "1.5"
+    """
+    if eff <= 0:
+        return ""
+    if eff >= 1:
+        return f"{eff:,.4f}".rstrip("0").rstrip(".")
+    if eff >= 0.0001:
+        return f"{eff:.6f}".rstrip("0").rstrip(".")
+    # Sub-0.0001: use 12 decimals so 1e-9 still shows ~3 sig figs.
+    return f"{eff:.12f}".rstrip("0").rstrip(".")
+
+
 @dataclass
 class _Batch:
     """One accumulating consolidation batch for a single (trader, token,
@@ -121,13 +142,12 @@ class _Batch:
             _parse_number(a.received_amount) for a in self.alerts
         )
 
-        # Effective price = total USD / total amount
+        # Effective price = total USD / total amount.
+        # Always render in plain decimal (memecoin convention) — scientific
+        # notation like "$3.94e-06" is harder to scan than "$0.00000394".
         avg_price = ""
         if total_usd > 0 and total_received > 0:
-            eff = total_usd / total_received
-            # Use scientific notation for very small prices to avoid a
-            # string of leading zeros.
-            avg_price = f"{eff:.2e}" if eff < 0.0001 else f"{eff:.6f}".rstrip("0").rstrip(".")
+            avg_price = _format_price_decimal(total_usd / total_received)
 
         latest = self.latest_alert
         consolidated = WalletTrackerAlert(
