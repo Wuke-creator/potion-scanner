@@ -336,7 +336,7 @@ def format_wallet_tracker_alert(
 
     if alert.received_amount:
         lines.append(
-            f"\U0001f4e6 Got: <b>{escape(alert.received_amount)}</b> {token}"
+            f"\U0001f4e6 Amount: <b>{escape(alert.received_amount)}</b> {token}"
         )
 
     if alert.price:
