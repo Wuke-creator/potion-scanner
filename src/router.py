@@ -28,12 +28,15 @@ from src.discord_listener import IncomingMessage
 from src.dispatcher import Dispatcher
 from src.formatter import (
     build_signal_keyboard,
+    build_wallet_tracker_keyboard,
     format_lifecycle_event,
     format_parsed_signal,
     format_unknown_message,
+    format_wallet_tracker_alert,
     label_for_source_type,
 )
 from src.parser import MessageType, SignalParseError, classify, parse_signal
+from src.parser.wallet_tracker_parser import parse_wallet_tracker
 from src.parser.update_parser import (
     UpdateParseError,
     parse_all_tp_hit,
@@ -114,6 +117,37 @@ class Router:
                 keyboard=None,
             )
             return
+
+        # Wallet Tracker channel uses a dedicated parser+formatter that
+        # produces a clean, structured alert (matching the calls-channel
+        # visual style) and a single Trade-on-Terminal button pointing
+        # at the token's Padre page with Orangie's ref code. Competitor
+        # brand links (GMGN, AXIOM, BonkBot, etc.) are stripped out.
+        if route.key == "wallet_tracker":
+            try:
+                alert = parse_wallet_tracker(message.content)
+            except Exception:
+                logger.exception("Wallet tracker parse crashed; falling back")
+                alert = None
+            if alert is not None and alert.parsed_ok:
+                text = format_wallet_tracker_alert(
+                    alert=alert, channel_name=route.name,
+                )
+                keyboard = build_wallet_tracker_keyboard(ca=alert.ca)
+                logger.info(
+                    "Wallet-tracker structured: action=%s token=%s trader=%s",
+                    alert.action, alert.token, alert.trader,
+                )
+                await self._dispatcher.dispatch(
+                    text=text, source_key=route.key, pair="", keyboard=keyboard,
+                )
+                return
+            # Parse failed (unknown format) → fall through to the normal
+            # memecoin freeform path so we still forward something.
+            logger.info(
+                "Wallet-tracker parse incomplete (parsed_ok=False) — "
+                "falling back to verbatim forward"
+            )
 
         msg_type = classify(message.content)
         logger.info(

@@ -8,9 +8,11 @@ Output is HTML-safe for ``parse_mode="HTML"``.
 
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime, timezone
 from html import escape
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -19,6 +21,53 @@ from src.parser import ParsedSignal, Side
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+# Referral-key rewriting. Onsight-style alert bots often hyperlink tokens /
+# tools to trade.padre.gg using a competing affiliate's ref code (e.g.
+# ?rk=raybot). When Potion Scanner forwards these to our Telegram audience,
+# we rewrite the rk query param to Potion's code so clicks credit Potion
+# instead of the competitor.
+_PADRE_REF_CODE = os.environ.get("PADRE_REF_CODE", "orangie")
+_PADRE_URL_RE = re.compile(
+    r"(?P<url>https?://(?:www\.)?trade\.padre\.gg/[^\s<>)\"']+)",
+    re.IGNORECASE,
+)
+
+
+def _rewrite_padre_url(url: str, ref_code: str = _PADRE_REF_CODE) -> str:
+    """Ensure a trade.padre.gg URL's rk query param equals ``ref_code``.
+
+    Preserves path-style /rk/<code> links as-is (those are already hitting
+    a dedicated landing page; rewriting the path would break the redirect).
+    Only touches query-param rk on /trade/<chain>/<ca> style URLs.
+    """
+    try:
+        parsed = urlparse(url)
+        if "padre.gg" not in (parsed.netloc or "").lower():
+            return url
+        if parsed.path.lstrip("/").startswith("rk/"):
+            return url  # path-style landing page, leave alone
+        qs = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        qs["rk"] = ref_code
+        return urlunparse(parsed._replace(query=urlencode(qs)))
+    except Exception:
+        return url
+
+
+def _rewrite_padre_refs_in_text(
+    text: str, ref_code: str = _PADRE_REF_CODE,
+) -> str:
+    """Regex-replace every trade.padre.gg URL in ``text`` with its
+    rk-rewritten form. Called on the raw Discord content before the
+    markdown converter so rewritten URLs flow into both link hrefs and
+    bare-URL positions.
+    """
+    if not text:
+        return ""
+    return _PADRE_URL_RE.sub(
+        lambda m: _rewrite_padre_url(m.group("url"), ref_code), text,
+    )
 
 
 # Discord markdown → Telegram HTML conversion. Runs on the raw Discord
@@ -53,9 +102,16 @@ def discord_to_telegram_html(text: str) -> str:
     token holding the final HTML, escape the remaining raw text, then swap
     placeholders back in. Avoids double-escaping the HTML tags we just
     produced.
+
+    Also rewrites trade.padre.gg URLs so the rk query param credits Potion
+    (``orangie``) rather than whatever affiliate the source bot embedded.
     """
     if not text:
         return ""
+
+    # Rewrite Padre referral keys BEFORE markdown parsing so the new URL
+    # flows into both link hrefs and any bare-text URL positions.
+    text = _rewrite_padre_refs_in_text(text)
 
     tags: list[str] = []
 
@@ -232,6 +288,102 @@ def format_unknown_message(
         f"<i>{timestamp or _utc_now()}</i>",
     ]
     return "\n".join(lines)
+
+
+def format_wallet_tracker_alert(
+    alert,
+    channel_name: str,
+    timestamp: str | None = None,
+) -> str:
+    """Build a clean, structured Telegram alert from a parsed Onsight
+    wallet-tracker message.
+
+    Mirrors the visual structure of the perp signal formatter (sections
+    separated by blank lines, emoji bullets per row) so the Wallet Tracker
+    channel reads consistently with the calls channels. All Padre-only
+    deeplinks credit Orangie via the URL rewriter that runs separately.
+
+    Excludes competitor brand links (GMGN/Trojan/AXIOM/etc.) entirely.
+    """
+    direction_icon = "\U0001f7e2" if (alert.action or "").upper() == "BUY" else "\U0001f534"
+    pnl_icon = "\U0001f4c8" if alert.pnl_positive else "\U0001f4c9"
+
+    ch = escape(channel_name)
+    token = escape(alert.token or "?")
+    action = escape(alert.action or "?")
+
+    lines: list[str] = [
+        f"{direction_icon} <b>{action} {token}</b>",
+    ]
+
+    if alert.platform:
+        lines.append(f"<i>via {escape(alert.platform)}</i>")
+
+    lines.append("")
+    lines.append(f"\U0001f4e1 Source: Potion #{ch}")
+
+    if alert.trader:
+        lines.append(f"\U0001f464 Trader: <b>{escape(alert.trader)}</b>")
+    lines.append("")
+
+    if alert.spent_sol or alert.spent_usd:
+        spent_parts = []
+        if alert.spent_sol:
+            spent_parts.append(f"<b>{escape(alert.spent_sol)}</b> SOL")
+        if alert.spent_usd:
+            spent_parts.append(f"(${escape(alert.spent_usd)})")
+        lines.append(f"\U0001f4b0 Spent: {' '.join(spent_parts)}")
+
+    if alert.received_amount:
+        lines.append(
+            f"\U0001f4e6 Got: <b>{escape(alert.received_amount)}</b> {token}"
+        )
+
+    if alert.price:
+        lines.append(f"\U0001f4b5 Price: <code>${escape(alert.price)}</code>")
+
+    if alert.market_cap or alert.age:
+        meta = []
+        if alert.market_cap:
+            meta.append(f"MC: <b>{escape(alert.market_cap)}</b>")
+        if alert.age:
+            meta.append(f"Age: <b>{escape(alert.age)}</b>")
+        lines.append("\U0001f4ca " + "  •  ".join(meta))
+
+    if alert.holds_amount or alert.holds_pct:
+        holds_str = ""
+        if alert.holds_amount:
+            holds_str = f"<b>{escape(alert.holds_amount)}</b>"
+        if alert.holds_pct:
+            holds_str += f" ({escape(alert.holds_pct)}%)"
+        lines.append(f"\U0001f44a Holds: {holds_str.strip()}")
+
+    if alert.pnl:
+        lines.append(f"{pnl_icon} PnL: <b>${escape(alert.pnl)}</b>")
+
+    if alert.ca:
+        lines.append("")
+        lines.append(f"\U0001f3f7️ CA: <code>{escape(alert.ca)}</code>")
+
+    lines.append("")
+    lines.append(f"<i>{timestamp or _utc_now()}</i>")
+
+    return "\n".join(lines)
+
+
+def build_wallet_tracker_keyboard(
+    ca: str, ref_code: str = _PADRE_REF_CODE,
+) -> InlineKeyboardMarkup | None:
+    """Build a single-button keyboard pointing to the token's Padre/Terminal
+    trade page with Orangie's referral key. Returns None if no CA is known
+    (no point sending a Trade button without a target)."""
+    if not ca:
+        return None
+    url = f"https://trade.padre.gg/trade/solana/{ca}?rk={ref_code}"
+    button = InlineKeyboardButton(
+        text="\U0001f680 Trade on Terminal", url=url,
+    )
+    return InlineKeyboardMarkup([[button]])
 
 
 def label_for_source_type(source_type: str) -> str:
