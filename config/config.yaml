@@ -9,7 +9,7 @@ discord:
       display_name: "Perp Calls"
       source_type: perps
       id_env: MANUAL_PERP_CHANNEL_ID
-      ref_link_env: REF_LINK_PERPS
+      ref_link_env: REF_LINK_OSTIUM
 
     - key: prediction
       name: "Prediction Calls"
