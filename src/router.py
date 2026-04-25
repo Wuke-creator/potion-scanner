@@ -133,12 +133,17 @@ class Router:
         # at the token's Padre page with Orangie's ref code. Competitor
         # brand links (GMGN, AXIOM, BonkBot, etc.) are stripped out.
         if route.key == "wallet_tracker":
-            # Drop TRANSFER alerts — they're wallet-to-wallet movements, not
-            # trading signals. Users only want BUY/SELL actions.
-            first_line = (message.content or "").split("\n", 1)[0]
-            if "TRANSFER" in first_line.upper():
+            # Drop non-trading wallet activity types. Onsight emits:
+            #   BUY / SELL -> real trading signals, forward
+            #   TRANSFER -> wallet-to-wallet movement, not a trade
+            #   UNKNOWN -> Onsight's catch-all for activity it couldn't
+            #     classify (often just balance changes or noise)
+            # Only BUY/SELL should reach subscribers.
+            head = (message.content or "").split("\n", 1)[0].upper()
+            if "TRANSFER" in head or "UNKNOWN" in head:
                 logger.info(
-                    "Skipping TRANSFER alert from #Wallet Tracker (not a BUY/SELL)"
+                    "Skipping non-trading Wallet Tracker alert (head=%r)",
+                    head[:80],
                 )
                 return
             try:

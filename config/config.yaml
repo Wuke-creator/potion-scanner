@@ -4,13 +4,6 @@
 
 discord:
   channels:
-    - key: manual_perp
-      name: "Perp Calls"
-      display_name: "Perp Calls"
-      source_type: perps
-      id_env: MANUAL_PERP_CHANNEL_ID
-      ref_link_env: REF_LINK_PERPS
-
     - key: prediction
       name: "Prediction Calls"
       display_name: "Elite Scans"
