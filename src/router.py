@@ -89,7 +89,7 @@ class Router:
         # emit callback bound to this router instance).
         self._wallet_debouncer = WalletTrackerDebouncer(
             emit_fn=self._emit_wallet_tracker_alert,
-            idle_timeout_sec=30.0,
+            idle_timeout_sec=10.0,
             max_hold_sec=120.0,
         )
 
