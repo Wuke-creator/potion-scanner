@@ -293,6 +293,7 @@ def format_unknown_message(
 def format_wallet_tracker_alert(
     alert,
     channel_name: str,
+    source_url: str = "",
     timestamp: str | None = None,
 ) -> str:
     """Build a clean, structured Telegram alert from a parsed Onsight
@@ -320,7 +321,13 @@ def format_wallet_tracker_alert(
         lines.append(f"<i>via {escape(alert.platform)}</i>")
 
     lines.append("")
-    lines.append(f"\U0001f4e1 Source: Potion #{ch}")
+    if source_url:
+        lines.append(
+            f'\U0001f4e1 Source: Potion '
+            f'<a href="{escape(source_url, quote=True)}">#{ch}</a>'
+        )
+    else:
+        lines.append(f"\U0001f4e1 Source: Potion #{ch}")
 
     if alert.trader:
         lines.append(f"\U0001f464 Trader: <b>{escape(alert.trader)}</b>")

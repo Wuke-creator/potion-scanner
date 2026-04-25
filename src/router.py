@@ -93,6 +93,15 @@ class Router:
                 "Router crashed on message from channel=%d", message.channel_id,
             )
 
+    def _build_discord_channel_url(self, channel_id: int) -> str:
+        """Deep link back to the source Discord channel. Returns empty
+        string when guild_id isn't configured (defensive — URL is optional
+        in the formatters)."""
+        guild_id = getattr(self._discord_cfg, "guild_id", 0)
+        if not guild_id or not channel_id:
+            return ""
+        return f"https://discord.com/channels/{guild_id}/{channel_id}"
+
     async def _handle(self, message: IncomingMessage) -> None:
         route = self._discord_cfg.channel_by_id(message.channel_id)
         if route is None:
@@ -138,8 +147,11 @@ class Router:
                 logger.exception("Wallet tracker parse crashed; falling back")
                 alert = None
             if alert is not None and alert.parsed_ok:
+                source_url = self._build_discord_channel_url(message.channel_id)
                 text = format_wallet_tracker_alert(
-                    alert=alert, channel_name=route.name,
+                    alert=alert,
+                    channel_name=route.name,
+                    source_url=source_url,
                 )
                 keyboard = build_wallet_tracker_keyboard(ca=alert.ca)
                 logger.info(
