@@ -238,20 +238,71 @@ def format_parsed_signal(
     return "\n".join(lines)
 
 
+_OSTIUM_REF_FALLBACK = "PTION"
+
+
+def _extract_base_symbol(pair: str) -> str:
+    """Pull the base ticker out of a free-form pair string.
+
+    Handles "BTC/USDT", "ETH/USD 10x", "SOL", "btc/usdt", etc. Strips
+    whitespace, splits on the first slash, and uppercases. Non-alphanumeric
+    trailing tokens (like "10x") get dropped so we don't smuggle them into
+    the deeplink as part of the symbol.
+    """
+    if not pair:
+        return ""
+    head = pair.split("/", 1)[0].strip()
+    # Take only the first token (drop trailing "10x", "(LONG)", etc.)
+    head = head.split()[0] if head else head
+    return re.sub(r"[^A-Za-z0-9]", "", head).upper()
+
+
+def _build_ostium_trade_url(ref_link: str, pair: str) -> str:
+    """Build a per-pair Ostium deeplink that opens the right market directly.
+
+    Ostium's frontend takes ``?from=<BASE>&to=USD&ref=<CODE>`` and routes
+    straight into the trade view for that market. Mirrors the per-CA
+    deeplink trick we use for Padre/Terminal on memecoin alerts.
+
+    Falls back to the bare ref_link if base extraction fails (defensive:
+    never produce a broken Trade button).
+    """
+    base = _extract_base_symbol(pair)
+    if not base:
+        return ref_link
+    # Preserve whatever ref code is already on the configured URL.
+    try:
+        parsed = urlparse(ref_link)
+        existing = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        ref_code = existing.get("ref") or _OSTIUM_REF_FALLBACK
+    except Exception:
+        ref_code = _OSTIUM_REF_FALLBACK
+    qs = urlencode({"from": base, "to": "USD", "ref": ref_code})
+    return f"https://app.ostium.com/trade?{qs}"
+
+
 def build_signal_keyboard(
     ref_link: str, pair: str,
 ) -> InlineKeyboardMarkup:
     """Build inline buttons for a parsed signal alert.
 
     Row 1: "Trade now" (ref link) + "Chart" (DexScreener search)
+
+    For Ostium ref links we rewrite the Trade-now URL to a per-pair deeplink
+    so the right market opens with one tap (matching the Padre/Terminal
+    per-CA deeplink behaviour on memecoin alerts).
     """
     # Build a DexScreener search URL from the base token (first in the pair)
     base_token = pair.split("/")[0].strip() if "/" in pair else pair.strip()
     chart_url = f"https://dexscreener.com/search?q={base_token}"
 
+    trade_url = ref_link
+    if ref_link and "app.ostium.com" in ref_link.lower():
+        trade_url = _build_ostium_trade_url(ref_link, pair)
+
     buttons = [
         [
-            InlineKeyboardButton(text="\U0001f7e2 Trade now", url=ref_link),
+            InlineKeyboardButton(text="\U0001f7e2 Trade now", url=trade_url),
             InlineKeyboardButton(text="\U0001f4ca Chart", url=chart_url),
         ],
     ]
