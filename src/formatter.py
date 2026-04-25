@@ -8,6 +8,7 @@ Output is HTML-safe for ``parse_mode="HTML"``.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from html import escape
 
@@ -18,6 +19,106 @@ from src.parser import ParsedSignal, Side
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+# Discord markdown → Telegram HTML conversion. Runs on the raw Discord
+# message text for freeform-forward channels (memecoin source_type) and
+# lifecycle events, so links/bold/italic render cleanly on mobile instead
+# of showing as literal asterisks and bracket syntax.
+
+_MD_LINK_ANGLE_RE = re.compile(r"\[([^\]]+)\]\(<([^>]+)>\)")
+_MD_LINK_PLAIN_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_MD_BOLD_RE = re.compile(r"\*\*([^*\n]+?)\*\*")
+_MD_UNDERLINE_RE = re.compile(r"__([^_\n]+?)__")
+_MD_ITALIC_STAR_RE = re.compile(r"(?<![*\w])\*([^*\n]+?)\*(?!\w)")
+_MD_ITALIC_UNDER_RE = re.compile(r"(?<![_\w])_([^_\n]+?)_(?!\w)")
+_MD_STRIKE_RE = re.compile(r"~~([^~\n]+?)~~")
+_MD_CODE_BLOCK_RE = re.compile(r"```[a-zA-Z]*\n?([\s\S]+?)```", re.MULTILINE)
+_MD_CODE_INLINE_RE = re.compile(r"`([^`\n]+?)`")
+_BARE_URL_ANGLE_RE = re.compile(r"<(https?://[^>\s]+)>")
+
+_PLACEHOLDER_FMT = "\x00TG_TAG_{i}\x00"
+
+
+def discord_to_telegram_html(text: str) -> str:
+    """Convert Discord markdown into Telegram-HTML-safe output.
+
+    Handles (in order): links with angle-bracketed URLs like
+    ``[text](<url>)`` (Discord's no-preview syntax), plain ``[text](url)``
+    links, code blocks, inline code, bold ``**x**``, underline ``__x__``,
+    italic ``*x*`` / ``_x_``, strikethrough ``~~x~~``, bare angle-bracketed
+    URLs like ``<https://...>`` (strip the wrappers).
+
+    Strategy: replace each markdown construct with a unique placeholder
+    token holding the final HTML, escape the remaining raw text, then swap
+    placeholders back in. Avoids double-escaping the HTML tags we just
+    produced.
+    """
+    if not text:
+        return ""
+
+    tags: list[str] = []
+
+    def _stash(tag_html: str) -> str:
+        idx = len(tags)
+        tags.append(tag_html)
+        return _PLACEHOLDER_FMT.format(i=idx)
+
+    def _link_sub(url: str, label: str) -> str:
+        return _stash(
+            f'<a href="{escape(url, quote=True)}">{escape(label)}</a>'
+        )
+
+    # Order matters: links first (so ** inside link labels gets escaped as
+    # label text, not converted), then code blocks (so ** inside code stays
+    # literal), then remaining inline constructs.
+
+    def _angle_link(m):
+        return _link_sub(m.group(2), m.group(1))
+    text = _MD_LINK_ANGLE_RE.sub(_angle_link, text)
+
+    def _plain_link(m):
+        return _link_sub(m.group(2), m.group(1))
+    text = _MD_LINK_PLAIN_RE.sub(_plain_link, text)
+
+    def _code_block(m):
+        return _stash(f"<pre>{escape(m.group(1).rstrip())}</pre>")
+    text = _MD_CODE_BLOCK_RE.sub(_code_block, text)
+
+    def _code_inline(m):
+        return _stash(f"<code>{escape(m.group(1))}</code>")
+    text = _MD_CODE_INLINE_RE.sub(_code_inline, text)
+
+    def _bold(m):
+        return _stash(f"<b>{escape(m.group(1))}</b>")
+    text = _MD_BOLD_RE.sub(_bold, text)
+
+    def _underline(m):
+        return _stash(f"<u>{escape(m.group(1))}</u>")
+    text = _MD_UNDERLINE_RE.sub(_underline, text)
+
+    def _italic(m):
+        return _stash(f"<i>{escape(m.group(1))}</i>")
+    text = _MD_ITALIC_STAR_RE.sub(_italic, text)
+    text = _MD_ITALIC_UNDER_RE.sub(_italic, text)
+
+    def _strike(m):
+        return _stash(f"<s>{escape(m.group(1))}</s>")
+    text = _MD_STRIKE_RE.sub(_strike, text)
+
+    # Bare <https://...> wrappers → strip the <>, leave the URL as-is so
+    # Telegram auto-linkifies it.
+    text = _BARE_URL_ANGLE_RE.sub(lambda m: m.group(1), text)
+
+    # Escape whatever plain text remains, then re-insert the HTML tags.
+    # Replace in REVERSE order: a later-indexed tag may contain a reference
+    # to an earlier-indexed tag (e.g. bold around a link) and we need to
+    # expand the outer tag first so the inner placeholder is unwrapped
+    # before the loop reaches it.
+    text = escape(text)
+    for i in range(len(tags) - 1, -1, -1):
+        text = text.replace(_PLACEHOLDER_FMT.format(i=i), tags[i])
+    return text
 
 
 def format_parsed_signal(
@@ -84,7 +185,7 @@ def format_lifecycle_event(
     timestamp: str | None = None,
 ) -> str:
     """Format a lifecycle update (TP hit, breakeven, stop hit, etc.)."""
-    cleaned = escape(raw_message.strip())
+    cleaned = discord_to_telegram_html(raw_message.strip())
     if len(cleaned) > 1500:
         cleaned = cleaned[:1500] + "..."
     ch = escape(channel_name)
@@ -109,8 +210,13 @@ def format_unknown_message(
     source_type_label: str,
     timestamp: str | None = None,
 ) -> str:
-    """Forward an unparseable but non-noise message verbatim."""
-    cleaned = escape(raw_message.strip())
+    """Forward an unparseable but non-noise message verbatim.
+
+    Runs Discord markdown through ``discord_to_telegram_html`` so links,
+    bold, and italic render correctly on Telegram instead of leaking as
+    literal ``**``/``[…](…)``/``&lt;…&gt;`` tokens.
+    """
+    cleaned = discord_to_telegram_html(raw_message.strip())
     if len(cleaned) > 1500:
         cleaned = cleaned[:1500] + "..."
     ch = escape(channel_name)
