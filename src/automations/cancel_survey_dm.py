@@ -125,18 +125,25 @@ class CancelSurveyDM:
                 username TEXT,
                 sent_at INTEGER NOT NULL,
                 delivered INTEGER NOT NULL DEFAULT 1,
-                survey_email_sent INTEGER NOT NULL DEFAULT 0
+                survey_email_sent INTEGER NOT NULL DEFAULT 0,
+                confirmation_email_sent INTEGER NOT NULL DEFAULT 0
             )
             """
         )
-        # Migration for DBs created before survey_email_sent landed.
-        try:
-            await self._db.execute(
-                "ALTER TABLE sent_dms "
-                "ADD COLUMN survey_email_sent INTEGER NOT NULL DEFAULT 0"
-            )
-        except aiosqlite.OperationalError:
-            pass  # column already exists on fresh DBs
+        # Column migrations for DBs that predate each new flag. Each ALTER
+        # is wrapped individually so a partial migration history doesn't
+        # block subsequent columns. SQLite raises OperationalError when
+        # the column already exists; that's the only error we swallow.
+        for stmt in (
+            "ALTER TABLE sent_dms ADD COLUMN survey_email_sent "
+            "INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sent_dms ADD COLUMN confirmation_email_sent "
+            "INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                await self._db.execute(stmt)
+            except aiosqlite.OperationalError:
+                pass  # column already exists
         await self._db.commit()
         self._register_handler()
         logger.info(
@@ -236,6 +243,15 @@ class CancelSurveyDM:
         # user has abandoned Discord; typical of real cancellations.
         await self._send_survey_email(
             user_id=user_id, username=after.name, email=email, url=url,
+        )
+
+        # Step 4: send the cancellation-confirmation email. Distinct from
+        # the survey email — this one acknowledges the cancellation and
+        # surfaces the 14-day reactivation window. Sent immediately so
+        # the member has a clean confirmation in their inbox alongside
+        # the survey ask, not buried inside the winback sequence.
+        await self._send_cancellation_confirmation_email(
+            user_id=user_id, username=after.name, email=email,
         )
 
     def _build_url(
@@ -563,6 +579,113 @@ class CancelSurveyDM:
                 "CancelSurveyDM: survey email failed for %s: %s", email, err,
             )
 
+    async def _send_cancellation_confirmation_email(
+        self,
+        *,
+        user_id: str,
+        username: str,
+        email: str,
+    ) -> None:
+        """Send a one-shot cancellation confirmation email.
+
+        Distinct from the survey email and the winback sequence:
+          - Survey email asks for feedback (single immediate touch)
+          - Winback sequence persuades them to come back (Day 1/4/7)
+          - This email simply acknowledges the cancellation and surfaces
+            the 14-day reactivation window. Reassuring, not pushy.
+
+        Silent skip when:
+          - resend_client is None (email delivery not configured)
+          - email resolution returned blank
+          - we already sent the confirmation inside the cooldown window
+            (checked via ``sent_dms.confirmation_email_sent``)
+        """
+        if self._resend is None:
+            logger.debug(
+                "CancelSurveyDM: resend_client not wired, "
+                "skipping confirmation email",
+            )
+            return
+        if not email:
+            logger.info(
+                "CancelSurveyDM: no email on file for discord=%s (%s), "
+                "skipping confirmation email",
+                user_id, username,
+            )
+            return
+        if await self._already_confirmed_emailed(user_id):
+            logger.debug(
+                "CancelSurveyDM: confirmation email already sent to %s, "
+                "skipping",
+                user_id,
+            )
+            return
+
+        subject = "Your Potion Elite cancellation is confirmed"
+        greeting_name = username or "there"
+        safe_name = _html_escape(greeting_name)
+        safe_url = _html_escape(self._rejoin_url)
+
+        text_body = (
+            f"Hey {greeting_name},\n\n"
+            "Your Potion Elite membership has been cancelled and your "
+            "access has ended.\n\n"
+            "For the next 14 days, you can reactivate at your current "
+            "rate using the link below. After that, the standard rate "
+            "applies.\n\n"
+            f"Reactivate at current rate: {self._rejoin_url}\n\n"
+            "Whatever the reason for leaving, we appreciate the time you "
+            "spent with Potion.\n\n"
+            "Potion Alpha Team\n"
+        )
+        html_body = (
+            '<!doctype html><html><body style="font-family:system-ui,'
+            'sans-serif;max-width:560px;margin:0 auto;padding:24px;'
+            'color:#222;line-height:1.5;">'
+            f"<p>Hey {safe_name},</p>"
+            "<p>Your Potion Elite membership has been cancelled and your "
+            "access has ended.</p>"
+            "<p>For the next <strong>14 days</strong>, you can reactivate "
+            "at your current rate using the link below. After that, the "
+            "standard rate applies.</p>"
+            f'<p style="margin:32px 0;"><a href="{safe_url}" '
+            'style="background:#6b4fbb;color:white;padding:14px 28px;'
+            'text-decoration:none;border-radius:8px;font-weight:bold;'
+            'display:inline-block;">Reactivate at current rate</a></p>'
+            '<p style="color:#666;font-size:14px;">Whatever the reason '
+            "for leaving, we appreciate the time you spent with Potion.</p>"
+            "<p>Potion Alpha Team</p>"
+            "</body></html>"
+        )
+
+        try:
+            result = await self._resend.send(
+                to=email,
+                subject=subject,
+                html=html_body,
+                text=text_body,
+                from_name=self._from_name,
+            )
+        except Exception:
+            logger.exception(
+                "CancelSurveyDM: confirmation email send crashed for %s",
+                email,
+            )
+            return
+
+        if getattr(result, "ok", False):
+            await self._mark_confirmation_emailed(user_id)
+            logger.info(
+                "CancelSurveyDM: confirmation email sent to %s (%s)",
+                email, username,
+            )
+        else:
+            err = getattr(result, "error", "unknown error")
+            logger.warning(
+                "CancelSurveyDM: confirmation email failed for %s: %s",
+                email, err,
+            )
+
     async def _already_sent_recently(self, user_id: str) -> bool:
         if self._db is None:
             return False
@@ -588,19 +711,22 @@ class CancelSurveyDM:
         if self._db is None:
             return
         async with self._db.execute(
-            "SELECT survey_email_sent FROM sent_dms WHERE discord_user_id = ?",
+            "SELECT survey_email_sent, confirmation_email_sent "
+            "FROM sent_dms WHERE discord_user_id = ?",
             (user_id,),
         ) as cur:
             prior = await cur.fetchone()
-        email_flag = int(prior[0]) if prior else 0
+        survey_flag = int(prior[0]) if prior else 0
+        confirm_flag = int(prior[1]) if prior else 0
         await self._db.execute(
             """
             INSERT OR REPLACE INTO sent_dms
-              (discord_user_id, username, sent_at, delivered, survey_email_sent)
-            VALUES (?, ?, ?, ?, ?)
+              (discord_user_id, username, sent_at, delivered,
+               survey_email_sent, confirmation_email_sent)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (user_id, username, int(time.time()),
-             1 if delivered else 0, email_flag),
+             1 if delivered else 0, survey_flag, confirm_flag),
         )
         await self._db.commit()
 
@@ -618,6 +744,44 @@ class CancelSurveyDM:
         if row is None or not int(row[0]):
             return False
         return (int(time.time()) - int(row[1])) < self._cooldown
+
+    async def _already_confirmed_emailed(self, user_id: str) -> bool:
+        """True when we've already sent the cancellation-confirmation email
+        to this user within the cooldown window. Independent from DM
+        and survey-email dedupe."""
+        if self._db is None:
+            return False
+        async with self._db.execute(
+            "SELECT confirmation_email_sent, sent_at FROM sent_dms "
+            "WHERE discord_user_id = ?",
+            (user_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None or not int(row[0]):
+            return False
+        return (int(time.time()) - int(row[1])) < self._cooldown
+
+    async def _mark_confirmation_emailed(self, user_id: str) -> None:
+        """Record that the cancellation-confirmation email has been sent.
+
+        UPSERT pattern matches _mark_survey_emailed so the row is created
+        if no DM record exists yet (race condition where email send beats
+        the DM to the DB write)."""
+        if self._db is None:
+            return
+        now = int(time.time())
+        await self._db.execute(
+            """
+            INSERT INTO sent_dms
+              (discord_user_id, username, sent_at, delivered,
+               survey_email_sent, confirmation_email_sent)
+            VALUES (?, '', ?, 0, 0, 1)
+            ON CONFLICT(discord_user_id) DO UPDATE SET
+              confirmation_email_sent = 1
+            """,
+            (user_id, now),
+        )
+        await self._db.commit()
 
     async def _mark_survey_emailed(self, user_id: str) -> None:
         """Record that the survey email has been sent to this user.
