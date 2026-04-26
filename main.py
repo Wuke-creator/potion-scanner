@@ -77,6 +77,14 @@ async def run(config: Config) -> None:
     analytics = AnalyticsDB(db_path="data/analytics.db")
     await analytics.open()
 
+    # --- Open-signals memory: enriches lifecycle events (TP1 hit etc.)
+    # with the original signal's entry/SL/TP prices, so image-bot updates
+    # like "WET Update: TP1 here" carry the actual numbers on Telegram.
+    from src.automations.open_signals_db import OpenSignalsDB
+
+    open_signals_db = OpenSignalsDB(db_path="data/open_signals.db")
+    await open_signals_db.open()
+
     # --- Verification subsystem (commands read analytics for /data) ---
     from src.verification.runtime import build_verification_runtime
 
@@ -96,6 +104,7 @@ async def run(config: Config) -> None:
         discord_cfg=config.discord,
         dispatcher=dispatcher,
         analytics=analytics,
+        open_signals=open_signals_db,
     )
 
     # --- Automations: shared activity tracker (feeds Features 2 + 4) ---
@@ -456,6 +465,10 @@ async def run(config: Config) -> None:
             await analytics.close()
         except Exception:
             logger.exception("Analytics close error")
+        try:
+            await open_signals_db.close()
+        except Exception:
+            logger.exception("OpenSignalsDB close error")
         logger.info("Shutdown complete")
 
 

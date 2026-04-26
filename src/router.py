@@ -37,6 +37,8 @@ from src.formatter import (
 )
 from src.parser import MessageType, SignalParseError, classify, parse_signal
 from src.parser.wallet_tracker_parser import parse_wallet_tracker
+from src.parser.image_ocr import ocr_available, ocr_image_url, parse_ocr_text
+from src.automations.open_signals_db import OpenSignalsDB
 from src.automations.wallet_tracker_debouncer import WalletTrackerDebouncer
 from src.parser.update_parser import (
     UpdateParseError,
@@ -68,8 +70,33 @@ _LIFECYCLE_LABELS: dict[MessageType, str] = {
     MessageType.CANCELED: "Trade Canceled",
 }
 
+# Status flips applied to the open_signals memory layer when a lifecycle
+# event lands. Used to mark trades as terminated so future events for the
+# same symbol don't accidentally pull in a closed trade as 'original'.
+_LIFECYCLE_TERMINAL_STATUSES: dict[MessageType, str] = {
+    MessageType.ALL_TP_HIT: "all_tp_hit",
+    MessageType.STOP_HIT: "stopped",
+    MessageType.TRADE_CLOSED: "closed",
+    MessageType.CANCELED: "canceled",
+}
+_LIFECYCLE_NON_TERMINAL_STATUSES: dict[MessageType, str] = {
+    MessageType.TP_HIT: "tp_hit",
+    MessageType.BREAKEVEN: "breakeven",
+}
+
 # Always-dropped: PREPARATION posts (just teasers, not actionable)
 _ALWAYS_DROP = {MessageType.PREPARATION}
+
+# Pair-extraction regex used when an image-bot lifecycle message has only
+# a sparse caption ("WET Update: TP1 here, move SL to BE"). Pulls a 2-10
+# char ticker that looks like a coin symbol so we can do an open_signals
+# lookup. Deliberately permissive: even uppercased English words will
+# match, and the lookup just returns None when nothing's recorded.
+import re as _re  # noqa: E402  (kept local to this module's helpers)
+_CAPTION_TICKER_RE = _re.compile(
+    r"\b([A-Z][A-Z0-9]{1,9})\b(?=\s*(?:UPDATE|UPDATES|TP\d|SL|STOP|HIT|MOVE|BE|BREAKEVEN))",
+    _re.IGNORECASE,
+)
 
 
 class Router:
@@ -80,10 +107,18 @@ class Router:
         discord_cfg: DiscordConfig,
         dispatcher: Dispatcher,
         analytics: AnalyticsDB | None = None,
+        open_signals: OpenSignalsDB | None = None,
     ):
         self._discord_cfg = discord_cfg
         self._dispatcher = dispatcher
         self._analytics = analytics
+        # Open-signals memory: when present, every parsed new signal gets
+        # recorded here, and lifecycle events look up their original
+        # signal so we can render entry/SL/TP context that the update
+        # message itself doesn't carry. None disables the feature
+        # gracefully (image-bot updates still forward, just without the
+        # 'From the original call' block).
+        self._open_signals = open_signals
         # Debouncer for rapid same-trader same-token same-action buys on
         # the Wallet Tracker channel. Instantiated lazily (needs a stable
         # emit callback bound to this router instance).
@@ -202,6 +237,19 @@ class Router:
                 "falling back to verbatim forward"
             )
 
+        # Image-OCR new-signal fallback. When an image-bot channel posts a
+        # chart-card-only signal (caption is empty or just decorative), the
+        # caption can't be classified, so the message would normally drop.
+        # OCR the first attached image; if it yields enough fields to
+        # qualify as a new signal, record it in the memory layer and
+        # dispatch a synthesised alert. Cheap on memory layer (one row),
+        # only fires when the rest of the pipeline can't handle the post.
+        image_urls = message.image_urls or []
+        if image_urls and ocr_available():
+            handled = await self._try_ocr_new_signal(message, route, image_urls)
+            if handled:
+                return
+
         msg_type = classify(message.content)
         logger.info(
             "Classified message from #%s as %s", route.name, msg_type.value,
@@ -230,6 +278,176 @@ class Router:
             text=text, source_key=route.key, pair=pair, keyboard=keyboard,
         )
         logger.info("Enqueued %s from #%s for fan-out", msg_type.value, route.name)
+
+        # After successful dispatch, flip the open_signals status for
+        # terminal lifecycle events so future events don't pull the
+        # closed trade as 'original context'.
+        await self._maybe_flip_open_signal_status(msg_type, message, route)
+
+    async def _try_ocr_new_signal(
+        self,
+        message: IncomingMessage,
+        route: ChannelRoute,
+        image_urls: list[str],
+    ) -> bool:
+        """Attempt to extract a new signal from an attached chart image.
+
+        Returns True if the OCR pipeline produced a viable signal AND we
+        dispatched a Telegram alert (caller should stop further routing).
+        Returns False if OCR found nothing usable; caller continues with
+        the normal classify+route path.
+
+        Skips OCR when the caption already looks like a structured perp-
+        bot signal — those parse fine without OCR and we shouldn't
+        double-process them.
+        """
+        text = message.content or ""
+        upper = text.upper()
+        # Bail fast if the existing path will handle it.
+        if "TRADING SIGNAL ALERT" in upper or "TP TARGET" in upper:
+            return False
+        # Captions that obviously represent a lifecycle event also get
+        # handled by the normal path (with open_signals enrichment).
+        for marker in ("TP1", "TP 1", "TP HIT", "STOP HIT", "MOVE SL", "BREAKEVEN", "CANCELED", "CLOSED"):
+            if marker in upper:
+                return False
+
+        ocr_text = await ocr_image_url(image_urls[0])
+        if not ocr_text:
+            return False
+        fields = parse_ocr_text(ocr_text)
+        base = fields.get("base")
+        if not base:
+            return False
+        # Treat as new signal only when we have at least entry + (sl OR tp1).
+        # Update-style cards (ROI/market/etc. without entry+SL) get left
+        # for the regular caption path.
+        if "entry" not in fields:
+            return False
+        if "stop_loss" not in fields and "tp1" not in fields:
+            return False
+
+        pair = fields.get("pair") or base
+        side = fields.get("side")
+        leverage = fields.get("leverage")
+        entry = fields.get("entry")
+        sl = fields.get("stop_loss")
+        tp1 = fields.get("tp1")
+        tp2 = fields.get("tp2")
+        tp3 = fields.get("tp3")
+
+        # Record into open_signals so future lifecycle events for this
+        # symbol can be enriched.
+        if self._open_signals is not None:
+            try:
+                await self._open_signals.record_signal(
+                    channel_id=message.channel_id,
+                    pair=pair,
+                    side=side,
+                    leverage=leverage,
+                    entry=entry,
+                    stop_loss=sl,
+                    tp1=tp1,
+                    tp2=tp2,
+                    tp3=tp3,
+                    trade_id=None,
+                    raw_message=text + "\n\n[OCR]\n" + ocr_text,
+                )
+            except Exception:
+                logger.exception("OCR signal record_signal failed")
+
+        # Build a synthesised "new call" Telegram alert from the OCR
+        # fields. We use format_unknown_message as the carrier and
+        # prepend a clean structured block — keeps formatting consistent
+        # with the rest of the perp pipeline.
+        synthesized_lines: list[str] = []
+        head_bits: list[str] = [str(pair)]
+        if side:
+            head_bits.append(side.upper())
+        if leverage:
+            head_bits.append(f"{int(leverage)}x")
+        synthesized_lines.append(" ".join(head_bits))
+        if entry is not None:
+            synthesized_lines.append(f"Entry: {entry}")
+        if sl is not None:
+            synthesized_lines.append(f"SL: {sl}")
+        if tp1 is not None:
+            synthesized_lines.append(f"TP1: {tp1}")
+        if tp2 is not None:
+            synthesized_lines.append(f"TP2: {tp2}")
+        if tp3 is not None:
+            synthesized_lines.append(f"TP3: {tp3}")
+        synthesized = "\n".join(synthesized_lines)
+        # Preserve the original caption underneath so context isn't lost.
+        if text:
+            synthesized = synthesized + "\n\n" + text
+
+        alert_text = format_unknown_message(
+            raw_message=synthesized,
+            ref_link=route.ref_link,
+            channel_name=route.name,
+            source_type_label=label_for_source_type(route.source_type),
+        )
+        keyboard = build_signal_keyboard(
+            ref_link=route.ref_link, pair=pair,
+        )
+        await self._dispatcher.dispatch(
+            text=alert_text, source_key=route.key, pair=pair, keyboard=keyboard,
+        )
+        logger.info(
+            "OCR new-signal dispatched: pair=%s side=%s entry=%s",
+            pair, side, entry,
+        )
+        return True
+
+    async def _maybe_flip_open_signal_status(
+        self,
+        msg_type: MessageType,
+        message: IncomingMessage,
+        route: ChannelRoute,
+    ) -> None:
+        """If a lifecycle event landed for a known open signal, mark its
+        new status. No-op when memory layer is disabled or no match
+        exists. Cheap (one indexed UPDATE)."""
+        if self._open_signals is None:
+            return
+        new_status = (
+            _LIFECYCLE_TERMINAL_STATUSES.get(msg_type)
+            or _LIFECYCLE_NON_TERMINAL_STATUSES.get(msg_type)
+        )
+        if not new_status:
+            return
+        ticker = self._extract_pair_or_ticker(message.content)
+        if not ticker:
+            return
+        try:
+            await self._open_signals.update_status(
+                channel_id=message.channel_id,
+                pair_or_base=ticker,
+                new_status=new_status,
+            )
+        except Exception:
+            logger.exception("open_signals.update_status crashed")
+
+    @staticmethod
+    def _extract_pair_or_ticker(content: str) -> str | None:
+        """Extract a coin ticker from a free-form lifecycle caption.
+
+        Tries 'PAIR: WET/USDT' style first (the structured perp-bot
+        format), then falls back to a permissive ticker-near-keyword
+        regex that catches captions like 'WET Update: TP1 here'.
+        """
+        if not content:
+            return None
+        pair_match = _re.search(
+            r"PAIR\s*[:#]?\s*(\S+/\S+)", content, _re.IGNORECASE,
+        )
+        if pair_match:
+            return pair_match.group(1).upper()
+        cap_match = _CAPTION_TICKER_RE.search(content)
+        if cap_match:
+            return cap_match.group(1).upper()
+        return None
 
     async def _build_text(
         self,
@@ -274,6 +492,27 @@ class Router:
                     )
                 except Exception:
                     logger.exception("Analytics: failed to record signal")
+            # Record into the open_signals memory layer so subsequent
+            # lifecycle events (TP1 hit, SL moved, etc.) can be enriched
+            # with the original entry/SL/TP prices when the update post
+            # itself is just a sparse caption.
+            if self._open_signals is not None:
+                try:
+                    await self._open_signals.record_signal(
+                        channel_id=message.channel_id,
+                        pair=signal.pair,
+                        side=signal.side.value,
+                        leverage=signal.leverage,
+                        entry=signal.entry,
+                        stop_loss=signal.stop_loss,
+                        tp1=signal.tp1,
+                        tp2=signal.tp2,
+                        tp3=signal.tp3,
+                        trade_id=signal.trade_id,
+                        raw_message=message.content,
+                    )
+                except Exception:
+                    logger.exception("open_signals: failed to record signal")
             text = format_parsed_signal(
                 signal=signal,
                 ref_link=route.ref_link,
@@ -286,14 +525,24 @@ class Router:
             return (text, signal.pair, keyboard)
 
         if msg_type in _LIFECYCLE_LABELS:
+            # Look up the originating signal so we can render the entry,
+            # SL, and TP prices that the update message itself doesn't
+            # carry (image-bot updates often only say "TP1 hit, move
+            # SL to BE" — the actual numbers live in our memory layer
+            # from the original signal post).
+            original_signal = await self._lookup_original_for_lifecycle(
+                msg_type, message, route,
+            )
             text = format_lifecycle_event(
                 label=_LIFECYCLE_LABELS[msg_type],
                 raw_message=message.content,
                 ref_link=route.ref_link,
                 channel_name=route.name,
                 source_type_label=source_label,
+                original_signal=original_signal,
             )
-            return (text, "", None)
+            pair_for_filter = original_signal.pair if original_signal else ""
+            return (text, pair_for_filter, None)
 
         # Unknown / free-form fallback. Forward verbatim only for human-driven channels.
         if route.source_type in _FREEFORM_SOURCE_TYPES:
@@ -309,6 +558,64 @@ class Router:
             "Unrecognized message in non-freeform channel #%s: dropped", route.name,
         )
         return None
+
+    async def _lookup_original_for_lifecycle(
+        self,
+        msg_type: MessageType,
+        message: IncomingMessage,
+        route: ChannelRoute,
+    ):
+        """Find the open signal that this lifecycle event refers to.
+
+        Strategy (cheap to expensive):
+          1. If the lifecycle parser yields a trade_id, exact-match by it.
+          2. Else extract a ticker from the caption and look up by symbol.
+          3. Returns None if memory layer is disabled or no match.
+        """
+        if self._open_signals is None:
+            return None
+
+        content = message.content or ""
+
+        # Strategy 1: trade_id (most reliable when available)
+        trade_id: int | None = None
+        try:
+            if msg_type == MessageType.TP_HIT:
+                trade_id = parse_tp_hit(content).trade_id
+            elif msg_type == MessageType.ALL_TP_HIT:
+                trade_id = parse_all_tp_hit(content).trade_id
+            elif msg_type == MessageType.BREAKEVEN:
+                trade_id = parse_breakeven(content).trade_id
+            elif msg_type == MessageType.STOP_HIT:
+                trade_id = parse_stop_hit(content).trade_id
+            elif msg_type == MessageType.TRADE_CLOSED:
+                trade_id = parse_trade_closed(content).trade_id
+            elif msg_type == MessageType.CANCELED:
+                trade_id = parse_canceled(content).trade_id
+        except UpdateParseError:
+            trade_id = None
+
+        if trade_id is not None:
+            try:
+                hit = await self._open_signals.find_by_trade_id(
+                    channel_id=message.channel_id, trade_id=trade_id,
+                )
+                if hit is not None:
+                    return hit
+            except Exception:
+                logger.exception("open_signals.find_by_trade_id crashed")
+
+        # Strategy 2: ticker from caption
+        ticker = self._extract_pair_or_ticker(content)
+        if not ticker:
+            return None
+        try:
+            return await self._open_signals.find_latest_open(
+                channel_id=message.channel_id, pair_or_base=ticker,
+            )
+        except Exception:
+            logger.exception("open_signals.find_latest_open crashed")
+            return None
 
     async def _record_lifecycle_event(
         self,

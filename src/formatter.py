@@ -316,8 +316,17 @@ def format_lifecycle_event(
     channel_name: str,
     source_type_label: str,
     timestamp: str | None = None,
+    original_signal=None,
 ) -> str:
-    """Format a lifecycle update (TP hit, breakeven, stop hit, etc.)."""
+    """Format a lifecycle update (TP hit, breakeven, stop hit, etc.).
+
+    When ``original_signal`` (an OpenSignal from open_signals_db) is
+    provided, append a "From the original call" block with the entry, SL,
+    and TPs that the update message itself doesn't carry. This is what
+    makes image-bot updates ("WET Update: TP1 here") actually useful on
+    Telegram: the recipient sees the actual TP1 price the user is being
+    told to take profit at.
+    """
     cleaned = discord_to_telegram_html(raw_message.strip())
     if len(cleaned) > 1500:
         cleaned = cleaned[:1500] + "..."
@@ -328,12 +337,63 @@ def format_lifecycle_event(
         f"<i>Source: Potion #{ch}</i>",
         "",
         cleaned,
-        "",
-        f'Trade Now: <a href="{escape(ref_link)}">here</a>',
-        "",
-        f"<i>{timestamp or _utc_now()}</i>",
     ]
+
+    # Original-signal context block (only when the memory layer found a
+    # match in open_signals).
+    if original_signal is not None:
+        ctx = _format_original_signal_block(original_signal)
+        if ctx:
+            lines.append("")
+            lines.append(ctx)
+
+    lines.append("")
+    lines.append(f'Trade Now: <a href="{escape(ref_link)}">here</a>')
+    lines.append("")
+    lines.append(f"<i>{timestamp or _utc_now()}</i>")
     return "\n".join(lines)
+
+
+def _format_original_signal_block(sig) -> str:
+    """Render an OpenSignal as a compact "from the original call" block.
+
+    Lays out only the fields that are populated — image-OCR-extracted
+    rows often miss the SL or one of the TPs, and we'd rather show a
+    short clean block than print 'None' placeholders.
+    """
+    pair = getattr(sig, "pair", None) or ""
+    side = getattr(sig, "side", None) or ""
+    leverage = getattr(sig, "leverage", None)
+    entry = getattr(sig, "entry", None)
+    sl = getattr(sig, "stop_loss", None)
+    tp1 = getattr(sig, "tp1", None)
+    tp2 = getattr(sig, "tp2", None)
+    tp3 = getattr(sig, "tp3", None)
+
+    if not any([pair, side, entry, sl, tp1, tp2, tp3]):
+        return ""
+
+    parts: list[str] = ["<b>From the original call:</b>"]
+    head_bits: list[str] = []
+    if pair:
+        head_bits.append(escape(str(pair)))
+    if side:
+        head_bits.append(escape(str(side)))
+    if leverage:
+        head_bits.append(f"{int(leverage)}x")
+    if head_bits:
+        parts.append("  " + " ".join(head_bits))
+    if entry is not None:
+        parts.append(f"  Entry: {_format_price_for_display(str(entry))}")
+    if sl is not None:
+        parts.append(f"  SL: {_format_price_for_display(str(sl))}")
+    if tp1 is not None:
+        parts.append(f"  TP1: {_format_price_for_display(str(tp1))}")
+    if tp2 is not None:
+        parts.append(f"  TP2: {_format_price_for_display(str(tp2))}")
+    if tp3 is not None:
+        parts.append(f"  TP3: {_format_price_for_display(str(tp3))}")
+    return "\n".join(parts)
 
 
 def format_unknown_message(

@@ -2,6 +2,19 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# System deps:
+#   tesseract-ocr (+ eng language data) — used by src/parser/image_ocr.py to
+#   extract trade fields from image-bot chart cards (Pingu Charts etc.).
+#   libjpeg / zlib are Pillow runtime deps (not strictly required on slim
+#   bookworm but safe to be explicit; preserves Pillow's image-format support).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       tesseract-ocr \
+       tesseract-ocr-eng \
+       libjpeg62-turbo \
+       zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+
 # Layer-cached dependency install
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

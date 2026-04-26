@@ -30,6 +30,12 @@ class IncomingMessage:
     author_name: str
     author_is_bot: bool
     content: str
+    # Image attachment URLs (Discord CDN). Used by the OCR pipeline for
+    # image-bot channels (Pingu Charts etc.) where the actual signal data
+    # lives baked into a chart image rather than the message text. Empty
+    # list when the message has no image attachments. URLs are valid for
+    # ~24h on Discord's CDN, which is plenty for synchronous routing.
+    image_urls: list[str] | None = None
 
 
 def _serialize_embed(embed: discord.Embed) -> str:
@@ -169,7 +175,33 @@ class DiscordListener:
                     _serialize_embed(e) for e in message.embeds if e is not None
                 ]
                 text = "\n\n".join(b for b in embed_blocks if b).strip()
-            if not text:
+
+            # Collect image attachments (chart cards, screenshots). Image-
+            # bot channels like Pingu Charts often post a one-line caption
+            # plus a chart image where all the actual numbers live; the
+            # OCR pipeline downstream can extract them. Filter to URLs that
+            # look like Discord-hosted images by content_type or extension.
+            image_urls: list[str] = []
+            for att in message.attachments or []:
+                ctype = (getattr(att, "content_type", "") or "").lower()
+                url = getattr(att, "url", "") or ""
+                if ctype.startswith("image/") or url.lower().endswith(
+                    (".png", ".jpg", ".jpeg", ".webp")
+                ):
+                    if url:
+                        image_urls.append(url)
+            # Embed images / thumbnails too — some bots send the chart as
+            # an embed image rather than an attachment.
+            for emb in message.embeds or []:
+                emb_img = getattr(emb, "image", None)
+                if emb_img is not None and getattr(emb_img, "url", None):
+                    image_urls.append(str(emb_img.url))
+                emb_thumb = getattr(emb, "thumbnail", None)
+                if emb_thumb is not None and getattr(emb_thumb, "url", None):
+                    image_urls.append(str(emb_thumb.url))
+
+            # If we have neither text nor images, nothing to route.
+            if not text and not image_urls:
                 return
 
             channel_name = getattr(message.channel, "name", "") or str(channel_id)
@@ -179,6 +211,7 @@ class DiscordListener:
                 author_name=getattr(message.author, "display_name", str(message.author)),
                 author_is_bot=bool(getattr(message.author, "bot", False)),
                 content=text,
+                image_urls=image_urls or None,
             )
             logger.debug(
                 "Discord message captured: channel=%s author=%s len=%d",
