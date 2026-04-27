@@ -17,6 +17,7 @@ order.
 from __future__ import annotations
 
 import asyncio
+import os
 import logging
 import signal
 
@@ -231,11 +232,21 @@ async def run(config: Config) -> None:
                     rejoin_url=config.automations.launch_cta_url,
                 )
                 # Onboarding 5-email sequence (Day 0/3/5/7/30).
+                # SAFETY: go_live_at must be set (via ONBOARDING_GO_LIVE_AT_EPOCH
+                # env var) so the cron can't retroactively onboard the
+                # 121k+ historical whop_members roster. Default 0 means
+                # the cron silently no-ops at startup; flip the env var
+                # to NOW (epoch seconds) to begin onboarding for any
+                # member synced AFTER that point.
+                _onboarding_go_live = int(
+                    os.environ.get("ONBOARDING_GO_LIVE_AT_EPOCH", "0") or "0"
+                )
                 onboarding_sequence = OnboardingSequence(
                     whop_members_db=whop_members_db,
                     email_db=email_db,
                     interval_hours=24,
                     rejoin_url=config.automations.launch_cta_url,
+                    go_live_at=_onboarding_go_live,
                 )
                 # Failed-payment dunning (Day 0/3/10) — needs Whop
                 # payment_failed webhook to set dunning_active=1.

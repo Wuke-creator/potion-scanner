@@ -6,12 +6,21 @@ onboarding 'the single biggest lever for subscription retention'.
 
 Daily cron walks ``whop_members`` and for each (day-offset, member) pair
 where:
-  - the member has been seen long enough ago (now - first_seen_at >= N days)
-  - AND they haven't already been emailed for that day-offset
-    (whop_members.onboarding_last_day_sent < N)
+  - first_seen_at >= ``go_live_at`` (HARD safety: never enroll members
+    who joined before onboarding was switched on, otherwise the 121k+
+    existing roster gets flooded with Day-0/3/5 emails on first run)
+  - now - first_seen_at >= N days (member is old enough for that day)
+  - onboarding_last_day_sent < N (we haven't already sent that day)
 ... it enrolls them in the ``onboarding`` sequence via EmailDB.schedule_one
 and bumps ``onboarding_last_day_sent``. The email worker picks up the row,
 renders via templates._onboard_dayN, and sends.
+
+The ``go_live_at`` cutoff is the most important parameter here. Default
+is **disabled** (``go_live_at = 0`` means the cron is a no-op) so an
+unconfigured deploy can never accidentally blast historical members.
+Set ``ONBOARDING_GO_LIVE_AT_EPOCH`` env var (or pass ``go_live_at`` to
+the constructor) to the timestamp from which new members should start
+receiving onboarding emails.
 
 Day 30 is the last "first-month" email; Day 60+ recurs monthly via the
 ``_onboard_monthly`` template (kept dormant in this cron until we decide
@@ -48,24 +57,41 @@ class OnboardingSequence:
         *,
         interval_hours: int = 24,
         rejoin_url: str = "https://whop.com/potion",
+        go_live_at: int = 0,
     ):
+        """``go_live_at`` is the epoch-seconds cutoff: members whose
+        ``first_seen_at < go_live_at`` are NEVER enrolled in onboarding.
+        Default 0 means the cron is a no-op (safe by default).
+        """
         self._members = whop_members_db
         self._email_db = email_db
         self._interval_sec = max(60, interval_hours * 3600)
         self._rejoin_url = rejoin_url
+        self._go_live_at = int(go_live_at)
         self._task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
 
     async def start(self) -> None:
         if self._task is not None:
             return
+        if self._go_live_at <= 0:
+            logger.warning(
+                "OnboardingSequence NOT started: go_live_at is unset. "
+                "Set ONBOARDING_GO_LIVE_AT_EPOCH env var to enable. "
+                "(This guard prevents the 121k+ existing whop_members "
+                "roster from being retroactively blasted with Day 0/3/5 "
+                "onboarding emails on first run.)"
+            )
+            return
         self._stop_event.clear()
         self._task = asyncio.create_task(
             self._run(), name="onboarding_sequence",
         )
         logger.info(
-            "OnboardingSequence started (interval=%dh, days=%s)",
+            "OnboardingSequence started (interval=%dh, days=%s, "
+            "go_live_at=%d)",
             self._interval_sec // 3600, list(ONBOARDING_DAYS),
+            self._go_live_at,
         )
 
     async def stop(self) -> None:
@@ -100,7 +126,18 @@ class OnboardingSequence:
         Idempotent: if the cron runs twice in a window, the second pass
         finds zero eligible members for already-sent days because
         ``onboarding_last_day_sent`` is updated atomically per member.
+
+        Hard guard: members with ``first_seen_at < go_live_at`` are
+        filtered out at the in-Python layer regardless of what the SQL
+        returns, so a stale go_live_at can never accidentally onboard
+        the historical roster.
         """
+        if self._go_live_at <= 0:
+            # Defensive: should never reach here because start() refuses
+            # to spawn the task with an unset cutoff, but if a caller
+            # invokes run_once() directly we still no-op.
+            return {d: 0 for d in ONBOARDING_DAYS}
+
         ts = now if now is not None else int(time.time())
         result: dict[int, int] = {}
 
@@ -114,6 +151,14 @@ class OnboardingSequence:
                     "OnboardingSequence: list_onboarding_due(day=%d) failed", day,
                 )
                 continue
+
+            # Hard cutoff: drop members who joined before go-live. We
+            # do this in Python (not SQL) to keep the SQL surface
+            # narrow and so the cutoff is auditable in code review.
+            due_members = [
+                m for m in due_members
+                if (getattr(m, "first_seen_at", 0) or 0) >= self._go_live_at
+            ]
 
             if not due_members:
                 result[day] = 0

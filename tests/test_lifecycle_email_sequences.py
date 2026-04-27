@@ -140,7 +140,11 @@ async def test_onboarding_schedules_day0_for_brand_new_member(both_dbs):
         email="new@example.com", valid=True,
         membership_id="mem_1", when=now,
     )
-    cron = OnboardingSequence(members, email, interval_hours=24)
+    # go_live_at = now means "everyone synced from this moment onward
+    # is eligible" — the test member qualifies because we just synced them.
+    cron = OnboardingSequence(
+        members, email, interval_hours=24, go_live_at=now,
+    )
     counts = await cron.run_once(now=now)
     assert counts.get(0) == 1  # day 0 scheduled
     # Days > 0 should NOT have fired yet
@@ -157,7 +161,9 @@ async def test_onboarding_dedupes_on_second_run(both_dbs):
         email="a@example.com", valid=True,
         membership_id="m", when=now,
     )
-    cron = OnboardingSequence(members, email, interval_hours=24)
+    cron = OnboardingSequence(
+        members, email, interval_hours=24, go_live_at=now,
+    )
     first = await cron.run_once(now=now)
     second = await cron.run_once(now=now)
     assert first.get(0) == 1
@@ -173,11 +179,69 @@ async def test_onboarding_fires_day3_after_3_days(both_dbs):
         email="3d@example.com", valid=True,
         membership_id="m", when=base,
     )
-    cron = OnboardingSequence(members, email, interval_hours=24)
+    cron = OnboardingSequence(
+        members, email, interval_hours=24, go_live_at=base,
+    )
     counts = await cron.run_once(now=base + 3 * 86400)
     # Both day 0 and day 3 are due (member is 3 days old, never sent any)
     assert counts.get(0) == 1
     assert counts.get(3) == 1
+
+
+@pytest.mark.asyncio
+async def test_onboarding_skips_members_before_go_live(both_dbs):
+    """The hard-safety guard: members with first_seen_at BEFORE
+    go_live_at must never be enrolled, no matter how long they've
+    been in the roster. Protects against blasting the 121k+ existing
+    Potion roster on first onboarding deploy."""
+    members, email = both_dbs
+    now = int(time.time())
+    # Three members:
+    #  - "old"   joined 30 days ago (way before go-live)
+    #  - "edge"  joined exactly at go-live
+    #  - "new"   joined just after go-live
+    go_live = now - 86400        # go-live was 1 day ago
+    old_ts = now - 30 * 86400
+    edge_ts = go_live
+    new_ts = go_live + 3600
+
+    for whop_id, ts, em in (
+        ("u_old", old_ts, "old@example.com"),
+        ("u_edge", edge_ts, "edge@example.com"),
+        ("u_new", new_ts, "new@example.com"),
+    ):
+        await members.upsert_member(
+            whop_user_id=whop_id, discord_user_id="",
+            email=em, valid=True,
+            membership_id="m", when=ts,
+        )
+
+    cron = OnboardingSequence(
+        members, email, interval_hours=24, go_live_at=go_live,
+    )
+    counts = await cron.run_once(now=now)
+    # Day 0 should fire for "edge" + "new" (2 members), NOT for "old"
+    assert counts.get(0) == 2
+
+
+@pytest.mark.asyncio
+async def test_onboarding_unset_go_live_is_a_noop(both_dbs):
+    """With go_live_at=0 (default, unset), even brand-new members
+    don't get enrolled. The cron is a deliberate no-op until the
+    operator flips ONBOARDING_GO_LIVE_AT_EPOCH explicitly."""
+    members, email = both_dbs
+    now = int(time.time())
+    await members.upsert_member(
+        whop_user_id="u_new", discord_user_id="",
+        email="new@example.com", valid=True,
+        membership_id="m", when=now,
+    )
+    cron = OnboardingSequence(
+        members, email, interval_hours=24,  # go_live_at defaults to 0
+    )
+    counts = await cron.run_once(now=now)
+    for d in ONBOARDING_DAYS:
+        assert counts.get(d, 0) == 0
 
 
 # ---------------------------------------------------------------------------
