@@ -101,15 +101,28 @@ class EmailWebhookHandlers:
         whop_webhook_secret: str,
         admin_secret: str,
         rejoin_url_default: str,
+        whop_members_db=None,
     ):
+        """``whop_members_db`` is optional. When provided, the new
+        payment_failed and payment_succeeded webhook receivers can flip
+        the dunning_active flag on the member's row so the
+        DunningSequence cron picks them up. Without it those endpoints
+        return 503 (server didn't start with members-DB wiring)."""
         self._db = db
         self._whop_secret = whop_webhook_secret
         self._admin_secret = admin_secret
         self._default_rejoin = rejoin_url_default
+        self._whop_members_db = whop_members_db
 
     def register(self, app: web.Application) -> None:
         app.router.add_post(
             "/webhook/whop/cancellation", self._whop_cancellation,
+        )
+        app.router.add_post(
+            "/webhook/whop/payment-failed", self._whop_payment_failed,
+        )
+        app.router.add_post(
+            "/webhook/whop/payment-succeeded", self._whop_payment_succeeded,
         )
         app.router.add_post("/webhook/inactivity", self._inactivity)
         app.router.add_post("/admin/email/test", self._admin_test)
@@ -152,6 +165,97 @@ class EmailWebhookHandlers:
         )
         logger.info("Whop cancellation enrolled %s (reason=%s)", email, reason)
         return web.json_response({"ok": True, "sequence": "winback"})
+
+    async def _whop_payment_failed(self, request: web.Request) -> web.Response:
+        """Whop fires this when a member's auto-renewal charge fails.
+
+        Sets dunning_active=1 on the member's whop_members row. The
+        DunningSequence cron picks it up on its next pass and starts the
+        Day 0 / 3 / 10 email sequence.
+        """
+        raw, data = await _read_json(request)
+        sig = request.headers.get("Whop-Signature", "").strip()
+        if not self._whop_secret or not _whop_signature_ok(
+            raw, self._whop_secret, sig,
+        ):
+            logger.warning(
+                "Whop payment_failed webhook rejected: bad signature",
+            )
+            return web.json_response({"error": "bad signature"}, status=401)
+
+        if self._whop_members_db is None:
+            return web.json_response(
+                {"error": "whop_members_db not wired"}, status=503,
+            )
+
+        whop_user_id = self._extract_whop_user_id(data)
+        if not whop_user_id:
+            return web.json_response(
+                {"error": "missing whop_user_id"}, status=400,
+            )
+        try:
+            started = await self._whop_members_db.start_dunning(whop_user_id)
+        except Exception:
+            logger.exception(
+                "payment_failed: start_dunning crashed for %s", whop_user_id,
+            )
+            return web.json_response({"error": "internal"}, status=500)
+        logger.info(
+            "Whop payment_failed: %s dunning_active=%s",
+            whop_user_id, started,
+        )
+        return web.json_response({"ok": True, "started_cycle": started})
+
+    async def _whop_payment_succeeded(self, request: web.Request) -> web.Response:
+        """Whop fires this when a member's payment goes through after a
+        retry (or just normally). If they were in a dunning cycle, end it."""
+        raw, data = await _read_json(request)
+        sig = request.headers.get("Whop-Signature", "").strip()
+        if not self._whop_secret or not _whop_signature_ok(
+            raw, self._whop_secret, sig,
+        ):
+            logger.warning(
+                "Whop payment_succeeded webhook rejected: bad signature",
+            )
+            return web.json_response({"error": "bad signature"}, status=401)
+
+        if self._whop_members_db is None:
+            return web.json_response(
+                {"error": "whop_members_db not wired"}, status=503,
+            )
+
+        whop_user_id = self._extract_whop_user_id(data)
+        if not whop_user_id:
+            return web.json_response(
+                {"error": "missing whop_user_id"}, status=400,
+            )
+        try:
+            await self._whop_members_db.stop_dunning(whop_user_id)
+        except Exception:
+            logger.exception(
+                "payment_succeeded: stop_dunning crashed for %s",
+                whop_user_id,
+            )
+            return web.json_response({"error": "internal"}, status=500)
+        logger.info(
+            "Whop payment_succeeded: %s dunning cleared", whop_user_id,
+        )
+        return web.json_response({"ok": True})
+
+    @staticmethod
+    def _extract_whop_user_id(data: dict) -> str:
+        """Pull the Whop user ID out of the (variable-shape) webhook body."""
+        candidates = (
+            data.get("whop_user_id"),
+            data.get("user_id"),
+            (data.get("user") or {}).get("id"),
+            (data.get("membership") or {}).get("user_id"),
+            (data.get("membership") or {}).get("user", {}).get("id"),
+        )
+        for c in candidates:
+            if c:
+                return str(c)
+        return ""
 
     async def _inactivity(self, request: web.Request) -> web.Response:
         if not self._admin_check(request):

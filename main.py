@@ -28,6 +28,11 @@ from src.automations.cancel_survey_dm import CancelSurveyDM
 from src.automations.channel_feeler import ChannelFeeler
 from src.automations.feature_launch import FeatureLaunchBroadcaster
 from src.automations.inactivity_detector import InactivityDetector
+from src.automations.inactivity_day10 import InactivityDay10Email
+from src.automations.onboarding_sequence import OnboardingSequence
+from src.automations.dunning_sequence import DunningSequence
+from src.automations.pre_renewal_email import PreRenewalEmail
+from src.automations.pre_pause_return_email import PrePauseReturnEmail
 from src.automations.value_reminder import ValueReminder
 from src.automations.whop_email_sync import WhopEmailSync, WhopEmailSyncCron
 from src.automations.whop_members_db import WhopMembersDB
@@ -174,6 +179,7 @@ async def run(config: Config) -> None:
                 whop_webhook_secret=config.email_bot.whop_webhook_secret,
                 admin_secret=config.email_bot.admin_webhook_secret,
                 rejoin_url_default=config.email_bot.rejoin_url,
+                whop_members_db=whop_members_db,
             )
             webhook_handlers.register(verification.callback_server.app)
             logger.info("Email bot enabled (Resend + Whop webhook)")
@@ -181,6 +187,11 @@ async def run(config: Config) -> None:
     # --- Automations crons (optional, controlled by AUTOMATIONS_ENABLED) ---
     launch_broadcaster: FeatureLaunchBroadcaster | None = None
     inactivity_detector: InactivityDetector | None = None
+    inactivity_day10: InactivityDay10Email | None = None
+    onboarding_sequence: OnboardingSequence | None = None
+    dunning_sequence: DunningSequence | None = None
+    pre_renewal_email: PreRenewalEmail | None = None
+    pre_pause_return_email: PrePauseReturnEmail | None = None
     value_reminder: ValueReminder | None = None
     channel_feeler: ChannelFeeler | None = None
     whop_email_sync: WhopEmailSync | None = None
@@ -207,6 +218,57 @@ async def run(config: Config) -> None:
                 whop_members_db=whop_members_db,
                 verification_db=verification.db,
             )
+            # 10-day inactivity (one-shot, distinct from 14-day reengagement).
+            # Sits between the 5-day Concierge ping (Discord, separate)
+            # and the 14-day reengagement series.
+            if whop_members_db is not None:
+                inactivity_day10 = InactivityDay10Email(
+                    activity_db=activity_db,
+                    whop_members_db=whop_members_db,
+                    email_db=email_db,
+                    threshold_days=10,
+                    interval_hours=config.automations.inactivity_detector_interval_hours,
+                    rejoin_url=config.automations.launch_cta_url,
+                )
+                # Onboarding 5-email sequence (Day 0/3/5/7/30).
+                onboarding_sequence = OnboardingSequence(
+                    whop_members_db=whop_members_db,
+                    email_db=email_db,
+                    interval_hours=24,
+                    rejoin_url=config.automations.launch_cta_url,
+                )
+                # Failed-payment dunning (Day 0/3/10) — needs Whop
+                # payment_failed webhook to set dunning_active=1.
+                dunning_sequence = DunningSequence(
+                    whop_members_db=whop_members_db,
+                    email_db=email_db,
+                    interval_hours=24,
+                    rejoin_url=config.automations.launch_cta_url,
+                )
+                # Pre-renewal (3 days before billing). Dormant until
+                # Whop sync starts populating current_period_end.
+                pre_renewal_email = PreRenewalEmail(
+                    whop_members_db=whop_members_db,
+                    email_db=email_db,
+                    days_before=3,
+                    interval_hours=24,
+                    rejoin_url=config.automations.launch_cta_url,
+                )
+                # Pre-pause-return (3 days before pause expires).
+                # Dormant until Whop pause feature is wired.
+                pre_pause_return_email = PrePauseReturnEmail(
+                    whop_members_db=whop_members_db,
+                    email_db=email_db,
+                    days_before=3,
+                    interval_hours=24,
+                    rejoin_url=config.automations.launch_cta_url,
+                )
+            else:
+                logger.info(
+                    "Onboarding/dunning/pre-renewal/pre-pause-return/"
+                    "10-day-inactivity skipped: whop_members_db not "
+                    "available (set WHOP_API_KEY to enable)"
+                )
         else:
             logger.info("Feature 2 (inactivity) skipped: email bot not enabled")
 
@@ -363,6 +425,16 @@ async def run(config: Config) -> None:
         await email_worker.start()
     if inactivity_detector is not None:
         await inactivity_detector.start()
+    if inactivity_day10 is not None:
+        await inactivity_day10.start()
+    if onboarding_sequence is not None:
+        await onboarding_sequence.start()
+    if dunning_sequence is not None:
+        await dunning_sequence.start()
+    if pre_renewal_email is not None:
+        await pre_renewal_email.start()
+    if pre_pause_return_email is not None:
+        await pre_pause_return_email.start()
     if value_reminder is not None:
         await value_reminder.start()
     if channel_feeler is not None:
@@ -415,6 +487,11 @@ async def run(config: Config) -> None:
             (whop_email_sync_cron, "whop_email_sync_cron"),
             (channel_feeler, "channel_feeler"),
             (value_reminder, "value_reminder"),
+            (pre_pause_return_email, "pre_pause_return_email"),
+            (pre_renewal_email, "pre_renewal_email"),
+            (dunning_sequence, "dunning_sequence"),
+            (onboarding_sequence, "onboarding_sequence"),
+            (inactivity_day10, "inactivity_day10"),
             (inactivity_detector, "inactivity_detector"),
         ):
             if cron is not None:

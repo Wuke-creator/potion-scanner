@@ -168,6 +168,28 @@ class EmailDB:
 
     # ---- scheduled_sends ----------------------------------------------
 
+    # Known sequence names. New sequences must be registered here so the
+    # render pipeline knows about them. Add a row to KNOWN_SEQUENCES and a
+    # matching renderer in templates._ONBOARDING_RENDERERS / etc.
+    KNOWN_SEQUENCES = {
+        # Cancellation / churn-prevention
+        "winback",            # 3-email Day 1/4/7 sequence on cancel
+        "reengagement",       # 3-email Day 1/4/7 sequence on inactivity
+        # Lifecycle (new 2026-04-27)
+        "onboarding",         # 5 emails Day 0/3/5/7/30 + monthly digest
+        "dunning",            # 3 emails Day 0/3/10 on payment failure
+        "pre_renewal",        # one-shot 3 days before billing
+        "pre_pause_return",   # one-shot 3 days before pause expiry
+        "inactive_day10",     # one-shot at 10 days of inactivity
+    }
+
+    # Sequences that are mutually exclusive when scheduling — a fresh
+    # winback or reengagement cancels prior pending sends from the SAME
+    # category. Onboarding / dunning / one-shots are independent: a new
+    # member can hit dunning on their first cycle without their onboarding
+    # sequence getting cancelled.
+    _CANCEL_ON_RESCHEDULE = {"winback", "reengagement"}
+
     async def schedule_sequence(
         self,
         email: str,
@@ -177,30 +199,42 @@ class EmailDB:
     ) -> list[int]:
         """Queue the email sequence for a subscriber.
 
-        Cancels any pending sends from prior sequences for the same email
-        so a user who re-cancels after re-joining gets a fresh sequence
-        instead of overlapping delivery.
+        For winback/reengagement: cancels any pending sends from prior
+        sequences for the same email so a user who re-cancels after
+        re-joining gets a fresh sequence instead of overlapping delivery.
+
+        For onboarding/dunning/one-shots: does NOT cancel prior pending
+        sends — they're independent lifecycles that can legitimately
+        overlap (e.g. a member can be in onboarding day 7 AND get a
+        dunning day 0 the same week).
 
         Per-sequence defaults (both simplified to 3 emails 2026-04-18):
           winback: day 1 (soft touch), 4 (offer), 7 (last chance)
-          reengagement: day 1 (miss you), 4 (what you missed + results), 7 (personal touch)
+          reengagement: day 1 (miss you), 4 (what you missed), 7 (personal touch)
+          onboarding: 0 / 3 / 5 / 7 / 30 (5 emails)
+          dunning: 0 / 3 / 10 (3 emails — Day 7 is Discord, out of scope)
 
         Returns the list of inserted send IDs.
         """
         assert self._conn is not None
-        if sequence not in ("winback", "reengagement"):
+        if sequence not in self.KNOWN_SEQUENCES:
             raise ValueError(f"unknown sequence: {sequence!r}")
         if day_offsets is None:
-            # Both sequences now share the 1/4/7 cadence per Drive spec update.
-            day_offsets = (1, 4, 7)
+            day_offsets = self._default_offsets(sequence)
         now = now if now is not None else int(time.time())
 
-        # Cancel any pending sends for this email first
-        await self._conn.execute(
-            "UPDATE scheduled_sends SET status='canceled' "
-            "WHERE email = ? AND status = 'pending'",
-            (email,),
-        )
+        # Cancel-on-reschedule: winback and reengagement are mutually
+        # exclusive churn flows, so enrolling in either one cancels any
+        # pending sends from EITHER. New lifecycle sequences (onboarding,
+        # dunning, etc.) don't touch existing pending sends — a member
+        # can legitimately be in onboarding and dunning concurrently.
+        if sequence in self._CANCEL_ON_RESCHEDULE:
+            await self._conn.execute(
+                "UPDATE scheduled_sends SET status='canceled' "
+                "WHERE email = ? AND status = 'pending' "
+                "  AND sequence IN ('winback', 'reengagement')",
+                (email,),
+            )
 
         send_ids: list[int] = []
         for day in day_offsets:
@@ -215,6 +249,20 @@ class EmailDB:
         await self._conn.commit()
         return send_ids
 
+    @staticmethod
+    def _default_offsets(sequence: str) -> tuple[int, ...]:
+        """Default day offsets per sequence."""
+        if sequence in ("winback", "reengagement"):
+            return (1, 4, 7)
+        if sequence == "onboarding":
+            return (0, 3, 5, 7, 30)
+        if sequence == "dunning":
+            return (0, 3, 10)
+        # One-shot sequences (pre_renewal etc.) get one send at the
+        # caller-specified due_at via schedule_one — schedule_sequence
+        # isn't the right entry point. Default to (0,) defensively.
+        return (0,)
+
     async def schedule_one(
         self,
         email: str,
@@ -222,9 +270,10 @@ class EmailDB:
         day: int,
         due_at: int | None = None,
     ) -> int:
-        """Queue a single send (used by admin test endpoint)."""
+        """Queue a single send (used by admin test endpoint AND by
+        one-shot sequences like pre_renewal / pre_pause_return / inactive_day10)."""
         assert self._conn is not None
-        if sequence not in ("winback", "reengagement"):
+        if sequence not in self.KNOWN_SEQUENCES:
             raise ValueError(f"unknown sequence: {sequence!r}")
         when = due_at if due_at is not None else int(time.time())
         cursor = await self._conn.execute(

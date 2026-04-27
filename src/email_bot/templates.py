@@ -653,6 +653,512 @@ def _reengage_day7(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
 
 
 # ---------------------------------------------------------------------------
+# Onboarding sequence (Day 0/3/5/7/30 + monthly digest)
+# Triggered when whop_email_sync sees a new member; runs against
+# whop_members.first_seen_at offsets.
+# ---------------------------------------------------------------------------
+
+
+def _onboard_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Day 0: welcome + 3 quickstart steps. Fires on first_seen_at."""
+    name = _pretty_name(sub)
+    discord = "https://discord.com/channels/1260259552763580537"
+    telegram_bot = "https://t.me/PotionScannerBot"
+
+    subject = "Welcome to Potion Alpha"
+    text = (
+        f"Hey {name},\n\n"
+        f"Welcome to Potion. Glad you’re here.\n\n"
+        f"Three things to do in the next 5 minutes so you don’t miss "
+        f"the next move:\n\n"
+        f"1. Open Discord and head to #start-here. Read the pinned post.\n"
+        f"2. Set up the Telegram alert bot: {telegram_bot}. /start, then "
+        f"/verify. Calls land in your DMs the second they fire.\n"
+        f"3. Drop into #questions and say hi. The fastest way to learn "
+        f"the room is to ask.\n\n"
+        f"Calls fire at all hours. The Telegram bot is what catches them "
+        f"when you’re not at the screen. Set it up first.\n\n"
+        f"Discord: {discord}\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Welcome to Potion. Glad you’re here.</p>"
+        f"<p><strong>Three things to do in the next 5 minutes so you "
+        f"don’t miss the next move:</strong></p>"
+        f"<ol>"
+        f"<li>Open Discord and head to #start-here. Read the pinned post.</li>"
+        f"<li>Set up the Telegram alert bot: "
+        f"<a href='{escape(telegram_bot)}'>{escape(telegram_bot)}</a>. "
+        f"<code>/start</code>, then <code>/verify</code>. Calls land in "
+        f"your DMs the second they fire.</li>"
+        f"<li>Drop into #questions and say hi. The fastest way to learn "
+        f"the room is to ask.</li>"
+        f"</ol>"
+        f"<p>Calls fire at all hours. The Telegram bot is what catches "
+        f"them when you’re not at the screen. Set it up first.</p>"
+        f"{_cta_button_html('Open Discord', discord)}"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _onboard_day3(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Day 3: how to read an alpha call + protect access (backup payment)."""
+    name = _pretty_name(sub)
+    rejoin = sub.rejoin_url or "https://whop.com/potion"
+    discord = "https://discord.com/channels/1260259552763580537"
+
+    subject = "How to read a Potion call"
+    text = (
+        f"Hey {name},\n\n"
+        f"Quick one. Every Potion call has the same shape:\n\n"
+        f"• Pair (BTC/USDT, ETH/USDT, etc.)\n"
+        f"• Side (LONG / SHORT) and leverage\n"
+        f"• Entry price (where to fill)\n"
+        f"• Stop loss (your pain threshold)\n"
+        f"• TP1, TP2, TP3 (where to take profits, scaled out)\n\n"
+        f"The discipline is in the SL and the TPs, not the entry. Most "
+        f"members who blow up are the ones who skip the SL.\n\n"
+        f"While you’re thinking about it: add a backup payment "
+        f"method to your Whop account. We see members lose access over "
+        f"a single failed card more than anything else.\n\n"
+        f"Manage your Whop: {rejoin}\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Quick one. Every Potion call has the same shape:</p>"
+        f"<ul>"
+        f"<li><strong>Pair</strong> (BTC/USDT, ETH/USDT, etc.)</li>"
+        f"<li><strong>Side</strong> (LONG / SHORT) and <strong>leverage</strong></li>"
+        f"<li><strong>Entry price</strong> (where to fill)</li>"
+        f"<li><strong>Stop loss</strong> (your pain threshold)</li>"
+        f"<li><strong>TP1, TP2, TP3</strong> (where to take profits, scaled out)</li>"
+        f"</ul>"
+        f"<p>The discipline is in the SL and the TPs, not the entry. "
+        f"Most members who blow up are the ones who skip the SL.</p>"
+        f"<p>While you’re thinking about it: <strong>add a backup "
+        f"payment method to your Whop account.</strong> We see members "
+        f"lose access over a single failed card more than anything else.</p>"
+        f"{_cta_button_html('Open Discord', discord)}"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _onboard_day5(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Day 5: real win callout. Pulls top recent call from analytics."""
+    name = _pretty_name(sub)
+    discord = "https://discord.com/channels/1260259552763580537"
+
+    top_pair = (
+        getattr(stats, "top_pair_7d", None) or "ETH/USDT"
+    )
+    top_pct = getattr(stats, "top_pct_7d", None) or 89
+
+    subject = f"+{top_pct}% on {top_pair}, in case you missed it"
+    text = (
+        f"Hey {name},\n\n"
+        f"This week’s headline call: {top_pair} closed at +{top_pct}%.\n\n"
+        f"Not a fluke. The community was in the room when it fired. The "
+        f"Telegram bot pinged subscribers within seconds. The members "
+        f"who scaled out at TP1 took 30%+ profit and let runners ride.\n\n"
+        f"You can see the full play in the calls channel. Every TP hit, "
+        f"every breakeven move, every closeout. We don’t hide losers "
+        f"either — the track-record channel shows the full history.\n\n"
+        f"Open Discord: {discord}\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>This week’s headline call: <strong>{escape(str(top_pair))} "
+        f"closed at +{top_pct}%.</strong></p>"
+        f"<p>Not a fluke. The community was in the room when it fired. "
+        f"The Telegram bot pinged subscribers within seconds. The members "
+        f"who scaled out at TP1 took 30%+ profit and let runners ride.</p>"
+        f"<p>You can see the full play in the calls channel. Every TP "
+        f"hit, every breakeven move, every closeout. We don’t hide "
+        f"losers either — the track-record channel shows the full "
+        f"history.</p>"
+        f"{_cta_button_html('See it in Discord', discord)}"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _onboard_day7(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Day 7: first-week recap + keep-going / trial nudge."""
+    name = _pretty_name(sub)
+    discord = "https://discord.com/channels/1260259552763580537"
+    rejoin = sub.rejoin_url or "https://whop.com/potion"
+
+    calls_7d = getattr(stats, "calls_7d_total", None) or 22
+    wins_7d = getattr(stats, "wins_7d_over_50pct", None) or 5
+
+    subject = "Your first week in Potion"
+    text = (
+        f"Hey {name},\n\n"
+        f"Week 1 wrap. Here’s what fired across Potion in the seven "
+        f"days you’ve been here:\n\n"
+        f"• {calls_7d} structured calls\n"
+        f"• {wins_7d} closed at +50% or better\n"
+        f"• Daily morning brief, daily VC, weekly Mac sessions\n\n"
+        f"If you’ve been listening from the sidelines, this is the "
+        f"week to start engaging. Drop into a VC. Reply to a call. Use "
+        f"#questions when you’re unsure. The members who participate "
+        f"in week 1 are the ones still here at month 6.\n\n"
+        f"Open Discord: {discord}\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Week 1 wrap. Here’s what fired across Potion in the "
+        f"seven days you’ve been here:</p>"
+        f"<ul>"
+        f"<li>{calls_7d} structured calls</li>"
+        f"<li>{wins_7d} closed at +50% or better</li>"
+        f"<li>Daily morning brief, daily VC, weekly Mac sessions</li>"
+        f"</ul>"
+        f"<p>If you’ve been listening from the sidelines, "
+        f"<strong>this is the week to start engaging.</strong> Drop into "
+        f"a VC. Reply to a call. Use #questions when you’re unsure. "
+        f"The members who participate in week 1 are the ones still here "
+        f"at month 6.</p>"
+        f"{_cta_button_html('Open Discord', discord)}"
+        f"<p style='color:#666;font-size:14px;'>Manage your Whop: "
+        f"<a href='{escape(rejoin)}'>{escape(rejoin)}</a></p>"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _onboard_day30(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Day 30: month-in-Potion personal digest + renew/upgrade nudge."""
+    name = _pretty_name(sub)
+    rejoin = sub.rejoin_url or "https://whop.com/potion"
+
+    calls_30d = getattr(stats, "calls_30d_total", None) or 92
+    wins_30d = getattr(stats, "wins_30d_over_50pct", None) or 18
+    top_pair = getattr(stats, "top_pair_30d", None) or "ETH/USDT"
+    top_pct = getattr(stats, "top_pnl_pct_30d", None) or 142
+
+    subject = "Your month in Potion"
+    text = (
+        f"Hey {name},\n\n"
+        f"Thirty days in. Here’s the recap:\n\n"
+        f"• {calls_30d} structured calls\n"
+        f"• {wins_30d} closed at +50%+\n"
+        f"• Top call: +{top_pct}% on {top_pair}\n\n"
+        f"Members who renew at month 1 stick around 6+ months on average. "
+        f"The hard part of joining a new community — figuring out the "
+        f"format, building habits — is behind you. From here it "
+        f"compounds.\n\n"
+        f"If you’re thinking about going annual, the math is "
+        f"straightforward: 12 months billed annually saves a meaningful "
+        f"chunk vs. monthly. The link below shows current pricing.\n\n"
+        f"Manage your Whop: {rejoin}\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Thirty days in. Here’s the recap:</p>"
+        f"<ul>"
+        f"<li>{calls_30d} structured calls</li>"
+        f"<li>{wins_30d} closed at +50%+</li>"
+        f"<li>Top call: <strong>+{top_pct}% on {escape(str(top_pair))}</strong></li>"
+        f"</ul>"
+        f"<p>Members who renew at month 1 stick around 6+ months on "
+        f"average. The hard part of joining a new community — "
+        f"figuring out the format, building habits — is behind "
+        f"you. From here it compounds.</p>"
+        f"<p>If you’re thinking about going annual, the math is "
+        f"straightforward: 12 months billed annually saves a meaningful "
+        f"chunk vs. monthly. The link below shows current pricing.</p>"
+        f"{_cta_button_html('Manage your Whop', rejoin)}"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _onboard_monthly(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Monthly digest (Day 60+, recurring): top calls + community pulse.
+
+    Sent on Day 60, 90, 120, ... at 30-day intervals after the Day-30
+    onboarding email. Same content as a generic newsletter, personalised
+    only by name.
+    """
+    name = _pretty_name(sub)
+    discord = "https://discord.com/channels/1260259552763580537"
+
+    top_pair = getattr(stats, "top_pair_30d", None) or "ETH/USDT"
+    top_pct = getattr(stats, "top_pnl_pct_30d", None) or 142
+    calls_30d = getattr(stats, "calls_30d_total", None) or 90
+    wins_30d = getattr(stats, "wins_30d_over_50pct", None) or 17
+
+    subject = "What Potion caught this month"
+    text = (
+        f"Hey {name},\n\n"
+        f"Last 30 days at a glance:\n\n"
+        f"• {calls_30d} structured calls\n"
+        f"• {wins_30d} closed at +50%+\n"
+        f"• Top call: +{top_pct}% on {top_pair}\n\n"
+        f"Drop into Discord if you haven’t in a while. Voice chats "
+        f"run daily. Mac’s weekly is on Sunday.\n\n"
+        f"Open Discord: {discord}\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Last 30 days at a glance:</p>"
+        f"<ul>"
+        f"<li>{calls_30d} structured calls</li>"
+        f"<li>{wins_30d} closed at +50%+</li>"
+        f"<li>Top call: <strong>+{top_pct}% on {escape(str(top_pair))}</strong></li>"
+        f"</ul>"
+        f"<p>Drop into Discord if you haven’t in a while. Voice "
+        f"chats run daily. Mac’s weekly is on Sunday.</p>"
+        f"{_cta_button_html('Open Discord', discord)}"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+# ---------------------------------------------------------------------------
+# Dunning sequence (failed payment) — Day 0 / 3 / 10
+# Day 7 in the spec is a Discord Concierge ping (not email), out of scope.
+# ---------------------------------------------------------------------------
+
+
+def _dunning_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Day 0: payment didn’t go through. Heads-up, retry within 3 days."""
+    name = _pretty_name(sub)
+    rejoin = sub.rejoin_url or "https://whop.com/potion"
+
+    subject = "Your Potion payment didn’t go through"
+    text = (
+        f"Hey {name},\n\n"
+        f"Heads-up: this month’s Potion payment failed to process. "
+        f"This is usually one of three things:\n\n"
+        f"• Card expired\n"
+        f"• Insufficient funds at the moment\n"
+        f"• Bank flagged the charge as suspicious\n\n"
+        f"Whop will retry the charge automatically over the next 3 days. "
+        f"If you want to skip the wait and keep access uninterrupted, "
+        f"update your payment method now.\n\n"
+        f"Update payment: {rejoin}\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p><strong>Heads-up: this month’s Potion payment failed "
+        f"to process.</strong> This is usually one of three things:</p>"
+        f"<ul>"
+        f"<li>Card expired</li>"
+        f"<li>Insufficient funds at the moment</li>"
+        f"<li>Bank flagged the charge as suspicious</li>"
+        f"</ul>"
+        f"<p>Whop will retry the charge automatically over the next 3 "
+        f"days. If you want to skip the wait and keep access "
+        f"uninterrupted, update your payment method now.</p>"
+        f"{_cta_button_html('Update payment', rejoin)}"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _dunning_day3(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Day 3: access will be paused soon. Increase urgency without panic."""
+    name = _pretty_name(sub)
+    rejoin = sub.rejoin_url or "https://whop.com/potion"
+
+    subject = "Your Potion access will pause in a few days"
+    text = (
+        f"Hey {name},\n\n"
+        f"Quick reminder: your payment from a few days ago is still "
+        f"pending. Whop’s been retrying but hasn’t been able to "
+        f"complete the charge.\n\n"
+        f"If we can’t get a successful charge through in the next "
+        f"few days, your Elite role will be removed and you’ll lose "
+        f"access to the calls channel and the Telegram alert bot. We "
+        f"don’t want that and we don’t think you do either.\n\n"
+        f"It takes 60 seconds to update your payment method:\n\n"
+        f"Update payment: {rejoin}\n\n"
+        f"Already done? Ignore this. The retry will succeed on the next "
+        f"attempt.\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Quick reminder: your payment from a few days ago is still "
+        f"pending. Whop’s been retrying but hasn’t been able to "
+        f"complete the charge.</p>"
+        f"<p><strong>If we can’t get a successful charge through in "
+        f"the next few days, your Elite role will be removed</strong> and "
+        f"you’ll lose access to the calls channel and the Telegram "
+        f"alert bot. We don’t want that and we don’t think you "
+        f"do either.</p>"
+        f"<p>It takes 60 seconds to update your payment method.</p>"
+        f"{_cta_button_html('Update payment', rejoin)}"
+        f"<p style='color:#666;font-size:14px;'>Already done? Ignore "
+        f"this. The retry will succeed on the next attempt.</p>"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _dunning_day10(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Day 10: access paused, reactivation link, last save attempt."""
+    name = _pretty_name(sub)
+    rejoin = sub.rejoin_url or "https://whop.com/potion"
+
+    subject = "Your Potion access has been paused"
+    text = (
+        f"Hey {name},\n\n"
+        f"After 10 days of failed retries we’ve paused your Potion "
+        f"access. Your Elite role has been removed and Telegram alerts "
+        f"have stopped.\n\n"
+        f"Reactivating takes one click. Update the payment method on "
+        f"your Whop account and your Elite role comes back automatically. "
+        f"No new signup, no friction — your settings, your "
+        f"Concierge thread, everything is still there.\n\n"
+        f"Reactivate: {rejoin}\n\n"
+        f"If you’re leaving for another reason, reply to this email "
+        f"and tell us why. We read every reply.\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p><strong>After 10 days of failed retries we’ve paused "
+        f"your Potion access.</strong> Your Elite role has been removed "
+        f"and Telegram alerts have stopped.</p>"
+        f"<p>Reactivating takes one click. Update the payment method on "
+        f"your Whop account and your Elite role comes back automatically. "
+        f"No new signup, no friction — your settings, your "
+        f"Concierge thread, everything is still there.</p>"
+        f"{_cta_button_html('Reactivate', rejoin)}"
+        f"<p style='color:#666;font-size:14px;'>If you’re leaving "
+        f"for another reason, reply to this email and tell us why. We "
+        f"read every reply.</p>"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+# ---------------------------------------------------------------------------
+# One-shot lifecycle emails
+# ---------------------------------------------------------------------------
+
+
+def _pre_renewal(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Fired 3 days before billing. 'Here’s what you caught this month.'"""
+    name = _pretty_name(sub)
+    rejoin = sub.rejoin_url or "https://whop.com/potion"
+
+    calls_30d = getattr(stats, "calls_30d_total", None) or 90
+    wins_30d = getattr(stats, "wins_30d_over_50pct", None) or 17
+    top_pair = getattr(stats, "top_pair_30d", None) or "ETH/USDT"
+    top_pct = getattr(stats, "top_pnl_pct_30d", None) or 142
+
+    subject = "Your Potion renews in 3 days"
+    text = (
+        f"Hey {name},\n\n"
+        f"Quick check-in. Your Elite renews in 3 days. Here’s what "
+        f"you got for the last cycle:\n\n"
+        f"• {calls_30d} structured calls\n"
+        f"• {wins_30d} closed at +50%+\n"
+        f"• Top call: +{top_pct}% on {top_pair}\n\n"
+        f"Plus the daily VCs, weekly Mac sessions, the Telegram alert "
+        f"bot, and the Concierge thread.\n\n"
+        f"Nothing to do here — renewal is automatic. This is just "
+        f"a heads-up so you know what’s coming and what to expect.\n\n"
+        f"Manage your Whop: {rejoin}\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Quick check-in. Your Elite renews in 3 days. Here’s "
+        f"what you got for the last cycle:</p>"
+        f"<ul>"
+        f"<li>{calls_30d} structured calls</li>"
+        f"<li>{wins_30d} closed at +50%+</li>"
+        f"<li>Top call: <strong>+{top_pct}% on {escape(str(top_pair))}</strong></li>"
+        f"</ul>"
+        f"<p>Plus the daily VCs, weekly Mac sessions, the Telegram alert "
+        f"bot, and the Concierge thread.</p>"
+        f"<p>Nothing to do here — renewal is automatic. This is "
+        f"just a heads-up so you know what’s coming and what to "
+        f"expect.</p>"
+        f"{_cta_button_html('Manage your Whop', rejoin)}"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _pre_pause_return(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Fired 3 days before a paused membership reactivates.
+
+    Pause feature isn’t built yet (Whop config + role flow needed),
+    so this template is dormant until that lands. When it lands, the
+    cron schedules this 3 days before pause expiry.
+    """
+    name = _pretty_name(sub)
+    rejoin = sub.rejoin_url or "https://whop.com/potion"
+
+    top_pair = getattr(stats, "top_pair_30d", None) or "ETH/USDT"
+    top_pct = getattr(stats, "top_pnl_pct_30d", None) or 142
+
+    subject = "Welcome back — here’s what you missed"
+    text = (
+        f"Hey {name},\n\n"
+        f"Your Potion pause ends in 3 days. Elite access comes back "
+        f"automatically — no action needed.\n\n"
+        f"While you were away the headline call was +{top_pct}% on "
+        f"{top_pair}. Plus a stack of smaller wins and a couple of the "
+        f"Mac sessions you usually catch.\n\n"
+        f"If you want to extend the pause, you can do that from your "
+        f"Whop. Otherwise, see you back inside.\n\n"
+        f"Manage your Whop: {rejoin}\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Your Potion pause ends in 3 days. Elite access comes back "
+        f"automatically — no action needed.</p>"
+        f"<p>While you were away the headline call was "
+        f"<strong>+{top_pct}% on {escape(str(top_pair))}</strong>. Plus "
+        f"a stack of smaller wins and a couple of the Mac sessions you "
+        f"usually catch.</p>"
+        f"<p>If you want to extend the pause, you can do that from your "
+        f"Whop. Otherwise, see you back inside.</p>"
+        f"{_cta_button_html('Manage your Whop', rejoin)}"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _inactive_day10(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """10-day inactivity email. Distinct from the 14-day reengagement
+    series so we can fire both without double-counting (each tracks its
+    own dedupe row in the inactivity DB)."""
+    name = _pretty_name(sub)
+    discord = "https://discord.com/channels/1260259552763580537"
+
+    top_pair = getattr(stats, "top_pair_7d", None) or "ETH/USDT"
+    top_pct = getattr(stats, "top_pct_7d", None) or 89
+
+    subject = "We noticed you’ve been quiet"
+    text = (
+        f"Hey {name},\n\n"
+        f"Haven’t seen you in Discord for 10 days. No pressure — "
+        f"life happens. Just dropping in with a quick week-in-review so "
+        f"you can catch up:\n\n"
+        f"• Headline call: +{top_pct}% on {top_pair}\n"
+        f"• The Telegram alert bot has been firing through the week\n"
+        f"• Daily morning brief and weekly Mac session both ran on "
+        f"schedule\n\n"
+        f"If something’s blocking you from engaging — the "
+        f"format, missed setups, anything — reply to this email "
+        f"and tell us. We read every reply.\n\n"
+        f"Open Discord: {discord}\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Haven’t seen you in Discord for 10 days. No pressure "
+        f"— life happens. Just dropping in with a quick week-in-"
+        f"review so you can catch up:</p>"
+        f"<ul>"
+        f"<li>Headline call: <strong>+{top_pct}% on {escape(str(top_pair))}</strong></li>"
+        f"<li>The Telegram alert bot has been firing through the week</li>"
+        f"<li>Daily morning brief and weekly Mac session both ran on schedule</li>"
+        f"</ul>"
+        f"<p>If something’s blocking you from engaging — the "
+        f"format, missed setups, anything — reply to this email "
+        f"and tell us. We read every reply.</p>"
+        f"{_cta_button_html('Open Discord', discord)}"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+# ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
 
@@ -680,6 +1186,34 @@ _REENGAGE_RENDERERS = {
     7: _reengage_day7,
 }
 
+_ONBOARDING_RENDERERS = {
+    0: _onboard_day0,
+    3: _onboard_day3,
+    5: _onboard_day5,
+    7: _onboard_day7,
+    30: _onboard_day30,
+    60: _onboard_monthly,
+    90: _onboard_monthly,
+    120: _onboard_monthly,
+    150: _onboard_monthly,
+    180: _onboard_monthly,
+    # Beyond Day 180 we keep returning the monthly digest. The cron is
+    # responsible for not over-scheduling; this mapping just guarantees
+    # any (sequence='onboarding', day=N>=60) renders cleanly.
+}
+
+_DUNNING_RENDERERS = {
+    0: _dunning_day0,
+    3: _dunning_day3,
+    10: _dunning_day10,
+}
+
+_ONESHOT_RENDERERS = {
+    "pre_renewal": _pre_renewal,
+    "pre_pause_return": _pre_pause_return,
+    "inactive_day10": _inactive_day10,
+}
+
 
 def render(
     sequence: str, day: int, subscriber: Subscriber, stats: StatsBundle,
@@ -689,6 +1223,17 @@ def render(
         renderer = _WINBACK_RENDERERS.get(day)
     elif sequence == "reengagement":
         renderer = _REENGAGE_RENDERERS.get(day)
+    elif sequence == "onboarding":
+        renderer = _ONBOARDING_RENDERERS.get(day)
+        # Day > 60 falls back to the monthly digest so a recurring
+        # cadence beyond what the table explicitly covers still renders.
+        if renderer is None and day >= 60:
+            renderer = _onboard_monthly
+    elif sequence == "dunning":
+        renderer = _DUNNING_RENDERERS.get(day)
+    elif sequence in _ONESHOT_RENDERERS:
+        # One-shot sequences ignore `day` (always one email per trigger).
+        renderer = lambda s, st, _r=_ONESHOT_RENDERERS[sequence]: _r(s, st)  # noqa: E731
     else:
         raise ValueError(f"unknown sequence: {sequence!r}")
     if renderer is None:
