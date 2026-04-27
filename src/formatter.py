@@ -369,6 +369,12 @@ def format_lifecycle_event(
     makes image-bot updates ("WET Update: TP1 here") actually useful on
     Telegram: the recipient sees the actual TP1 price the user is being
     told to take profit at.
+
+    The "Trade Now" link gets per-pair Ostium deeplink treatment when
+    the channel's ref_link points at app.ostium.com AND we have a pair
+    (from original_signal or extracted from the raw caption). Mirrors
+    the deeplink behaviour of the new-signal Trade-now button so a TP1
+    update for WET opens the WET market directly with one tap.
     """
     cleaned = discord_to_telegram_html(raw_message.strip())
     if len(cleaned) > 1500:
@@ -384,21 +390,66 @@ def format_lifecycle_event(
 
     # Original-signal context block (only when the memory layer found a
     # match in open_signals).
+    pair_for_link = ""
     if original_signal is not None:
+        pair_for_link = getattr(original_signal, "pair", "") or ""
         ctx = _format_original_signal_block(original_signal)
         if ctx:
             lines.append("")
             lines.append(ctx)
 
+    # Build the Trade-Now URL. Per-pair Ostium deeplink when the ref link
+    # points at Ostium AND we have a pair to deeplink to. Otherwise use
+    # the channel's bare ref link unchanged.
+    trade_url = ref_link
+    if ref_link and "app.ostium.com" in ref_link.lower():
+        # Try the original signal's pair first; fall back to extracting
+        # a ticker from the raw message caption (handles "WET Update:
+        # TP1 here" style posts where there's no memory hit).
+        pair_candidate = pair_for_link or _extract_pair_from_caption(raw_message)
+        if pair_candidate:
+            trade_url = _build_ostium_trade_url(ref_link, pair_candidate)
+
     lines.append("")
-    lines.append(f'Trade Now: <a href="{escape(ref_link)}">here</a>')
+    lines.append(f'Trade Now: <a href="{escape(trade_url)}">here</a>')
     lines.append("")
     lines.append(f"<i>{timestamp or _utc_now()}</i>")
     return "\n".join(lines)
 
 
+# Pair-extraction regex for lifecycle captions. Pulls a 2-10 char ticker
+# that sits next to a lifecycle keyword (Update / TP\d / SL / Hit / etc.).
+# Permissive on purpose: a false hit just means we OCR'd a non-ticker and
+# the Ostium deeplink falls back to the bare ref URL when the URL builder
+# can't find a sensible base.
+_LIFECYCLE_TICKER_RE = re.compile(
+    r"\b([A-Z][A-Z0-9]{1,9})\b(?=\s*(?:UPDATE|UPDATES|TP\d|SL|STOP|HIT|MOVE|BE|BREAKEVEN))",
+    re.IGNORECASE,
+)
+
+
+def _extract_pair_from_caption(text: str) -> str:
+    """Best-effort ticker extraction from a lifecycle caption.
+
+    Returns an empty string when no candidate is found. Returns just the
+    base ticker (uppercased), not a full pair — the Ostium deeplink
+    builder takes either form.
+    """
+    if not text:
+        return ""
+    # Try "PAIR: WET/USDT" structured form first.
+    m = re.search(r"PAIR\s*[:#]?\s*(\S+/\S+)", text, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    m = _LIFECYCLE_TICKER_RE.search(text)
+    return m.group(1).upper() if m else ""
+
+
 def _format_original_signal_block(sig) -> str:
-    """Render an OpenSignal as a compact "from the original call" block.
+    """Render an OpenSignal as an "original call" block in the same visual
+    style as ``format_parsed_signal``: emoji bullets per row + ``<code>``
+    tags around every numeric value so users can tap-and-hold to copy the
+    exact entry / SL / TP price.
 
     Lays out only the fields that are populated — image-OCR-extracted
     rows often miss the SL or one of the TPs, and we'd rather show a
@@ -416,26 +467,52 @@ def _format_original_signal_block(sig) -> str:
     if not any([pair, side, entry, sl, tp1, tp2, tp3]):
         return ""
 
+    direction_icon = (
+        "\U0001f4c8" if str(side).upper() == "LONG"
+        else "\U0001f4c9" if str(side).upper() == "SHORT"
+        else "\U0001f4ca"
+    )
+
     parts: list[str] = ["<b>From the original call:</b>"]
-    head_bits: list[str] = []
     if pair:
-        head_bits.append(escape(str(pair)))
+        parts.append(f"\U0001f4b1 Pair: <b>{escape(str(pair))}</b>")
     if side:
-        head_bits.append(escape(str(side)))
+        parts.append(f"{direction_icon} Direction: <b>{escape(str(side))}</b>")
     if leverage:
-        head_bits.append(f"{int(leverage)}x")
-    if head_bits:
-        parts.append("  " + " ".join(head_bits))
+        parts.append(f"\U0001f4ca Leverage: <code>{int(leverage)}</code>x")
+    # Insert blank-row separator if we just rendered the head block AND
+    # have at least one numeric field below.
+    head_rendered = any([pair, side, leverage])
+    body_rendered = any([entry is not None, sl is not None,
+                         tp1 is not None, tp2 is not None, tp3 is not None])
+    if head_rendered and body_rendered:
+        parts.append("")
     if entry is not None:
-        parts.append(f"  Entry: {_format_price_for_display(str(entry))}")
+        parts.append(
+            f"\U0001f3af Entry: <code>{_format_price_for_display(str(entry))}</code>"
+        )
     if sl is not None:
-        parts.append(f"  SL: {_format_price_for_display(str(sl))}")
-    if tp1 is not None:
-        parts.append(f"  TP1: {_format_price_for_display(str(tp1))}")
-    if tp2 is not None:
-        parts.append(f"  TP2: {_format_price_for_display(str(tp2))}")
-    if tp3 is not None:
-        parts.append(f"  TP3: {_format_price_for_display(str(tp3))}")
+        parts.append(
+            f"\U0001f6e1️ Stop: <code>{_format_price_for_display(str(sl))}</code>"
+        )
+    has_tps = any(tp is not None for tp in (tp1, tp2, tp3))
+    if has_tps:
+        # Blank line before the targets section to mirror format_parsed_signal.
+        if entry is not None or sl is not None:
+            parts.append("")
+        parts.append("\U0001f48e Targets:")
+        if tp1 is not None:
+            parts.append(
+                f"TP1: <code>{_format_price_for_display(str(tp1))}</code>"
+            )
+        if tp2 is not None:
+            parts.append(
+                f"TP2: <code>{_format_price_for_display(str(tp2))}</code>"
+            )
+        if tp3 is not None:
+            parts.append(
+                f"TP3: <code>{_format_price_for_display(str(tp3))}</code>"
+            )
     return "\n".join(parts)
 
 
