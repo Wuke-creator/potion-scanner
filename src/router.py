@@ -476,11 +476,22 @@ class Router:
         """
         if not content:
             return True
-        # Strip Discord syntax that conveys no information.
-        cleaned = re.sub(r"<@&\d+>", "", content)
-        cleaned = re.sub(r"<@!?\d+>", "", cleaned)
-        cleaned = re.sub(r"<#\d+>", "", cleaned)
-        cleaned = re.sub(r"<a?:[A-Za-z0-9_]+:\d+>", "", cleaned)
+        # Strip Discord syntax that conveys no information. We match
+        # BOTH the unescaped form (``<@&123>``) and the html-entity-
+        # escaped form (``&lt;@&amp;123&gt;``) because content that
+        # flowed through Discord embed serialisation has been escaped
+        # by ``_serialize_embed``. Without the escaped-form match those
+        # mentions survive here, the regex sees digits remaining,
+        # decides 'this isn't a pointer', and forwards a garbage
+        # alert to Telegram.
+        cleaned = re.sub(r"<@&\d+>|&lt;@&amp;\d+&gt;", "", content)
+        cleaned = re.sub(r"<@!?\d+>|&lt;@!?\d+&gt;", "", cleaned)
+        cleaned = re.sub(r"<#\d+>|&lt;#\d+&gt;", "", cleaned)
+        cleaned = re.sub(
+            r"<a?:[A-Za-z0-9_]+:\d+>|&lt;a?:[A-Za-z0-9_]+:\d+&gt;",
+            "",
+            cleaned,
+        )
         # Strip Discord message URLs (the "see signal in other channel"
         # pointer) — they're cosmetically a link but carry no parseable
         # signal fields.

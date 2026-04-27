@@ -14,9 +14,43 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 from dataclasses import dataclass
 
 import discord
+
+
+# Discord-only syntax that has no meaning on Telegram. We strip these
+# from embed text BEFORE html.escape() runs, otherwise the escaping
+# turns ``<@&12345>`` into ``&lt;@&amp;12345&gt;`` and downstream
+# regexes (router._is_empty_signal_pointer, formatter.discord_to_telegram_html)
+# can no longer match the unescaped form. The result of failing to
+# strip here is the raw role mention leaking all the way into the
+# Telegram message body where parse_mode=HTML re-renders it as
+# ``<@&12345>`` again — visible noise.
+_EMBED_ROLE_MENTION_RE = re.compile(r"<@&\d+>")
+_EMBED_USER_MENTION_RE = re.compile(r"<@!?\d+>")
+_EMBED_CHANNEL_MENTION_RE = re.compile(r"<#\d+>")
+_EMBED_CUSTOM_EMOJI_RE = re.compile(r"<a?:([A-Za-z0-9_]+):\d+>")
+
+
+def _clean_discord_syntax(text: str) -> str:
+    """Strip Discord mention/emoji syntax from raw embed text.
+
+    Runs before html.escape() so the cleaned output flows through the
+    normal escape pipeline without the angle-bracket-wrapped Discord
+    constructs being immortalised as HTML entities.
+    """
+    if not text:
+        return ""
+    text = _EMBED_ROLE_MENTION_RE.sub("", text)
+    text = _EMBED_USER_MENTION_RE.sub("", text)
+    text = _EMBED_CHANNEL_MENTION_RE.sub("", text)
+    text = _EMBED_CUSTOM_EMOJI_RE.sub(r":\1:", text)
+    # Collapse the extra whitespace the strips leave behind.
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 logger = logging.getLogger(__name__)
 
@@ -79,23 +113,46 @@ def _serialize_embed(embed: discord.Embed) -> str:
 
     Captures: author, title, description, fields (name/value pairs), footer,
     url. Skips thumbnails and images (Telegram DM can't easily inline them).
+
+    CRITICAL: Discord mention syntax (``<@&id>``, ``<@id>``, ``<#id>``,
+    ``<:emoji:id>``) is stripped from each text component BEFORE
+    html.escape() runs. Without this pre-strip the escape pipeline
+    produces ``&lt;@&amp;id&gt;`` which:
+      a) is no longer matched by the downstream router regex that drops
+         pointer-only signal alerts, and
+      b) gets re-rendered back to ``<@&id>`` by Telegram's HTML parse
+         mode when the message is finally delivered.
+    Net effect of the bug was Discord role pings leaking visibly into
+    every embed-based forwarded signal. Strip-then-escape closes it.
     """
     parts: list[str] = []
     if embed.author and embed.author.name:
-        parts.append(html.escape(str(embed.author.name)))
+        parts.append(html.escape(_clean_discord_syntax(str(embed.author.name))))
     if embed.title:
-        parts.append(f"<b>{html.escape(str(embed.title))}</b>")
+        parts.append(
+            f"<b>{html.escape(_clean_discord_syntax(str(embed.title)))}</b>"
+        )
     if embed.description:
-        parts.append(html.escape(str(embed.description)))
+        parts.append(
+            html.escape(_clean_discord_syntax(str(embed.description)))
+        )
     for field in embed.fields or []:
-        fname = html.escape(str(field.name)) if field.name else ""
-        fval = html.escape(str(field.value)) if field.value else ""
+        fname = (
+            html.escape(_clean_discord_syntax(str(field.name)))
+            if field.name else ""
+        )
+        fval = (
+            html.escape(_clean_discord_syntax(str(field.value)))
+            if field.value else ""
+        )
         if fname and fval:
             parts.append(f"<b>{fname}:</b> {fval}")
         elif fval:
             parts.append(fval)
     if embed.footer and embed.footer.text:
-        parts.append(f"<i>{html.escape(str(embed.footer.text))}</i>")
+        parts.append(
+            f"<i>{html.escape(_clean_discord_syntax(str(embed.footer.text)))}</i>"
+        )
     if embed.url:
         parts.append(html.escape(str(embed.url)))
     return "\n".join(p for p in parts if p)

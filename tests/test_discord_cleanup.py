@@ -147,3 +147,84 @@ def test_header_only_treated_as_empty():
 def test_pointer_with_only_role_mention():
     raw = "<@&12345>\nTrading Signal Alert"
     assert Router._is_empty_signal_pointer(raw) is True
+
+
+# ---------------------------------------------------------------------------
+# Regression: HTML-escaped mentions from embed serialisation must drop
+# Bug found 2026-04-28: Discord pointer signals posted as embeds (not as
+# plain message.content) flowed through _serialize_embed which html.escape'd
+# the description, turning <@&123> into &lt;@&amp;123&gt;. The regex in
+# both _is_empty_signal_pointer AND discord_to_telegram_html only matched
+# the unescaped form, so every embed-based pointer leaked the role mention
+# all the way into Telegram, where parse_mode=HTML re-rendered it.
+# ---------------------------------------------------------------------------
+
+
+def test_escaped_role_mention_stripped_in_formatter():
+    raw = "Trading Signal Alert &lt;@&amp;1316518702790742059&gt;"
+    out = discord_to_telegram_html(raw)
+    # No escaped role-mention syntax should leak
+    assert "&lt;@&amp;" not in out
+    assert "1316518702790742059" not in out
+    # The header phrase should still be visible
+    assert "Trading Signal Alert" in out
+
+
+def test_escaped_pointer_message_detected_as_empty():
+    """The exact scenario that broke yesterday: an embed-derived
+    pointer message arrives with HTML-escaped role mention."""
+    raw = (
+        "Trading Signal Alert &lt;@&amp;1316518702790742059&gt;\n"
+        "https://discord.com/channels/1260259552763580537/1340469776815886379"
+    )
+    assert Router._is_empty_signal_pointer(raw) is True
+
+
+def test_escaped_user_mention_stripped():
+    raw = "ping &lt;@123456789&gt; please"
+    out = discord_to_telegram_html(raw)
+    assert "&lt;@" not in out
+    assert "123456789" not in out
+
+
+def test_escaped_channel_mention_stripped():
+    raw = "see &lt;#1316518499283370064&gt; for details"
+    out = discord_to_telegram_html(raw)
+    assert "&lt;#" not in out
+    assert "1316518499283370064" not in out
+
+
+def test_escaped_custom_emoji_normalised():
+    """Escaped emoji <:name:id> -> :name: (drops the id)."""
+    raw = "Big launch &lt;:rocket_purple:1234567890&gt;!"
+    out = discord_to_telegram_html(raw)
+    assert "&lt;:" not in out
+    assert "1234567890" not in out
+    assert ":rocket_purple:" in out
+
+
+def test_serialize_embed_strips_role_mention_before_escape():
+    """End-to-end: an embed with a role-mention in its description
+    flows through _serialize_embed without leaking the mention.
+
+    Uses a hand-rolled embed stand-in (no real discord.Embed import)
+    because the test environment doesn't have a live Discord client.
+    """
+    from types import SimpleNamespace
+    from src.discord_listener import _serialize_embed
+
+    fake_embed = SimpleNamespace(
+        author=None,
+        title="Trading Signal Alert",
+        description="<@&1316518702790742059>\nhttps://discord.com/channels/1/2/3",
+        fields=[],
+        footer=None,
+        url=None,
+    )
+    out = _serialize_embed(fake_embed)
+    # Neither the raw mention NOR the escaped form should leak
+    assert "<@&" not in out
+    assert "&lt;@&amp;" not in out
+    assert "1316518702790742059" not in out
+    # Title should still render
+    assert "Trading Signal Alert" in out

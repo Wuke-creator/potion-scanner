@@ -115,13 +115,26 @@ _BARE_URL_ANGLE_RE = re.compile(r"<(https?://[^>\s]+)>")
 # Discord mention syntax. These render as raw <@&id> / <@id> / <#id> blobs
 # on Telegram if not stripped — useless to subscribers and visually
 # distracting. Match all three (role / user / channel) and remove cleanly.
-_DISCORD_ROLE_MENTION_RE = re.compile(r"<@&\d+>")
-_DISCORD_USER_MENTION_RE = re.compile(r"<@!?\d+>")
-_DISCORD_CHANNEL_MENTION_RE = re.compile(r"<#\d+>")
+# We also match the HTML-entity-escaped forms because content that flowed
+# through Discord embed serialisation gets html.escape'd before this code
+# sees it (``<@&123>`` -> ``&lt;@&amp;123&gt;``). Without the escaped
+# variants those mentions would survive the strip, then Telegram's HTML
+# parse mode would re-render them back into raw role pings.
+_DISCORD_ROLE_MENTION_RE = re.compile(
+    r"<@&\d+>|&lt;@&amp;\d+&gt;",
+)
+_DISCORD_USER_MENTION_RE = re.compile(
+    r"<@!?\d+>|&lt;@!?\d+&gt;",
+)
+_DISCORD_CHANNEL_MENTION_RE = re.compile(
+    r"<#\d+>|&lt;#\d+&gt;",
+)
 # Custom emoji <:name:id> / animated <a:name:id> render as raw text on
 # Telegram. Replace with the bare emoji name (drops the colons) so at
-# least the intent reads correctly.
-_DISCORD_CUSTOM_EMOJI_RE = re.compile(r"<a?:([A-Za-z0-9_]+):\d+>")
+# least the intent reads correctly. Same escaped-form match for robustness.
+_DISCORD_CUSTOM_EMOJI_RE = re.compile(
+    r"<a?:([A-Za-z0-9_]+):\d+>|&lt;a?:([A-Za-z0-9_]+):\d+&gt;",
+)
 
 # Discord message URLs. We surface these as a clean "View original on
 # Discord" link instead of leaking the raw 70-char URL into the body.
@@ -165,7 +178,13 @@ def discord_to_telegram_html(text: str) -> str:
     text = _DISCORD_ROLE_MENTION_RE.sub("", text)
     text = _DISCORD_USER_MENTION_RE.sub("", text)
     text = _DISCORD_CHANNEL_MENTION_RE.sub("", text)
-    text = _DISCORD_CUSTOM_EMOJI_RE.sub(r":\1:", text)
+    # Custom emoji: alternation has two name-capture groups (one per
+    # branch — escaped vs unescaped form). Use a callback so we pick
+    # whichever group actually matched.
+    text = _DISCORD_CUSTOM_EMOJI_RE.sub(
+        lambda m: f":{m.group(1) or m.group(2) or ''}:",
+        text,
+    )
     # Collapse any blank lines / leading whitespace the strips left behind
     # so the cleaned message doesn't have ragged gaps where pings used to be.
     text = re.sub(r"[ \t]+\n", "\n", text)
