@@ -597,8 +597,23 @@ class Router:
                 source_type_label=source_label,
                 original_signal=original_signal,
             )
-            pair_for_filter = original_signal.pair if original_signal else ""
-            return (text, pair_for_filter, None)
+            # Pair for the Trade-now button + dispatcher mute filter.
+            # Prefer the memory-layer pair, fall back to extracting a
+            # ticker from the caption so even cold-start updates still
+            # get a working keyboard.
+            pair_for_filter = (
+                (original_signal.pair if original_signal else "")
+                or self._extract_pair_or_ticker(message.content)
+                or ""
+            )
+            keyboard = None
+            if pair_for_filter:
+                # Same Trade-now + Chart keyboard as new signals — keeps
+                # the visual contract identical across the signal lifetime.
+                keyboard = build_signal_keyboard(
+                    ref_link=route.ref_link, pair=pair_for_filter,
+                )
+            return (text, pair_for_filter, keyboard)
 
         # Unknown / free-form fallback. Forward verbatim only for human-driven channels.
         if route.source_type in _FREEFORM_SOURCE_TYPES:

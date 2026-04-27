@@ -81,8 +81,8 @@ def test_lifecycle_event_ostium_deeplink_fallback_to_caption_pair():
     assert "app.ostium.com/trade?from=WET&amp;to=USD" in out
 
 
-def test_lifecycle_event_blofin_ref_link_unchanged():
-    """Non-Ostium ref links pass through unchanged (no per-pair rewrite)."""
+def test_lifecycle_event_blofin_per_pair_deeplink():
+    """Blofin ref links also get per-pair deeplinks (BASE-USDT path)."""
     out = format_lifecycle_event(
         label="Take Profit Hit",
         raw_message="WET Update: TP1 here",
@@ -91,9 +91,24 @@ def test_lifecycle_event_blofin_ref_link_unchanged():
         source_type_label="Perps",
         original_signal=_make_open_signal(),
     )
-    # Bare Blofin URL preserved (no per-pair query string added)
-    assert "partner.blofin.com/d/potion" in out
+    # Per-pair Blofin URL: blofin.com/futures/WET-USDT?invitecode=potion
+    assert "blofin.com/futures/WET-USDT" in out
+    assert "invitecode=potion" in out
+
+
+def test_lifecycle_event_unknown_exchange_ref_link_unchanged():
+    """A ref link pointing at neither Ostium nor Blofin passes through."""
+    out = format_lifecycle_event(
+        label="Take Profit Hit",
+        raw_message="WET Update: TP1 here",
+        ref_link="https://example.com/ref",
+        channel_name="Test Channel",
+        source_type_label="Perps",
+        original_signal=_make_open_signal(),
+    )
+    assert "https://example.com/ref" in out
     assert "from=WET" not in out
+    assert "futures/WET" not in out
 
 
 def test_lifecycle_block_handles_partial_signal():

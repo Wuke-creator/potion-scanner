@@ -324,6 +324,46 @@ def _build_ostium_trade_url(ref_link: str, pair: str) -> str:
     return f"https://app.ostium.com/trade?{qs}"
 
 
+_BLOFIN_REF_FALLBACK = "potion"
+
+
+def _build_blofin_trade_url(ref_link: str, pair: str) -> str:
+    """Build a per-pair Blofin futures deeplink that opens the trading
+    page directly with the referral attribution preserved.
+
+    Blofin's URL shape: ``https://blofin.com/futures/<BASE>-USDT?invitecode=<CODE>``.
+
+    The configured ref_link is typically the partner landing page
+    ``https://partner.blofin.com/d/potion`` — we extract the partner
+    code from the path's last segment so the deeplink credits the same
+    partner as the bare URL would have.
+
+    Falls back to the bare ref_link if base extraction fails.
+    """
+    base = _extract_base_symbol(pair)
+    if not base:
+        return ref_link
+    # Pull the invite code out of the configured ref URL so we honour
+    # whatever code Luke has set in REF_LINK_PERPS. Path-style
+    # https://partner.blofin.com/d/<code> stores the code as the last
+    # path segment; query-string style ?invitecode=<code> is also
+    # supported as a fallback.
+    invitecode = _BLOFIN_REF_FALLBACK
+    try:
+        parsed = urlparse(ref_link)
+        if parsed.path:
+            segments = [s for s in parsed.path.split("/") if s]
+            if segments:
+                invitecode = segments[-1] or invitecode
+        if parsed.query:
+            qs_existing = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            invitecode = qs_existing.get("invitecode") or invitecode
+    except Exception:
+        invitecode = _BLOFIN_REF_FALLBACK
+    qs = urlencode({"invitecode": invitecode})
+    return f"https://blofin.com/futures/{base}-USDT?{qs}"
+
+
 def build_signal_keyboard(
     ref_link: str, pair: str,
 ) -> InlineKeyboardMarkup:
@@ -339,9 +379,7 @@ def build_signal_keyboard(
     base_token = pair.split("/")[0].strip() if "/" in pair else pair.strip()
     chart_url = f"https://dexscreener.com/search?q={base_token}"
 
-    trade_url = ref_link
-    if ref_link and "app.ostium.com" in ref_link.lower():
-        trade_url = _build_ostium_trade_url(ref_link, pair)
+    trade_url = _resolve_trade_url(ref_link, pair)
 
     buttons = [
         [
@@ -350,6 +388,25 @@ def build_signal_keyboard(
         ],
     ]
     return InlineKeyboardMarkup(buttons)
+
+
+def _resolve_trade_url(ref_link: str, pair: str) -> str:
+    """Return the right Trade-now URL for a (ref_link, pair) combination.
+
+    Per-pair deeplink for Ostium and Blofin (the two perp exchanges we
+    route to today). Anything else falls through to the bare ref link
+    unchanged. Centralised here so the new-signal keyboard, lifecycle
+    Trade-Now link, and any future Trade-now contexts all share one
+    consistent URL builder.
+    """
+    if not ref_link:
+        return ref_link
+    lower = ref_link.lower()
+    if "app.ostium.com" in lower:
+        return _build_ostium_trade_url(ref_link, pair)
+    if "blofin.com" in lower:
+        return _build_blofin_trade_url(ref_link, pair)
+    return ref_link
 
 
 def format_lifecycle_event(
@@ -398,17 +455,13 @@ def format_lifecycle_event(
             lines.append("")
             lines.append(ctx)
 
-    # Build the Trade-Now URL. Per-pair Ostium deeplink when the ref link
-    # points at Ostium AND we have a pair to deeplink to. Otherwise use
-    # the channel's bare ref link unchanged.
-    trade_url = ref_link
-    if ref_link and "app.ostium.com" in ref_link.lower():
-        # Try the original signal's pair first; fall back to extracting
-        # a ticker from the raw message caption (handles "WET Update:
-        # TP1 here" style posts where there's no memory hit).
-        pair_candidate = pair_for_link or _extract_pair_from_caption(raw_message)
-        if pair_candidate:
-            trade_url = _build_ostium_trade_url(ref_link, pair_candidate)
+    # Build the Trade-Now URL. Per-pair deeplink (Ostium or Blofin) when
+    # the ref link supports one AND we have a pair. Otherwise use the
+    # channel's bare ref link unchanged. Pair sourced from the original
+    # signal first, then a regex extract from the caption (handles
+    # "WET Update: TP1 here" posts that didn't hit the memory layer).
+    pair_candidate = pair_for_link or _extract_pair_from_caption(raw_message)
+    trade_url = _resolve_trade_url(ref_link, pair_candidate)
 
     lines.append("")
     lines.append(f'Trade Now: <a href="{escape(trade_url)}">here</a>')
