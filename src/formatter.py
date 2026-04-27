@@ -112,6 +112,24 @@ _MD_CODE_BLOCK_RE = re.compile(r"```[a-zA-Z]*\n?([\s\S]+?)```", re.MULTILINE)
 _MD_CODE_INLINE_RE = re.compile(r"`([^`\n]+?)`")
 _BARE_URL_ANGLE_RE = re.compile(r"<(https?://[^>\s]+)>")
 
+# Discord mention syntax. These render as raw <@&id> / <@id> / <#id> blobs
+# on Telegram if not stripped — useless to subscribers and visually
+# distracting. Match all three (role / user / channel) and remove cleanly.
+_DISCORD_ROLE_MENTION_RE = re.compile(r"<@&\d+>")
+_DISCORD_USER_MENTION_RE = re.compile(r"<@!?\d+>")
+_DISCORD_CHANNEL_MENTION_RE = re.compile(r"<#\d+>")
+# Custom emoji <:name:id> / animated <a:name:id> render as raw text on
+# Telegram. Replace with the bare emoji name (drops the colons) so at
+# least the intent reads correctly.
+_DISCORD_CUSTOM_EMOJI_RE = re.compile(r"<a?:([A-Za-z0-9_]+):\d+>")
+
+# Discord message URLs. We surface these as a clean "View original on
+# Discord" link instead of leaking the raw 70-char URL into the body.
+_DISCORD_MESSAGE_URL_RE = re.compile(
+    r"https?://(?:www\.)?discord\.com/channels/\d+/\d+(?:/\d+)?",
+    re.IGNORECASE,
+)
+
 _PLACEHOLDER_FMT = "\x00TG_TAG_{i}\x00"
 
 
@@ -138,6 +156,21 @@ def discord_to_telegram_html(text: str) -> str:
     # Rewrite Padre referral keys BEFORE markdown parsing so the new URL
     # flows into both link hrefs and any bare-text URL positions.
     text = _rewrite_padre_refs_in_text(text)
+
+    # Strip Discord-only syntax that doesn't render on Telegram. Role /
+    # user / channel mentions become noise (raw <@&id> blobs); custom
+    # emojis become "<:name:id>" gibberish. Cleaning happens before the
+    # markdown placeholder pass so the stripped tokens never enter the
+    # escape pipeline.
+    text = _DISCORD_ROLE_MENTION_RE.sub("", text)
+    text = _DISCORD_USER_MENTION_RE.sub("", text)
+    text = _DISCORD_CHANNEL_MENTION_RE.sub("", text)
+    text = _DISCORD_CUSTOM_EMOJI_RE.sub(r":\1:", text)
+    # Collapse any blank lines / leading whitespace the strips left behind
+    # so the cleaned message doesn't have ragged gaps where pings used to be.
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.strip()
 
     tags: list[str] = []
 
@@ -191,6 +224,16 @@ def discord_to_telegram_html(text: str) -> str:
     # Bare <https://...> wrappers → strip the <>, leave the URL as-is so
     # Telegram auto-linkifies it.
     text = _BARE_URL_ANGLE_RE.sub(lambda m: m.group(1), text)
+
+    # Bare Discord message URLs → clean "View on Discord" hyperlink. The
+    # raw 70-char URL leaks visually and gives the recipient nothing
+    # actionable on mobile. The cleaned link still lets desktop users
+    # click through to see the original post in context.
+    def _discord_url_sub(m):
+        return _stash(
+            f'<a href="{escape(m.group(0), quote=True)}">View on Discord</a>'
+        )
+    text = _DISCORD_MESSAGE_URL_RE.sub(_discord_url_sub, text)
 
     # Escape whatever plain text remains, then re-insert the HTML tags.
     # Replace in REVERSE order: a later-indexed tag may contain a reference

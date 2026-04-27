@@ -430,6 +430,50 @@ class Router:
             logger.exception("open_signals.update_status crashed")
 
     @staticmethod
+    def _is_empty_signal_pointer(content: str) -> bool:
+        """Return True if a SIGNAL_ALERT-classified message has no actual
+        signal data — just a header, mentions, and possibly a Discord URL
+        pointing at another channel.
+
+        Used to drop pointer-style posts like:
+
+            Trading Signal Alert
+            <@&1316518702790742059>
+            https://discord.com/channels/1260259552763580537/.../...
+
+        Without this check those forward as garbled "New Call Detected"
+        messages on Telegram with no entry/SL/TPs, which is worse than
+        no message at all.
+        """
+        if not content:
+            return True
+        # Strip Discord syntax that conveys no information.
+        cleaned = _re.sub(r"<@&\d+>", "", content)
+        cleaned = _re.sub(r"<@!?\d+>", "", cleaned)
+        cleaned = _re.sub(r"<#\d+>", "", cleaned)
+        cleaned = _re.sub(r"<a?:[A-Za-z0-9_]+:\d+>", "", cleaned)
+        # Strip Discord message URLs (the "see signal in other channel"
+        # pointer) — they're cosmetically a link but carry no parseable
+        # signal fields.
+        cleaned = _re.sub(
+            r"https?://(?:www\.)?discord\.com/channels/\d+/\d+(?:/\d+)?",
+            "",
+            cleaned,
+            flags=_re.IGNORECASE,
+        )
+        # Strip the header phrase itself so it doesn't pad the content.
+        cleaned = _re.sub(
+            r"trading\s+signal\s+alert", "", cleaned, flags=_re.IGNORECASE,
+        )
+        cleaned = cleaned.strip()
+        if not cleaned:
+            return True
+        # If anything remains, it should at minimum contain a digit for
+        # this to be a real signal post. No digits => no entry / SL /
+        # leverage / TPs => not a signal.
+        return not _re.search(r"\d", cleaned)
+
+    @staticmethod
     def _extract_pair_or_ticker(content: str) -> str | None:
         """Extract a coin ticker from a free-form lifecycle caption.
 
@@ -467,6 +511,18 @@ class Router:
             try:
                 signal = parse_signal(message.content)
             except SignalParseError as e:
+                # No actual call. The classifier matched the "Trading
+                # Signal Alert" header but parse_signal failed and the
+                # body has no entry / SL / TPs (after stripping role
+                # pings, channel mentions, and pointer URLs). Forwarding
+                # an empty header just confuses Telegram subscribers.
+                if self._is_empty_signal_pointer(message.content):
+                    logger.info(
+                        "Dropping signal-less SIGNAL_ALERT from #%s "
+                        "(role ping / pointer URL only, no fields).",
+                        route.name,
+                    )
+                    return None
                 logger.warning(
                     "Could not parse SIGNAL_ALERT from #%s (%s): forwarding raw",
                     route.name,
