@@ -36,6 +36,40 @@ class IncomingMessage:
     # list when the message has no image attachments. URLs are valid for
     # ~24h on Discord's CDN, which is plenty for synchronous routing.
     image_urls: list[str] | None = None
+    # URL buttons attached to the Discord message (typically by alert
+    # bots like Onsight on the Bonds channel: "Trade via Onsight",
+    # "Mobile Waitlist", etc.). List of (label, url) tuples. Mirror-mode
+    # channels forward these as Telegram inline keyboard buttons so
+    # subscribers see the same one-tap CTAs they'd see on Discord.
+    buttons: list[tuple[str, str]] | None = None
+
+
+def _extract_url_buttons(
+    components: list,
+) -> list[tuple[str, str]]:
+    """Pull URL-style buttons out of a Discord message's components list.
+
+    Discord buttons come in five styles; only ``ButtonStyle.link`` (URL
+    buttons) carry a URL we can forward to Telegram. The other four
+    (primary, secondary, success, danger) require an interaction with
+    the originating bot, which we can't replay from a Telegram client,
+    so we silently drop them.
+
+    Returns a list of (label, url) tuples in the order Discord rendered
+    them. An empty list is returned for messages with no components or
+    no URL-style buttons (the dispatcher then sends with no keyboard).
+    """
+    out: list[tuple[str, str]] = []
+    for action_row in components or []:
+        # ActionRow's children are accessed via .children in discord.py 2.x.
+        children = getattr(action_row, "children", None) or []
+        for component in children:
+            url = getattr(component, "url", None)
+            if not url:
+                continue  # not a URL button (or button missing href)
+            label = getattr(component, "label", None) or "Open"
+            out.append((str(label), str(url)))
+    return out
 
 
 def _serialize_embed(embed: discord.Embed) -> str:
@@ -200,8 +234,15 @@ class DiscordListener:
                 if emb_thumb is not None and getattr(emb_thumb, "url", None):
                     image_urls.append(str(emb_thumb.url))
 
-            # If we have neither text nor images, nothing to route.
-            if not text and not image_urls:
+            # Capture URL buttons attached to the Discord message. Mirror-
+            # mode channels (e.g. Bonds) replay these as Telegram inline
+            # keyboard buttons so subscribers see the same one-tap CTAs.
+            buttons = _extract_url_buttons(
+                getattr(message, "components", None) or [],
+            )
+
+            # If we have neither text nor images nor buttons, nothing to route.
+            if not text and not image_urls and not buttons:
                 return
 
             channel_name = getattr(message.channel, "name", "") or str(channel_id)
@@ -212,6 +253,7 @@ class DiscordListener:
                 author_is_bot=bool(getattr(message.author, "bot", False)),
                 content=text,
                 image_urls=image_urls or None,
+                buttons=buttons or None,
             )
             logger.debug(
                 "Discord message captured: channel=%s author=%s len=%d",

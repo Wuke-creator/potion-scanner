@@ -21,12 +21,16 @@ format.
 from __future__ import annotations
 
 import logging
+import re
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from src.analytics import AnalyticsDB
 from src.config import ChannelRoute, DiscordConfig
 from src.discord_listener import IncomingMessage
 from src.dispatcher import Dispatcher
 from src.formatter import (
+    _extract_pair_from_caption,
     build_signal_keyboard,
     build_wallet_tracker_keyboard,
     format_lifecycle_event,
@@ -87,16 +91,10 @@ _LIFECYCLE_NON_TERMINAL_STATUSES: dict[MessageType, str] = {
 # Always-dropped: PREPARATION posts (just teasers, not actionable)
 _ALWAYS_DROP = {MessageType.PREPARATION}
 
-# Pair-extraction regex used when an image-bot lifecycle message has only
-# a sparse caption ("WET Update: TP1 here, move SL to BE"). Pulls a 2-10
-# char ticker that looks like a coin symbol so we can do an open_signals
-# lookup. Deliberately permissive: even uppercased English words will
-# match, and the lookup just returns None when nothing's recorded.
-import re as _re  # noqa: E402  (kept local to this module's helpers)
-_CAPTION_TICKER_RE = _re.compile(
-    r"\b([A-Z][A-Z0-9]{1,9})\b(?=\s*(?:UPDATE|UPDATES|TP\d|SL|STOP|HIT|MOVE|BE|BREAKEVEN))",
-    _re.IGNORECASE,
-)
+# Telegram inline keyboards have a hard cap of 8 buttons per row and
+# 100 buttons total. We send at most 4 buttons per row of mirrored
+# Discord component buttons so labels don't get truncated on mobile.
+_MAX_BUTTONS_PER_ROW = 4
 
 
 class Router:
@@ -179,20 +177,26 @@ class Router:
             )
             return
 
-        # Mirror mode: pass the message body through to Telegram unchanged.
-        # No classification, no parsing, no header/footer wrap, no ref link
-        # appended, no keyboard. For channels whose format doesn't fit the
-        # structured perp or memecoin templates (e.g. third-party alert bots).
+        # Mirror mode: pass the message body through to Telegram unchanged,
+        # plus carry over any URL buttons attached to the original Discord
+        # post (Onsight's "Trade via Onsight" / "Mobile Waitlist" CTAs on
+        # Bonds, etc.). Mirror channels are for third-party alert bots
+        # whose format doesn't fit the structured perp or memecoin
+        # templates — we want the Telegram subscriber to see exactly what
+        # the Discord post showed, including its one-tap action buttons.
         if route.source_type == "mirror":
+            keyboard = self._build_mirror_keyboard(message.buttons or [])
             logger.info(
-                "Mirror-forwarding %d chars from #%s",
-                len(message.content), route.name,
+                "Mirror-forwarding %d chars + %d button(s) from #%s",
+                len(message.content),
+                len(message.buttons or []),
+                route.name,
             )
             await self._dispatcher.dispatch(
                 text=message.content,
                 source_key=route.key,
                 pair="",
-                keyboard=None,
+                keyboard=keyboard,
             )
             return
 
@@ -430,6 +434,31 @@ class Router:
             logger.exception("open_signals.update_status crashed")
 
     @staticmethod
+    def _build_mirror_keyboard(
+        buttons: list[tuple[str, str]],
+    ) -> InlineKeyboardMarkup | None:
+        """Translate Discord URL buttons into a Telegram inline keyboard.
+
+        Returns None when no buttons were captured so the dispatcher
+        sends without a keyboard (Telegram tolerates empty rows but it
+        looks visually awkward in the chat). Lays out at most
+        ``_MAX_BUTTONS_PER_ROW`` buttons per row to keep labels readable
+        on mobile.
+        """
+        if not buttons:
+            return None
+        rows: list[list[InlineKeyboardButton]] = []
+        current: list[InlineKeyboardButton] = []
+        for label, url in buttons:
+            current.append(InlineKeyboardButton(text=label, url=url))
+            if len(current) >= _MAX_BUTTONS_PER_ROW:
+                rows.append(current)
+                current = []
+        if current:
+            rows.append(current)
+        return InlineKeyboardMarkup(rows) if rows else None
+
+    @staticmethod
     def _is_empty_signal_pointer(content: str) -> bool:
         """Return True if a SIGNAL_ALERT-classified message has no actual
         signal data — just a header, mentions, and possibly a Discord URL
@@ -448,22 +477,22 @@ class Router:
         if not content:
             return True
         # Strip Discord syntax that conveys no information.
-        cleaned = _re.sub(r"<@&\d+>", "", content)
-        cleaned = _re.sub(r"<@!?\d+>", "", cleaned)
-        cleaned = _re.sub(r"<#\d+>", "", cleaned)
-        cleaned = _re.sub(r"<a?:[A-Za-z0-9_]+:\d+>", "", cleaned)
+        cleaned = re.sub(r"<@&\d+>", "", content)
+        cleaned = re.sub(r"<@!?\d+>", "", cleaned)
+        cleaned = re.sub(r"<#\d+>", "", cleaned)
+        cleaned = re.sub(r"<a?:[A-Za-z0-9_]+:\d+>", "", cleaned)
         # Strip Discord message URLs (the "see signal in other channel"
         # pointer) — they're cosmetically a link but carry no parseable
         # signal fields.
-        cleaned = _re.sub(
+        cleaned = re.sub(
             r"https?://(?:www\.)?discord\.com/channels/\d+/\d+(?:/\d+)?",
             "",
             cleaned,
-            flags=_re.IGNORECASE,
+            flags=re.IGNORECASE,
         )
         # Strip the header phrase itself so it doesn't pad the content.
-        cleaned = _re.sub(
-            r"trading\s+signal\s+alert", "", cleaned, flags=_re.IGNORECASE,
+        cleaned = re.sub(
+            r"trading\s+signal\s+alert", "", cleaned, flags=re.IGNORECASE,
         )
         cleaned = cleaned.strip()
         if not cleaned:
@@ -471,27 +500,19 @@ class Router:
         # If anything remains, it should at minimum contain a digit for
         # this to be a real signal post. No digits => no entry / SL /
         # leverage / TPs => not a signal.
-        return not _re.search(r"\d", cleaned)
+        return not re.search(r"\d", cleaned)
 
     @staticmethod
     def _extract_pair_or_ticker(content: str) -> str | None:
         """Extract a coin ticker from a free-form lifecycle caption.
 
-        Tries 'PAIR: WET/USDT' style first (the structured perp-bot
-        format), then falls back to a permissive ticker-near-keyword
-        regex that catches captions like 'WET Update: TP1 here'.
+        Delegates to ``formatter._extract_pair_from_caption`` so the
+        router and the lifecycle Trade-Now URL builder share one
+        ticker-detection implementation. Returns None if no candidate
+        is found (callers handle the no-pair case).
         """
-        if not content:
-            return None
-        pair_match = _re.search(
-            r"PAIR\s*[:#]?\s*(\S+/\S+)", content, _re.IGNORECASE,
-        )
-        if pair_match:
-            return pair_match.group(1).upper()
-        cap_match = _CAPTION_TICKER_RE.search(content)
-        if cap_match:
-            return cap_match.group(1).upper()
-        return None
+        ticker = _extract_pair_from_caption(content or "")
+        return ticker or None
 
     async def _build_text(
         self,

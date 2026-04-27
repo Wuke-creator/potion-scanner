@@ -498,7 +498,21 @@ def _extract_pair_from_caption(text: str) -> str:
     return m.group(1).upper() if m else ""
 
 
-def _format_original_signal_block(sig) -> str:
+def _direction_icon(side: str | None) -> str | None:
+    """Map LONG/SHORT to its directional emoji. Returns None for unknown
+    sides so the caller can render no icon (better than a misleading
+    fallback that visually clashes with the leverage 📊 icon)."""
+    if not side:
+        return None
+    upper = str(side).upper()
+    if upper == "LONG":
+        return "\U0001f4c8"
+    if upper == "SHORT":
+        return "\U0001f4c9"
+    return None
+
+
+def _format_original_signal_block(sig: object) -> str:
     """Render an OpenSignal as an "original call" block in the same visual
     style as ``format_parsed_signal``: emoji bullets per row + ``<code>``
     tags around every numeric value so users can tap-and-hold to copy the
@@ -507,6 +521,12 @@ def _format_original_signal_block(sig) -> str:
     Lays out only the fields that are populated — image-OCR-extracted
     rows often miss the SL or one of the TPs, and we'd rather show a
     short clean block than print 'None' placeholders.
+
+    The ``sig`` parameter is typed as ``object`` rather than the concrete
+    OpenSignal class to avoid an import cycle (open_signals_db imports
+    nothing from formatter; introducing a reverse import would be
+    awkward). Field access is via ``getattr`` with defaults, so any
+    object with the right attribute names works.
     """
     pair = getattr(sig, "pair", None) or ""
     side = getattr(sig, "side", None) or ""
@@ -520,53 +540,42 @@ def _format_original_signal_block(sig) -> str:
     if not any([pair, side, entry, sl, tp1, tp2, tp3]):
         return ""
 
-    direction_icon = (
-        "\U0001f4c8" if str(side).upper() == "LONG"
-        else "\U0001f4c9" if str(side).upper() == "SHORT"
-        else "\U0001f4ca"
-    )
-
     parts: list[str] = ["<b>From the original call:</b>"]
     if pair:
         parts.append(f"\U0001f4b1 Pair: <b>{escape(str(pair))}</b>")
     if side:
-        parts.append(f"{direction_icon} Direction: <b>{escape(str(side))}</b>")
+        icon = _direction_icon(side)
+        prefix = f"{icon} " if icon else ""
+        parts.append(f"{prefix}Direction: <b>{escape(str(side))}</b>")
     if leverage:
         parts.append(f"\U0001f4ca Leverage: <code>{int(leverage)}</code>x")
-    # Insert blank-row separator if we just rendered the head block AND
-    # have at least one numeric field below.
-    head_rendered = any([pair, side, leverage])
-    body_rendered = any([entry is not None, sl is not None,
-                         tp1 is not None, tp2 is not None, tp3 is not None])
-    if head_rendered and body_rendered:
+
+    # Blank-row separator when we have both a head block (pair/side/lev)
+    # and a numeric body block below.
+    has_head = any([pair, side, leverage])
+    has_body = any(v is not None for v in (entry, sl, tp1, tp2, tp3))
+    if has_head and has_body:
         parts.append("")
+
     if entry is not None:
-        parts.append(
-            f"\U0001f3af Entry: <code>{_format_price_for_display(str(entry))}</code>"
-        )
+        parts.append(_format_price_row("\U0001f3af Entry", entry))
     if sl is not None:
-        parts.append(
-            f"\U0001f6e1️ Stop: <code>{_format_price_for_display(str(sl))}</code>"
-        )
-    has_tps = any(tp is not None for tp in (tp1, tp2, tp3))
-    if has_tps:
-        # Blank line before the targets section to mirror format_parsed_signal.
+        parts.append(_format_price_row("\U0001f6e1️ Stop", sl))
+
+    if any(tp is not None for tp in (tp1, tp2, tp3)):
+        # Blank line before the targets section, matching format_parsed_signal.
         if entry is not None or sl is not None:
             parts.append("")
         parts.append("\U0001f48e Targets:")
-        if tp1 is not None:
-            parts.append(
-                f"TP1: <code>{_format_price_for_display(str(tp1))}</code>"
-            )
-        if tp2 is not None:
-            parts.append(
-                f"TP2: <code>{_format_price_for_display(str(tp2))}</code>"
-            )
-        if tp3 is not None:
-            parts.append(
-                f"TP3: <code>{_format_price_for_display(str(tp3))}</code>"
-            )
+        for idx, tp in ((1, tp1), (2, tp2), (3, tp3)):
+            if tp is not None:
+                parts.append(_format_price_row(f"TP{idx}", tp))
     return "\n".join(parts)
+
+
+def _format_price_row(label: str, value: float) -> str:
+    """One-line helper: render a labelled price as ``label: <code>value</code>``."""
+    return f"{label}: <code>{_format_price_for_display(str(value))}</code>"
 
 
 def format_unknown_message(
