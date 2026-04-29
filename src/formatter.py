@@ -499,22 +499,71 @@ _LIFECYCLE_TICKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Perp Pinger format patterns (different bot from Potion's original
+# Perps Bot). Examples:
+#   "SHORT WET @ 0.099"          -> entry signal
+#   "LONG MOODENG @ 0.5630"       -> entry signal
+#   "UPDATE WET @Perp WET Update: TP1 here"  -> manual update
+#   "TP1 HIT AAVE @Perp"          -> TP hit
+#   "SL HIT BTC"                  -> stop hit
+# Each pattern's first capture group is the ticker.
+_PERP_PINGER_PATTERNS = (
+    re.compile(r"^(?:SHORT|LONG)\s+([A-Z][A-Z0-9]{1,9})\b", re.IGNORECASE),
+    re.compile(r"^UPDATE\s+([A-Z][A-Z0-9]{1,9})\b", re.IGNORECASE),
+    re.compile(r"^TP\d\s+HIT\s+([A-Z][A-Z0-9]{1,9})\b", re.IGNORECASE),
+    re.compile(r"^SL\s+HIT\s+([A-Z][A-Z0-9]{1,9})\b", re.IGNORECASE),
+    re.compile(r"^STOP\s+HIT\s+([A-Z][A-Z0-9]{1,9})\b", re.IGNORECASE),
+    re.compile(r"^CLOSE[D]?\s+([A-Z][A-Z0-9]{1,9})\b", re.IGNORECASE),
+)
+
+# Tokens we know are NEVER tickers (action words, short-noise, etc.).
+# Filters out false positives from the lifecycle ticker regex above.
+_TICKER_BLOCKLIST = frozenset({
+    "SHORT", "LONG", "TP1", "TP2", "TP3", "SL", "DCA",
+    "EP", "CMP", "BE", "HIT", "UPDATE", "STOP", "CLOSED", "CLOSE",
+    "ALERT", "RISKY", "SCALP", "SWING", "MOVE", "ADD", "ADJUST",
+})
+
 
 def _extract_pair_from_caption(text: str) -> str:
     """Best-effort ticker extraction from a lifecycle caption.
 
     Returns an empty string when no candidate is found. Returns just the
-    base ticker (uppercased), not a full pair — the Ostium deeplink
-    builder takes either form.
+    base ticker (uppercased), not a full pair — the deeplink builders
+    take either form.
+
+    Resolution order (specific to general):
+      1. ``PAIR: WET/USDT`` (structured Potion Perps Bot format)
+      2. Perp Pinger header patterns (SHORT/LONG/UPDATE/TPn HIT/...)
+      3. Generic lifecycle keyword adjacency (any ticker next to
+         UPDATE/TP/HIT/etc.)
     """
     if not text:
         return ""
-    # Try "PAIR: WET/USDT" structured form first.
+    # 1. Structured "PAIR: X/Y" format
     m = re.search(r"PAIR\s*[:#]?\s*(\S+/\S+)", text, re.IGNORECASE)
     if m:
         return m.group(1).upper()
-    m = _LIFECYCLE_TICKER_RE.search(text)
-    return m.group(1).upper() if m else ""
+    # 2. Perp Pinger header patterns. Try each on the first non-blank line.
+    first_line = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line:
+            first_line = line
+            break
+    if first_line:
+        for pat in _PERP_PINGER_PATTERNS:
+            m = pat.search(first_line)
+            if m:
+                ticker = m.group(1).upper()
+                if ticker not in _TICKER_BLOCKLIST:
+                    return ticker
+    # 3. Generic lifecycle adjacency
+    for m in _LIFECYCLE_TICKER_RE.finditer(text):
+        ticker = m.group(1).upper()
+        if ticker not in _TICKER_BLOCKLIST:
+            return ticker
+    return ""
 
 
 def _direction_icon(side: str | None) -> str | None:

@@ -62,6 +62,14 @@ logger = logging.getLogger(__name__)
 # classifier was tuned for the Potion Perps Bot template, not human posts.
 _FREEFORM_SOURCE_TYPES = {"memecoin"}  # prediction & memecoin spot calls
 
+# Source types that ALSO forward NOISE verbatim, but only when the author
+# is a bot. The Perp Pinger bot in #perp-calls-ostium uses a format
+# ("SHORT WET @ 0.099", "TP1 HIT AAVE", etc.) that doesn't match the
+# classifier rules tuned for Potion's original Perps Bot. Without this
+# escape hatch, every Perp Pinger signal silently drops as NOISE.
+# Restricting to bot authors keeps random user chatter out of the feed.
+_BOT_FORWARD_SOURCE_TYPES = {"perps"}
+
 
 # Lifecycle events we DO forward (with a friendly label)
 _LIFECYCLE_LABELS: dict[MessageType, str] = {
@@ -267,11 +275,39 @@ class Router:
             logger.debug("Dropping %s message from #%s", msg_type.value, route.name)
             return
 
-        # NOISE drops only on perps channels (memecoin channels forward verbatim
-        # because the classifier wasn't trained on human-written predictions).
-        if msg_type == MessageType.NOISE and route.source_type not in _FREEFORM_SOURCE_TYPES:
-            logger.debug("Dropping NOISE in non-freeform channel #%s", route.name)
-            return
+        # NOISE handling:
+        #   - memecoin source types: always forward verbatim (humans + bots).
+        #   - perps source types with a BOT author AND an extractable
+        #     ticker: forward (Perp Pinger format etc.).
+        #   - perps source types where we can't extract a ticker: drop
+        #     (covers Potion's @Perp Alert pings which have no actionable
+        #     data).
+        #   - perps source types with a HUMAN author: drop (random chatter).
+        #   - mirror: handled earlier, never reaches this branch.
+        if msg_type == MessageType.NOISE:
+            forward_freeform = route.source_type in _FREEFORM_SOURCE_TYPES
+            ticker = (
+                _extract_pair_from_caption(message.content or "")
+                if message.author_is_bot else ""
+            )
+            forward_bot = (
+                route.source_type in _BOT_FORWARD_SOURCE_TYPES
+                and message.author_is_bot
+                and bool(ticker)
+            )
+            if not (forward_freeform or forward_bot):
+                logger.debug(
+                    "Dropping NOISE in #%s (source=%s, bot=%s, ticker=%r)",
+                    route.name, route.source_type,
+                    message.author_is_bot, ticker,
+                )
+                return
+            if forward_bot and not forward_freeform:
+                logger.info(
+                    "Forwarding bot-NOISE from #%s as freeform "
+                    "(ticker=%s, Perp Pinger / non-templated bot format)",
+                    route.name, ticker,
+                )
 
         result = await self._build_text(msg_type, message, route)
         if result is None:
@@ -647,15 +683,32 @@ class Router:
                 )
             return (text, pair_for_filter, keyboard)
 
-        # Unknown / free-form fallback. Forward verbatim only for human-driven channels.
-        if route.source_type in _FREEFORM_SOURCE_TYPES:
+        # Unknown / free-form fallback. Forward verbatim for:
+        #   - memecoin source types (humans + bots, always)
+        #   - perps source types where the author is a bot (Perp Pinger
+        #     etc. — non-templated bot signals that don't match the
+        #     classifier but ARE genuine alerts)
+        is_freeform = route.source_type in _FREEFORM_SOURCE_TYPES
+        is_bot_perp = (
+            route.source_type in _BOT_FORWARD_SOURCE_TYPES
+            and message.author_is_bot
+        )
+        if is_freeform or is_bot_perp:
             text = format_unknown_message(
                 raw_message=message.content,
                 ref_link=route.ref_link,
                 channel_name=route.name,
                 source_type_label=source_label,
             )
-            return (text, "", None)
+            # Try to extract a ticker from the caption so the Trade-now
+            # button can deeplink per-pair (Ostium / Blofin) and the
+            # dispatcher's mute filter has something to scope on.
+            pair = _extract_pair_from_caption(message.content) or ""
+            keyboard = (
+                build_signal_keyboard(ref_link=route.ref_link, pair=pair)
+                if pair else None
+            )
+            return (text, pair, keyboard)
 
         logger.debug(
             "Unrecognized message in non-freeform channel #%s: dropped", route.name,
