@@ -65,12 +65,17 @@ def _make_dispatcher_mock() -> AsyncMock:
     return dispatcher
 
 
-def _msg(channel_id: int, content: str, channel_name: str = "channel") -> IncomingMessage:
+def _msg(
+    channel_id: int,
+    content: str,
+    channel_name: str = "channel",
+    author_is_bot: bool = True,
+) -> IncomingMessage:
     return IncomingMessage(
         channel_id=channel_id,
         channel_name=channel_name,
-        author_name="bot",
-        author_is_bot=True,
+        author_name="bot" if author_is_bot else "human",
+        author_is_bot=author_is_bot,
         content=content,
     )
 
@@ -169,12 +174,38 @@ class TestClassification:
         dispatcher = _make_dispatcher_mock()
         router = Router(_make_discord_config(), dispatcher)
 
-        await router.handle(_msg(PREDICTION_ID, "long $PEPE here, breaking out"))
+        await router.handle(
+            _msg(
+                PREDICTION_ID,
+                "long $PEPE here, breaking out",
+                author_is_bot=False,
+            )
+        )
 
         dispatcher.dispatch.assert_awaited_once()
         sent = _dispatched_text(dispatcher)
         assert "long $PEPE here" in sent
         assert MEMECOIN_LINK in sent
+
+    async def test_bot_noise_dropped_in_memecoin_channel(self):
+        """A Discord bot's permission warning posted into #Prediction Calls
+        must not be forwarded to Telegram subscribers as a 'New Call Detected'
+        message. Only humans post real predictions in memecoin channels."""
+        dispatcher = _make_dispatcher_mock()
+        router = Router(_make_discord_config(), dispatcher)
+
+        permission_warning = (
+            "<b>Missing Permissions</b>\n"
+            "I am missing the following permissions to work optimally: "
+            "Manage Messages\n\nPlease fix this or remove my View Channel "
+            "permission in this channel to remove this warning."
+        )
+
+        await router.handle(
+            _msg(PREDICTION_ID, permission_warning, author_is_bot=True)
+        )
+
+        dispatcher.dispatch.assert_not_called()
 
 
 @pytest.mark.asyncio

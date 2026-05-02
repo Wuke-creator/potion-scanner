@@ -276,7 +276,14 @@ class Router:
             return
 
         # NOISE handling:
-        #   - memecoin source types: always forward verbatim (humans + bots).
+        #   - memecoin source types with a HUMAN author: forward verbatim
+        #     (Prediction Calls is human-posted predictions; structured
+        #     bot signals classify as SIGNAL_ALERT, not NOISE, so they
+        #     still flow through the normal path).
+        #   - memecoin source types with a BOT author: drop. Bot output
+        #     in these channels is overwhelmingly Discord ops noise
+        #     (permission warnings, slash command responses, status
+        #     pings) rather than calls.
         #   - perps source types with a BOT author AND an extractable
         #     ticker: forward (Perp Pinger format etc.).
         #   - perps source types where we can't extract a ticker: drop
@@ -285,7 +292,10 @@ class Router:
         #   - perps source types with a HUMAN author: drop (random chatter).
         #   - mirror: handled earlier, never reaches this branch.
         if msg_type == MessageType.NOISE:
-            forward_freeform = route.source_type in _FREEFORM_SOURCE_TYPES
+            forward_freeform = (
+                route.source_type in _FREEFORM_SOURCE_TYPES
+                and not message.author_is_bot
+            )
             ticker = (
                 _extract_pair_from_caption(message.content or "")
                 if message.author_is_bot else ""
