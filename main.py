@@ -43,6 +43,7 @@ from src.discord_listener import DiscordListener, IncomingMessage
 from src.dispatcher import Dispatcher
 from src.email_bot import EmailDB
 from src.email_bot.discord_commands import EmailSlashCommands
+from src.email_bot.events_db import EmailEventsDB
 from src.email_bot.sender import ResendClient
 from src.email_bot.webhook import EmailWebhookHandlers
 from src.email_bot.worker import EmailWorker
@@ -152,6 +153,7 @@ async def run(config: Config) -> None:
 
     # --- Email bot DB + sender (construction only; registration later) ---
     email_db: EmailDB | None = None
+    email_events_db: EmailEventsDB | None = None
     email_sender: ResendClient | None = None
     email_worker: EmailWorker | None = None
     if config.email_bot.enabled:
@@ -163,6 +165,13 @@ async def run(config: Config) -> None:
         else:
             email_db = EmailDB(db_path=config.email_bot.db_path)
             await email_db.open()
+            # Webhook event store (Resend stats + auto-suppression). Opens
+            # alongside the main email DB so the webhook handler can write
+            # the moment it's registered.
+            email_events_db = EmailEventsDB(
+                db_path=config.email_bot.email_events_db_path,
+            )
+            await email_events_db.open()
             email_sender = ResendClient(
                 api_key=config.email_bot.resend_api_key,
                 from_address=config.email_bot.resend_from_address,
@@ -181,6 +190,8 @@ async def run(config: Config) -> None:
                 admin_secret=config.email_bot.admin_webhook_secret,
                 rejoin_url_default=config.email_bot.rejoin_url,
                 whop_members_db=whop_members_db,
+                resend_webhook_secret=config.email_bot.resend_webhook_secret,
+                events_db=email_events_db,
             )
             webhook_handlers.register(verification.callback_server.app)
             logger.info("Email bot enabled (Resend + Whop webhook)")
@@ -420,6 +431,8 @@ async def run(config: Config) -> None:
             default_rejoin_url=config.email_bot.rejoin_url,
             launch_broadcaster=launch_broadcaster,
             whop_email_sync=whop_email_sync,
+            events_db=email_events_db,
+            resend_client=email_sender,
         )
         slash.register(listener.client)
         logger.info("Discord slash commands registered")
@@ -430,6 +443,23 @@ async def run(config: Config) -> None:
         )
 
     # --- Start everything in dependency order ---
+    # Diagnostic: log which automation crons are wired up, before starting them.
+    # If any of inactivity_day10, onboarding_sequence, dunning_sequence,
+    # pre_renewal_email, pre_pause_return_email show as None here despite
+    # whop_members_db + email_db both being non-None, the construction block
+    # at lines 236-287 is being silently skipped.
+    logger.info(
+        "Cron readiness pre-start: "
+        "email_worker=%s inactivity_detector=%s inactivity_day10=%s "
+        "onboarding_sequence=%s dunning_sequence=%s pre_renewal_email=%s "
+        "pre_pause_return_email=%s value_reminder=%s "
+        "(email_db=%s whop_members_db=%s)",
+        email_worker is not None, inactivity_detector is not None,
+        inactivity_day10 is not None, onboarding_sequence is not None,
+        dunning_sequence is not None, pre_renewal_email is not None,
+        pre_pause_return_email is not None, value_reminder is not None,
+        email_db is not None, whop_members_db is not None,
+    )
     await verification.start()
     await dispatcher.start()
     if email_worker is not None:
@@ -545,6 +575,11 @@ async def run(config: Config) -> None:
                 await email_db.close()
             except Exception:
                 logger.exception("Email DB close error")
+        if email_events_db is not None:
+            try:
+                await email_events_db.close()
+            except Exception:
+                logger.exception("Email events DB close error")
         try:
             await verification.stop()
         except Exception:
