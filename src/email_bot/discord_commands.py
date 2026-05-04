@@ -442,9 +442,8 @@ class EmailSlashCommands:
         @tree.command(
             name="broadcast-monthly",
             description=(
-                "Queue the monthly digest email (onboarding day=60 template) "
-                "for every member in the chosen audience. Worker drains via "
-                "Resend at the configured throttle."
+                "Queue the monthly digest email for the chosen audience "
+                "(active, churned, or all)."
             ),
             guild=guild,
         )
