@@ -1221,7 +1221,212 @@ _ONESHOT_RENDERERS = {
     "pre_renewal": _pre_renewal,
     "pre_pause_return": _pre_pause_return,
     "inactive_day10": _inactive_day10,
+    "save_offer": lambda sub, stats: _save_offer_day0(sub, stats),
 }
+
+
+def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """AUT-026 Targeted Save Offer (one-shot, fires on cancellation).
+
+    Drive spec: 06_Offer_Copy.docx Task 24 (Variants A–F). The router
+    (src/automations/save_offer_router.py) maps ``cancel_option`` to one
+    of six variants, mints a Whop promo code where applicable, and
+    embeds the resulting redemption URL into ``sub.rejoin_url``. This
+    template just renders the copy for ``sub.exit_reason``.
+
+    All variants share the same skeleton: greeting, brief acknowledgement
+    of the cancel reason, the offer, single CTA pointing at sub.rejoin_url
+    (which already carries the promo or pause link). Subject line varies
+    per variant so the inbox preview does some of the persuading.
+
+    Unknown reasons fall through to Offer F copy as a defensive default —
+    the router doesn't enrol unknown reasons today, but if one slips
+    through we'd rather send something coherent than crash.
+    """
+    name = _pretty_name(sub)
+    reason = sub.exit_reason
+    rejoin = sub.rejoin_url or "https://whop.com/potion"
+
+    if reason == "too_expensive":
+        # Offer A
+        subject = f"{name}, a cheaper way to stay in"
+        cta = "Stay at $79/month"
+        text_body = (
+            f"Hey {name},\n\n"
+            f"Pricing can be tough, we get it. Before you go, here’s "
+            f"something we don’t normally offer: $79/month for the "
+            f"next 3 months (20% off our standard rate). No commitment, "
+            f"cancel anytime if it’s still not the right fit.\n\n"
+            f"Lock it in here: {rejoin}\n\n"
+            f"This personal link expires in 14 days. If you’d rather "
+            f"go annual, we also offer $69/mo billed yearly ($828) — same "
+            f"full Elite access for a lower monthly rate."
+        )
+        body_html = (
+            f"<p>Hey {escape(name)},</p>"
+            f"<p>Pricing can be tough, we get it. Before you go, here’s "
+            f"something we don’t normally offer: <strong>$79/month for "
+            f"the next 3 months (20% off our standard rate)</strong>. No "
+            f"commitment, cancel anytime if it’s still not the right fit.</p>"
+            f"{_cta_button_html(cta, rejoin)}"
+            f"<p style='color:#666;font-size:14px;'>This personal link "
+            f"expires in 14 days. If you’d rather go annual, we also "
+            f"offer $69/mo billed yearly ($828) — same full Elite access "
+            f"for a lower monthly rate.</p>"
+        )
+    elif reason == "not_using":
+        # Offer B (pause)
+        subject = f"{name}, pause instead of cancel?"
+        cta = "Pause for 30 days"
+        text_body = (
+            f"Hey {name},\n\n"
+            f"No point paying if you’re not using it. So how about a "
+            f"30-day pause instead of cancelling outright?\n\n"
+            f"Your spot stays saved. Telegram bot, Concierge thread, "
+            f"channels, all of it. When you’re ready to jump back in, "
+            f"everything’s exactly where you left it. Auto-reactivates "
+            f"after 30 days unless you extend.\n\n"
+            f"Pause now: {rejoin}\n\n"
+            f"Zero effort, zero cost, you stay in the network."
+        )
+        body_html = (
+            f"<p>Hey {escape(name)},</p>"
+            f"<p>No point paying if you’re not using it. So how about "
+            f"a <strong>30-day pause</strong> instead of cancelling outright?</p>"
+            f"<p>Your spot stays saved. Telegram bot, Concierge thread, "
+            f"channels, all of it. When you’re ready to jump back in, "
+            f"everything’s exactly where you left it. Auto-reactivates "
+            f"after 30 days unless you extend.</p>"
+            f"{_cta_button_html(cta, rejoin)}"
+            f"<p style='color:#666;font-size:14px;'>Zero effort, zero cost, "
+            f"you stay in the network.</p>"
+        )
+    elif reason == "market_slow":
+        # Offer C (pause)
+        subject = f"{name}, pause until things heat up"
+        cta = "Pause until the market picks up"
+        text_body = (
+            f"Hey {name},\n\n"
+            f"The market’s been quiet, fair call. But sentiment "
+            f"changes fast in crypto, and you don’t want to be on the "
+            f"sidelines when it does.\n\n"
+            f"Instead of cancelling, pause your membership for 30 days. "
+            f"Cycle through, see what shifts, come back when the "
+            f"environment’s working for you again.\n\n"
+            f"Pause now: {rejoin}\n\n"
+            f"You won’t be billed during the pause. Auto-reactivates "
+            f"on day 31 unless you extend or cancel."
+        )
+        body_html = (
+            f"<p>Hey {escape(name)},</p>"
+            f"<p>The market’s been quiet, fair call. But sentiment "
+            f"changes fast in crypto, and you don’t want to be on the "
+            f"sidelines when it does.</p>"
+            f"<p>Instead of cancelling, <strong>pause your membership for "
+            f"30 days</strong>. Cycle through, see what shifts, come back "
+            f"when the environment’s working for you again.</p>"
+            f"{_cta_button_html(cta, rejoin)}"
+            f"<p style='color:#666;font-size:14px;'>You won’t be billed "
+            f"during the pause. Auto-reactivates on day 31 unless you "
+            f"extend or cancel.</p>"
+        )
+    elif reason == "quality_declined":
+        # Offer D: 7 free days + top 5 calls digest
+        subject = f"{name}, a look at the last 30 days"
+        cta = "Try 7 days free"
+        bullets_text = _top_calls_30d_bullets_text(stats)
+        bullets_html = _top_calls_30d_bullets_html(stats)
+        text_body = (
+            f"Hey {name},\n\n"
+            f"Appreciate you saying so honestly — that kind of feedback is "
+            f"how we improve.\n\n"
+            f"Quietly behind the scenes we’ve been making changes. "
+            f"Here’s the top 5 calls from the last 30 days so you can "
+            f"see for yourself:\n\n"
+            f"{bullets_text}\n\n"
+            f"We’d like to give you 7 free days to see if it feels "
+            f"different now. No pressure either way — if it’s still "
+            f"not landing for you after the trial, the cancellation "
+            f"goes through as planned.\n\n"
+            f"Claim 7 days free: {rejoin}"
+        )
+        body_html = (
+            f"<p>Hey {escape(name)},</p>"
+            f"<p>Appreciate you saying so honestly — that kind of feedback "
+            f"is how we improve.</p>"
+            f"<p>Quietly behind the scenes we’ve been making changes. "
+            f"Here’s the top 5 calls from the last 30 days so you can "
+            f"see for yourself:</p>"
+            f"{bullets_html}"
+            f"<p><strong>We’d like to give you 7 free days</strong> "
+            f"to see if it feels different now. No pressure either way — "
+            f"if it’s still not landing for you after the trial, the "
+            f"cancellation goes through as planned.</p>"
+            f"{_cta_button_html(cta, rejoin)}"
+        )
+    elif reason == "found_alternative":
+        # Offer E: comparison + 7-day trial
+        subject = "A fair comparison"
+        cta = "Compare and decide"
+        bullets_text = _top_calls_30d_bullets_text(stats)
+        bullets_html = _top_calls_30d_bullets_html(stats)
+        text_body = (
+            f"Hey {name},\n\n"
+            f"Respect the honesty. We’re not going to try to outbid "
+            f"anyone — instead, here’s our last 30 days of calls so "
+            f"you can compare like for like:\n\n"
+            f"{bullets_text}\n\n"
+            f"No discount on this one. Just the numbers.\n\n"
+            f"If you want to run them side by side, here’s a 7-day "
+            f"free trial — keep both subscriptions, see which one’s "
+            f"actually working for you, then decide.\n\n"
+            f"Start the comparison: {rejoin}"
+        )
+        body_html = (
+            f"<p>Hey {escape(name)},</p>"
+            f"<p>Respect the honesty. We’re not going to try to outbid "
+            f"anyone — instead, here’s our last 30 days of calls so "
+            f"you can compare like for like:</p>"
+            f"{bullets_html}"
+            f"<p><strong>No discount on this one. Just the numbers.</strong></p>"
+            f"<p>If you want to run them side by side, here’s a 7-day "
+            f"free trial — keep both subscriptions, see which one’s "
+            f"actually working for you, then decide.</p>"
+            f"{_cta_button_html(cta, rejoin)}"
+        )
+    else:
+        # Offer F (other / fulfillment / unknown reason fallback)
+        subject = "We’d like to make it up to you"
+        cta = "Stay at 25% off"
+        text_body = (
+            f"Hey {name},\n\n"
+            f"Thanks for the feedback. We’d love to make it up to you "
+            f"while we work on the things you flagged.\n\n"
+            f"Here’s 25% off for 2 months — no strings, just our way "
+            f"of saying we hear you.\n\n"
+            f"Lock in 25% off: {rejoin}\n\n"
+            f"This link is personal to you and expires in 14 days. If "
+            f"there’s something specific that drove you to cancel, "
+            f"reply to this email — we read every one and we’re "
+            f"actively reshaping the room based on member feedback."
+        )
+        body_html = (
+            f"<p>Hey {escape(name)},</p>"
+            f"<p>Thanks for the feedback. We’d love to make it up to "
+            f"you while we work on the things you flagged.</p>"
+            f"<p><strong>Here’s 25% off for 2 months</strong> — no "
+            f"strings, just our way of saying we hear you.</p>"
+            f"{_cta_button_html(cta, rejoin)}"
+            f"<p style='color:#666;font-size:14px;'>This link is personal "
+            f"to you and expires in 14 days. If there’s something "
+            f"specific that drove you to cancel, reply to this email — we "
+            f"read every one and we’re actively reshaping the room "
+            f"based on member feedback.</p>"
+        )
+
+    return RenderedEmail(
+        subject=subject, text=text_body, html=_wrap_html(body_html),
+    )
 
 
 def render(

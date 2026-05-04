@@ -325,6 +325,7 @@ class EmailWebhookHandlers:
         whop_members_db=None,
         resend_webhook_secret: str = "",
         events_db: EmailEventsDB | None = None,
+        save_offer_router=None,
     ):
         """``whop_members_db`` is optional. When provided, the new
         payment_failed and payment_succeeded webhook receivers can flip
@@ -345,6 +346,7 @@ class EmailWebhookHandlers:
         self._whop_members_db = whop_members_db
         self._resend_secret = resend_webhook_secret
         self._events_db = events_db
+        self._save_offer_router = save_offer_router
 
     def register(self, app: web.Application) -> None:
         # Unified Whop dispatcher (recommended). Configure ONE webhook in
@@ -464,14 +466,47 @@ class EmailWebhookHandlers:
         if not email:
             return web.json_response({"error": "missing email"}, status=400)
         reason = normalize_reason(reason_raw)
+
+        # AUT-026 Targeted Save Offer: fire BEFORE the winback sequence so
+        # the save-offer email lands first (within ~60s of cancellation).
+        # Failures here MUST NOT block winback enrolment — the save offer
+        # is best-effort, the winback is the safety net.
+        discord_user_id = self._extract_whop_user_id(data) or str(
+            (data.get("user") or {}).get("discord_id", "")
+        ).strip()
+        save_outcome = "skipped"
+        if self._save_offer_router is not None:
+            try:
+                result = await self._save_offer_router.route_offer(
+                    email=email,
+                    name=name,
+                    reason=reason,
+                    discord_user_id=discord_user_id,
+                )
+                save_outcome = (
+                    f"routed:{result.variant_label}" if result.routed
+                    else "no_variant"
+                )
+            except Exception:
+                logger.exception(
+                    "SaveOfferRouter.route_offer crashed for %s "
+                    "(reason=%s); falling through to winback only",
+                    email, reason,
+                )
+
         await self._enroll(
             email=email, name=name, trigger="cancellation", reason=reason,
         )
         logger.info(
-            "Whop membership.deactivated: enrolled %s in winback (reason=%s)",
-            email, reason,
+            "Whop membership.deactivated: %s reason=%s save_offer=%s "
+            "winback_enrolled=true",
+            email, reason, save_outcome,
         )
-        return web.json_response({"ok": True, "sequence": "winback"})
+        return web.json_response({
+            "ok": True,
+            "sequence": "winback",
+            "save_offer": save_outcome,
+        })
 
     async def _dispatch_reactivation(self, data: dict) -> web.Response:
         """membership.activated fires both for first-ever joins and for
@@ -546,38 +581,17 @@ class EmailWebhookHandlers:
     # -----------------------------------------------------------------
 
     async def _whop_cancellation(self, request: web.Request) -> web.Response:
+        """Legacy single-event endpoint. Delegates to the same dispatch
+        logic as the unified /webhook/whop endpoint so save offers fire
+        here too."""
         raw, data = await _read_json(request)
         if not self._check_whop_signature(raw, request.headers):
             logger.warning("Whop webhook rejected: bad or missing signature")
             return web.json_response({"error": "bad signature"}, status=401)
-
-        # Whop's payload shape varies; accept a few common layouts
-        email = (
-            data.get("email")
-            or (data.get("user") or {}).get("email")
-            or (data.get("membership") or {}).get("user", {}).get("email", "")
-        ).strip()
-        name = (
-            data.get("name")
-            or (data.get("user") or {}).get("name")
-            or (data.get("user") or {}).get("username", "")
-        ).strip()
-        reason_raw = (
-            data.get("cancellation_reason")
-            or data.get("reason")
-            or (data.get("survey") or {}).get("reason", "")
-        )
-
-        if not email:
-            return web.json_response({"error": "missing email"}, status=400)
-
-        reason = normalize_reason(reason_raw)
-        await self._enroll(
-            email=email, name=name, trigger="cancellation", reason=reason,
-        )
-        logger.info("Whop cancellation enrolled %s (reason=%s)", email, reason)
-        return web.json_response({"ok": True, "sequence": "winback"})
-
+        # The legacy endpoint receives the membership.deactivated payload
+        # at the top level (no event/data wrapper), so pass `data` as the
+        # inner payload directly.
+        return await self._dispatch_cancellation(data)
     async def _whop_payment_failed(self, request: web.Request) -> web.Response:
         """Whop fires this when a member's auto-renewal charge fails.
 

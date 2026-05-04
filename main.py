@@ -34,6 +34,7 @@ from src.automations.onboarding_sequence import OnboardingSequence
 from src.automations.dunning_sequence import DunningSequence
 from src.automations.pre_renewal_email import PreRenewalEmail
 from src.automations.pre_pause_return_email import PrePauseReturnEmail
+from src.automations.save_offer_router import SaveOfferRouter
 from src.automations.value_reminder import ValueReminder
 from src.automations.whop_email_sync import WhopEmailSync, WhopEmailSyncCron
 from src.automations.whop_members_db import WhopMembersDB
@@ -184,6 +185,18 @@ async def run(config: Config) -> None:
                 poll_interval_sec=config.email_bot.worker_poll_sec,
                 max_per_cycle=config.email_bot.worker_max_per_cycle,
             )
+            # AUT-026 Targeted Save Offer Router. Reuses the cancel-survey
+            # promo-creation key (same Whop scope: promo_code:create +
+            # access_pass:basic:read). Disabled gracefully if the key is
+            # unset — handler still fires, just falls back to bare rejoin
+            # URLs without minting personalised promo codes.
+            save_offer_router = SaveOfferRouter(
+                email_db=email_db,
+                promo_api_key=config.automations.whop_promo_api_key,
+                whop_company_id=config.automations.whop_company_id,
+                rejoin_url_base=config.email_bot.rejoin_url,
+                promo_ttl_days=config.automations.cancel_survey_promo_ttl_days,
+            )
             # Register aiohttp webhook routes on the shared OAuth callback app
             webhook_handlers = EmailWebhookHandlers(
                 db=email_db,
@@ -193,9 +206,10 @@ async def run(config: Config) -> None:
                 whop_members_db=whop_members_db,
                 resend_webhook_secret=config.email_bot.resend_webhook_secret,
                 events_db=email_events_db,
+                save_offer_router=save_offer_router,
             )
             webhook_handlers.register(verification.callback_server.app)
-            logger.info("Email bot enabled (Resend + Whop webhook)")
+            logger.info("Email bot enabled (Resend + Whop webhook + SaveOfferRouter)")
 
     # --- Automations crons (optional, controlled by AUTOMATIONS_ENABLED) ---
     launch_broadcaster: FeatureLaunchBroadcaster | None = None
