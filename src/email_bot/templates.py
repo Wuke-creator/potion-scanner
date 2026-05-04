@@ -668,13 +668,13 @@ def _onboard_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
     subject = "Welcome to Potion Alpha"
     text = (
         f"Hey {name},\n\n"
-        f"Welcome to Potion. Glad you’re here.\n\n"
+        f"Welcome to Potion Alpha. Glad you’re here.\n\n"
         f"Three things to do in the next 5 minutes so you don’t miss "
         f"the next move:\n\n"
         f"1. Open Discord and head to #start-here. Read the pinned post.\n"
         f"2. Set up the Telegram alert bot: {telegram_bot}. /start, then "
         f"/verify. Calls land in your DMs the second they fire.\n"
-        f"3. Drop into #questions and say hi. The fastest way to learn "
+        f"3. Drop into #alpha-chat and say hi. The fastest way to learn "
         f"the room is to ask.\n\n"
         f"Calls fire at all hours. The Telegram bot is what catches them "
         f"when you’re not at the screen. Set it up first.\n\n"
@@ -682,7 +682,7 @@ def _onboard_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
     )
     html_body = (
         f"<p>Hey {escape(name)},</p>"
-        f"<p>Welcome to Potion. Glad you’re here.</p>"
+        f"<p>Welcome to Potion Alpha. Glad you’re here.</p>"
         f"<p><strong>Three things to do in the next 5 minutes so you "
         f"don’t miss the next move:</strong></p>"
         f"<ol>"
@@ -691,7 +691,7 @@ def _onboard_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"<a href='{escape(telegram_bot)}'>{escape(telegram_bot)}</a>. "
         f"<code>/start</code>, then <code>/verify</code>. Calls land in "
         f"your DMs the second they fire.</li>"
-        f"<li>Drop into #questions and say hi. The fastest way to learn "
+        f"<li>Drop into #alpha-chat and say hi. The fastest way to learn "
         f"the room is to ask.</li>"
         f"</ol>"
         f"<p>Calls fire at all hours. The Telegram bot is what catches "
