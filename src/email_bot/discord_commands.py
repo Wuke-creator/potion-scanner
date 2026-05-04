@@ -31,10 +31,187 @@ from discord import app_commands
 
 from src.automations.feature_launch import FeatureLaunchBroadcaster
 from src.automations.whop_email_sync import WhopEmailSync
+from src.email_bot.analytics import EmailAnalytics
 from src.email_bot.db import EmailDB, Subscriber
+from src.email_bot.events_db import EmailEventsDB
+from src.email_bot.sender import ResendClient
 from src.email_bot.webhook import normalize_reason
 
 logger = logging.getLogger(__name__)
+
+
+def _format_window(seconds: int) -> str:
+    """Render a seconds count as 'N day(s)' / 'N hour(s)' for stats output."""
+    if seconds <= 0:
+        return "0 days"
+    days = seconds // 86400
+    if days >= 1:
+        return f"{days} day{'s' if days != 1 else ''}"
+    hours = seconds // 3600
+    return f"{hours} hour{'s' if hours != 1 else ''}"
+
+
+def _render_sequence_stats(
+    sequence: str, day: int | None, stats: dict,
+) -> str:
+    """Format the /email-sequence-stats response. Mirrors
+    _render_broadcast_stats so operators see the same shape regardless
+    of whether they're looking at a Resend broadcast or a transactional
+    sequence."""
+    sent = int(stats.get("sent", 0))
+    sent_events = int(stats.get("sent_events", sent))
+    delivered = int(stats.get("delivered", 0))
+    opened = int(stats.get("opened", 0))
+    clicked = int(stats.get("clicked", 0))
+    bounced = int(stats.get("bounced", 0))
+    complained = int(stats.get("complained", 0))
+    failed = int(stats.get("failed", 0))
+    hard_bounced = int(stats.get("hard_bounced", 0))
+    soft_bounced = int(stats.get("soft_bounced", 0))
+    unique_openers = int(stats.get("unique_openers", 0))
+    unique_clickers = int(stats.get("unique_clickers", 0))
+
+    delivery_rate = float(stats.get("delivery_rate", 0.0))
+    open_rate = float(stats.get("open_rate", 0.0))
+    click_rate_delivered = float(stats.get("click_rate_delivered", 0.0))
+    click_rate_opened = float(stats.get("click_rate_opened", 0.0))
+    bounce_rate = float(stats.get("bounce_rate", 0.0))
+    complaint_rate = float(stats.get("complaint_rate", 0.0))
+    fail_rate = float(stats.get("fail_rate", 0.0))
+
+    window = _format_window(int(stats.get("window_seconds", 0)))
+    label = sequence
+    if day is not None:
+        label = f"{sequence} day {day}"
+
+    lines = [
+        f'Sequence stats: "{label}" (last {window})',
+        f"  Sent:        {sent:>9,}",
+    ]
+    if sent_events != sent:
+        lines.append(
+            f"    (Resend webhook sent events: {sent_events:,} — "
+            f"webhook lag in progress)",
+        )
+    lines.extend([
+        f"  Delivered:   {delivered:>9,}    ({delivery_rate * 100:.1f}%)",
+        f"  Opened:      {opened:>9,}    "
+        f"({open_rate * 100:.1f}% of delivered, "
+        f"{unique_openers:,} unique)",
+        f"  Clicked:     {clicked:>9,}    "
+        f"({click_rate_delivered * 100:.1f}% of delivered, "
+        f"{click_rate_opened * 100:.1f}% of opens, "
+        f"{unique_clickers:,} unique)",
+        f"  Bounced:     {bounced:>9,}    "
+        f"({bounce_rate * 100:.1f}%, "
+        f"{hard_bounced:,} hard / {soft_bounced:,} soft)",
+        f"  Complaints:  {complained:>9,}    ({complaint_rate * 100:.3f}%)",
+        f"  Failed:      {failed:>9,}    ({fail_rate * 100:.2f}%)",
+    ])
+
+    top_clicks = stats.get("top_clicked_urls") or []
+    if top_clicks:
+        lines.append("")
+        lines.append("  Top CTAs:")
+        for i, item in enumerate(top_clicks, start=1):
+            url = str(item.get("url") or "")
+            count = int(item.get("count", 0))
+            lines.append(f"    {i}. {url}   ({count:,} clicks)")
+
+    return "\n".join(lines)
+
+
+def _render_day0_funnel(stats: dict) -> str:
+    """Format the /email-day0-funnel response. Renders a vertical funnel
+    of sent → delivered → opened → clicked → telegram_verified with
+    stepwise rates."""
+    sent = int(stats.get("sent", 0))
+    delivered = int(stats.get("delivered", 0))
+    opened = int(stats.get("opened", 0))
+    clicked = int(stats.get("clicked", 0))
+    verified = int(stats.get("telegram_verified", 0))
+
+    delivered_rate = float(stats.get("delivered_rate", 0.0)) * 100
+    open_rate = float(stats.get("open_rate", 0.0)) * 100
+    click_rate = float(stats.get("click_rate", 0.0)) * 100
+    verify_rate = float(stats.get("verify_rate", 0.0)) * 100
+
+    window = _format_window(int(stats.get("window_seconds", 0)))
+    conv = _format_window(int(stats.get("conversion_window_seconds", 0)))
+
+    lines = [
+        f"Day 0 onboarding funnel (last {window}, "
+        f"verification window: {conv})",
+        f"  Sent:                  {sent:>9,}",
+        f"  Delivered:             {delivered:>9,}    "
+        f"({delivered_rate:.1f}% of sent)",
+        f"  Opened:                {opened:>9,}    "
+        f"({open_rate:.1f}% of delivered)",
+        f"  Clicked:               {clicked:>9,}    "
+        f"({click_rate:.1f}% of opens)",
+        f"  Telegram-verified:     {verified:>9,}    "
+        f"({verify_rate:.1f}% of sent — top-of-funnel conversion)",
+    ]
+    return "\n".join(lines)
+
+
+def _render_broadcast_stats(
+    broadcast_id: str, title: str, stats: dict,
+) -> str:
+    """Format the /email-broadcast-stats response.
+
+    Pulled out of the slash command so tests can assert on the rendered
+    string without needing a Discord interaction. Numbers come in as
+    plain ints/floats from EmailEventsDB.broadcast_stats.
+
+    No em dashes anywhere (per Luke's writing rules); the title sits
+    after a colon.
+    """
+    sent = int(stats.get("sent", 0))
+    delivered = int(stats.get("delivered", 0))
+    opened = int(stats.get("opened", 0))
+    clicked = int(stats.get("clicked", 0))
+    bounced = int(stats.get("bounced", 0))
+    complained = int(stats.get("complained", 0))
+    failed = int(stats.get("failed", 0))
+    hard_bounced = int(stats.get("hard_bounced", 0))
+    soft_bounced = int(stats.get("soft_bounced", 0))
+
+    delivery_rate = float(stats.get("delivery_rate", 0.0))
+    open_rate = float(stats.get("open_rate", 0.0))
+    click_rate_delivered = float(stats.get("click_rate_delivered", 0.0))
+    click_rate_opened = float(stats.get("click_rate_opened", 0.0))
+    bounce_rate = float(stats.get("bounce_rate", 0.0))
+    complaint_rate = float(stats.get("complaint_rate", 0.0))
+    fail_rate = float(stats.get("fail_rate", 0.0))
+
+    safe_title = title.strip() or "(title unavailable)"
+    lines = [
+        f'Broadcast {broadcast_id}: "{safe_title}"',
+        f"  Sent:        {sent:>9,}",
+        f"  Delivered:   {delivered:>9,}    ({delivery_rate * 100:.1f}%)",
+        f"  Opened:      {opened:>9,}    "
+        f"({open_rate * 100:.1f}% of delivered)",
+        f"  Clicked:     {clicked:>9,}    "
+        f"({click_rate_delivered * 100:.1f}% of delivered, "
+        f"{click_rate_opened * 100:.1f}% of opens)",
+        f"  Bounced:     {bounced:>9,}    "
+        f"({bounce_rate * 100:.1f}%, "
+        f"{hard_bounced:,} hard / {soft_bounced:,} soft)",
+        f"  Complaints:  {complained:>9,}    ({complaint_rate * 100:.3f}%)",
+        f"  Failed:      {failed:>9,}    ({fail_rate * 100:.2f}%)",
+    ]
+
+    top_clicks = stats.get("top_clicked_urls") or []
+    if top_clicks:
+        lines.append("")
+        lines.append("  Top CTAs:")
+        for i, item in enumerate(top_clicks, start=1):
+            url = str(item.get("url") or "")
+            count = int(item.get("count", 0))
+            lines.append(f"    {i}. {url}   ({count:,} clicks)")
+
+    return "\n".join(lines)
 
 
 class EmailSlashCommands:
@@ -48,6 +225,9 @@ class EmailSlashCommands:
         default_rejoin_url: str,
         launch_broadcaster: FeatureLaunchBroadcaster | None = None,
         whop_email_sync: WhopEmailSync | None = None,
+        events_db: EmailEventsDB | None = None,
+        resend_client: ResendClient | None = None,
+        analytics: EmailAnalytics | None = None,
     ):
         self._db = db
         self._guild_id = guild_id
@@ -55,6 +235,9 @@ class EmailSlashCommands:
         self._default_rejoin = default_rejoin_url
         self._launch_broadcaster = launch_broadcaster
         self._whop_email_sync = whop_email_sync
+        self._events_db = events_db
+        self._resend_client = resend_client
+        self._analytics = analytics
 
     def register(self, client: discord.Client) -> None:
         """Attach a CommandTree to the discord.Client and wire our commands."""
@@ -201,12 +384,14 @@ class EmailSlashCommands:
             title="Short feature title, e.g. 'Perp Bot v2'",
             description="1-2 sentences explaining what it does and why it matters",
             include_email="Also send the email half? Default: yes",
+            audience="Email audience: 'active' (default), 'churned', or 'all'",
         )
         async def broadcast_feature(
             interaction: discord.Interaction,
             title: str,
             description: str,
             include_email: bool = True,
+            audience: str = "active",
         ) -> None:
             if not self._is_admin(interaction):
                 await interaction.response.send_message(
@@ -229,6 +414,12 @@ class EmailSlashCommands:
                     "description must be 1-500 chars.", ephemeral=True,
                 )
                 return
+            if audience not in ("active", "churned", "all"):
+                await interaction.response.send_message(
+                    "audience must be 'active', 'churned', or 'all'.",
+                    ephemeral=True,
+                )
+                return
 
             # Defer because broadcasting can take 30s+ for large audiences
             await interaction.response.defer(ephemeral=True, thinking=True)
@@ -236,14 +427,71 @@ class EmailSlashCommands:
                 title=title,
                 description=description,
                 include_email=include_email,
+                audience=audience,
             )
             await interaction.followup.send(
-                f"Feature launch complete:\n"
+                f"Feature launch complete (audience={audience}):\n"
                 f"  DM: {stats.dm_sent}/{stats.dm_attempted} sent "
                 f"(blocked {stats.dm_blocked}, failed {stats.dm_failed})\n"
                 f"  Email: {stats.email_sent}/{stats.email_attempted} sent "
                 f"(failed {stats.email_failed})\n"
                 f"  Duration: {stats.duration_sec:.1f}s",
+                ephemeral=True,
+            )
+
+        @tree.command(
+            name="broadcast-monthly",
+            description=(
+                "Queue the monthly digest email (onboarding day=60 template) "
+                "for every member in the chosen audience. Worker drains via "
+                "Resend at the configured throttle."
+            ),
+            guild=guild,
+        )
+        @app_commands.describe(
+            audience="Audience: 'active' (default Elite roster), 'churned', or 'all'",
+        )
+        async def broadcast_monthly(
+            interaction: discord.Interaction,
+            audience: str = "active",
+        ) -> None:
+            if not self._is_admin(interaction):
+                await interaction.response.send_message(
+                    "Admin only.", ephemeral=True,
+                )
+                return
+            if self._launch_broadcaster is None:
+                await interaction.response.send_message(
+                    "Launch broadcaster not wired. Enable automations in config.",
+                    ephemeral=True,
+                )
+                return
+            if audience not in ("active", "churned", "all"):
+                await interaction.response.send_message(
+                    "audience must be 'active', 'churned', or 'all'.",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                result = await self._launch_broadcaster.enqueue_monthly_digest(
+                    email_db=self._db,
+                    audience=audience,
+                    rejoin_url=self._default_rejoin,
+                )
+            except RuntimeError as e:
+                await interaction.followup.send(
+                    f"Cannot enqueue digest: {e}", ephemeral=True,
+                )
+                return
+            await interaction.followup.send(
+                f"Monthly digest queued (audience={result['audience']}):\n"
+                f"  Queued:           {result['queued']:,}\n"
+                f"  Skipped no email: {result['skipped_no_email']:,}\n\n"
+                f"The EmailWorker (1.5/sec throttle) will drain the queue. "
+                f"Track delivery via /email-broadcast-stats once a Resend "
+                f"broadcast id appears, or watch /email-status for sent/failed counts.",
                 ephemeral=True,
             )
 
@@ -277,6 +525,178 @@ class EmailSlashCommands:
             await interaction.followup.send(
                 "\n".join(lines), ephemeral=True,
             )
+
+        @tree.command(
+            name="email-broadcast-stats",
+            description=(
+                "Email bot: per-broadcast send/open/click/bounce stats."
+            ),
+            guild=guild,
+        )
+        @app_commands.describe(
+            broadcast_id="Resend broadcast UUID (find it in the Resend dashboard URL)",
+        )
+        async def email_broadcast_stats(
+            interaction: discord.Interaction, broadcast_id: str,
+        ) -> None:
+            if not self._is_admin(interaction):
+                await interaction.response.send_message(
+                    "Admin only.", ephemeral=True,
+                )
+                return
+            if self._events_db is None:
+                await interaction.response.send_message(
+                    "Events DB not wired. Set RESEND_WEBHOOK_SECRET and "
+                    "restart the bot.",
+                    ephemeral=True,
+                )
+                return
+            broadcast_id = broadcast_id.strip()
+            if not broadcast_id:
+                await interaction.response.send_message(
+                    "broadcast_id is required.", ephemeral=True,
+                )
+                return
+
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            stats = await self._events_db.broadcast_stats(broadcast_id)
+
+            title = "(title unavailable)"
+            if self._resend_client is not None:
+                try:
+                    meta = await self._resend_client.get_broadcast(broadcast_id)
+                except Exception:
+                    logger.exception(
+                        "get_broadcast failed for %s", broadcast_id,
+                    )
+                    meta = None
+                if meta and isinstance(meta.get("name"), str) and meta["name"]:
+                    title = meta["name"]
+
+            body = _render_broadcast_stats(broadcast_id, title, stats)
+            await interaction.followup.send(body, ephemeral=True)
+
+        @tree.command(
+            name="email-sequence-stats",
+            description=(
+                "Email bot: open/click/bounce stats for a sequence "
+                "(onboarding, winback, dunning, etc)."
+            ),
+            guild=guild,
+        )
+        @app_commands.describe(
+            sequence=(
+                "onboarding | winback | reengagement | dunning | "
+                "pre_renewal | pre_pause_return | inactive_day10"
+            ),
+            day="Specific day offset (omit to aggregate all days)",
+            days_back="Trailing window in days (default 30)",
+        )
+        async def email_sequence_stats(
+            interaction: discord.Interaction,
+            sequence: str,
+            day: int | None = None,
+            days_back: int = 30,
+        ) -> None:
+            if not self._is_admin(interaction):
+                await interaction.response.send_message(
+                    "Admin only.", ephemeral=True,
+                )
+                return
+            if self._analytics is None:
+                await interaction.response.send_message(
+                    "Analytics not wired. Set RESEND_WEBHOOK_SECRET and "
+                    "restart the bot.",
+                    ephemeral=True,
+                )
+                return
+            sequence = (sequence or "").strip()
+            if sequence not in EmailDB.KNOWN_SEQUENCES:
+                await interaction.response.send_message(
+                    f"Unknown sequence '{sequence}'. Valid: "
+                    f"{', '.join(sorted(EmailDB.KNOWN_SEQUENCES))}.",
+                    ephemeral=True,
+                )
+                return
+            if days_back < 1 or days_back > 365:
+                await interaction.response.send_message(
+                    "days_back must be between 1 and 365.", ephemeral=True,
+                )
+                return
+
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                stats = await self._analytics.sequence_stats(
+                    sequence=sequence, day=day, days_back=days_back,
+                )
+            except Exception:
+                logger.exception(
+                    "sequence_stats crashed for %s day=%s", sequence, day,
+                )
+                await interaction.followup.send(
+                    "Stats query crashed. Check logs.", ephemeral=True,
+                )
+                return
+            body = _render_sequence_stats(sequence, day, stats)
+            await interaction.followup.send(body, ephemeral=True)
+
+        @tree.command(
+            name="email-day0-funnel",
+            description=(
+                "Email bot: Day 0 onboarding -> Telegram-verified "
+                "conversion funnel."
+            ),
+            guild=guild,
+        )
+        @app_commands.describe(
+            days_back="Trailing window in days (default 30)",
+            conversion_window_days=(
+                "Window after Day 0 send to count a verification (default 7)"
+            ),
+        )
+        async def email_day0_funnel(
+            interaction: discord.Interaction,
+            days_back: int = 30,
+            conversion_window_days: int = 7,
+        ) -> None:
+            if not self._is_admin(interaction):
+                await interaction.response.send_message(
+                    "Admin only.", ephemeral=True,
+                )
+                return
+            if self._analytics is None:
+                await interaction.response.send_message(
+                    "Analytics not wired. Set RESEND_WEBHOOK_SECRET and "
+                    "restart the bot.",
+                    ephemeral=True,
+                )
+                return
+            if days_back < 1 or days_back > 365:
+                await interaction.response.send_message(
+                    "days_back must be between 1 and 365.", ephemeral=True,
+                )
+                return
+            if conversion_window_days < 1 or conversion_window_days > 90:
+                await interaction.response.send_message(
+                    "conversion_window_days must be between 1 and 90.",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                stats = await self._analytics.onboarding_day0_funnel(
+                    days_back=days_back,
+                    conversion_window_days=conversion_window_days,
+                )
+            except Exception:
+                logger.exception("onboarding_day0_funnel crashed")
+                await interaction.followup.send(
+                    "Funnel query crashed. Check logs.", ephemeral=True,
+                )
+                return
+            body = _render_day0_funnel(stats)
+            await interaction.followup.send(body, ephemeral=True)
 
         # Sync guild commands once the client is ready. discord.Client (base
         # class, not commands.Bot) has no add_listener hook. wait_until_ready()

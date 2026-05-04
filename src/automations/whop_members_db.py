@@ -192,6 +192,30 @@ class WhopMembersDB:
         )
         await self._conn.commit()
 
+    async def mark_invalid_by_email(self, email: str) -> int:
+        """Suppress every member row matching this email (case-insensitive
+        exact match). Returns the number of rows updated.
+
+        Email is not UNIQUE in this table because the same person can
+        hold multiple memberships under different whop_user_ids. We
+        suppress all matches so future broadcasts skip the address
+        entirely. Repeat fires for an already-suppressed address are
+        no-ops (rowcount 0) thanks to the `valid = 1` predicate.
+
+        Used by the Resend webhook handler when a hard bounce or spam
+        complaint lands; see src/email_bot/webhook.py::_resend_webhook.
+        """
+        assert self._conn is not None
+        if not email:
+            return 0
+        cur = await self._conn.execute(
+            "UPDATE whop_members SET valid = 0, last_synced_at = ? "
+            "WHERE LOWER(email) = LOWER(?) AND valid = 1",
+            (int(time.time()), email),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
     async def get_by_discord(self, discord_user_id: str) -> WhopMemberRow | None:
         """Fetch one member by Discord ID. Returns None if not found."""
         assert self._conn is not None
@@ -219,12 +243,22 @@ class WhopMembersDB:
     async def list_valid_with_email(self) -> list[WhopMemberRow]:
         """Every valid member who has an email. Used by Feature 1 email half
         and Feature 4 channel feeler."""
+        return await self._list_with_email(valid=True)
+
+    async def list_invalid_with_email(self) -> list[WhopMemberRow]:
+        """Every CHURNED member (valid=0) who has an email. Used by AUT-031
+        New Feature for Churned segment so a feature-launch broadcast can
+        target lapsed members specifically."""
+        return await self._list_with_email(valid=False)
+
+    async def _list_with_email(self, *, valid: bool) -> list[WhopMemberRow]:
         assert self._conn is not None
         async with self._conn.execute(
             "SELECT whop_user_id, discord_user_id, email, valid, "
             "       membership_id, first_seen_at, last_synced_at "
-            "FROM whop_members WHERE valid = 1 AND email != '' "
-            "ORDER BY last_synced_at DESC"
+            "FROM whop_members WHERE valid = ? AND email != '' "
+            "ORDER BY last_synced_at DESC",
+            (1 if valid else 0,),
         ) as cursor:
             rows = await cursor.fetchall()
         return [

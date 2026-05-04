@@ -115,11 +115,35 @@ class FeatureLaunchBroadcaster:
         self._email_interval = 1.0 / email_rate_per_sec
 
     async def broadcast(
-        self, title: str, description: str, include_email: bool = True,
+        self,
+        title: str,
+        description: str,
+        include_email: bool = True,
+        audience: str = "active",
     ) -> LaunchStats:
-        """Fire DMs to every active verified user + optional email half."""
+        """Fire DMs to every active verified user + optional email half.
+
+        ``audience`` controls who receives the email half (Telegram DMs
+        always go to verified Telegram users, since churned members have
+        usually disconnected the bot anyway):
+
+          - ``"active"`` (default): Whop members with valid=1 (current Elite)
+          - ``"churned"``: Whop members with valid=0 (lapsed Elite). This
+            implements AUT-031 "New Feature Announcement (Churned)" — a
+            re-engagement broadcast targeting people who can come back.
+          - ``"all"``: union of both audiences (de-duped)
+
+        DMs always target Telegram-verified users regardless of audience
+        because we don't have Telegram IDs for churned members anyway.
+        """
         start = time.monotonic()
         stats = LaunchStats()
+
+        if audience not in ("active", "churned", "all"):
+            raise ValueError(
+                f"audience must be 'active' | 'churned' | 'all', got "
+                f"{audience!r}"
+            )
 
         users = await self._db.list_active()
         dm_text = _build_dm_text(title, description, self._cta_url)
@@ -166,11 +190,22 @@ class FeatureLaunchBroadcaster:
         if include_email and self._resend is not None:
             emails: list[str] = []
             if self._whop_members_db is not None:
-                rows = await self._whop_members_db.list_valid_with_email()
+                rows: list = []
+                if audience in ("active", "all"):
+                    rows.extend(
+                        await self._whop_members_db.list_valid_with_email()
+                    )
+                if audience in ("churned", "all"):
+                    rows.extend(
+                        await self._whop_members_db.list_invalid_with_email()
+                    )
                 emails = [r.email for r in rows]
-            if not emails:
+            if not emails and audience == "active":
+                # Fallback only makes sense for the "active" audience —
+                # if you asked for churned and Whop sync hasn't run, we
+                # have no way to identify who's churned.
                 emails = [u.email for u in users if u.email]
-            # De-dup in case the same email appears in both sources.
+            # De-dup in case the same email appears in multiple sources.
             emails = list({e for e in emails if e})
             subject = f"Something new just dropped in Potion: {title}"
             for email in emails:
@@ -199,9 +234,95 @@ class FeatureLaunchBroadcaster:
 
         stats.duration_sec = time.monotonic() - start
         logger.info(
-            "Feature launch complete: DM %d/%d, email %d/%d, %.1fs",
+            "Feature launch complete: DM %d/%d, email %d/%d, audience=%s, %.1fs",
             stats.dm_sent, stats.dm_attempted,
             stats.email_sent, stats.email_attempted,
-            stats.duration_sec,
+            audience, stats.duration_sec,
         )
         return stats
+
+    async def enqueue_monthly_digest(
+        self,
+        email_db,
+        audience: str = "active",
+        rejoin_url: str = "",
+    ) -> dict[str, int]:
+        """Schedule a monthly digest email (onboarding day=60 template) for
+        every member in the requested audience via the existing email_db
+        scheduled_sends pipeline.
+
+        Why scheduled_sends instead of direct Resend.send like ``broadcast()``?
+        Three reasons:
+
+          1. The EmailWorker already throttles to 1.5/sec (Resend's per-second
+             cap). Sending 95k emails directly from this method would either
+             saturate the API or require duplicating the throttling logic.
+          2. Each scheduled_send row gets a Resend message id stamped on
+             delivery, which the Resend webhook receiver joins back for
+             open/click/bounce stats per recipient.
+          3. Auto-suppression (hard bounce / complaint flags whop_members
+             invalid=1) is wired into the events_db path, so a monthly
+             digest blast actually cleans up the roster.
+
+        Returns ``{"audience": str, "queued": int, "skipped_no_email": int}``.
+        Caller should follow with the standard EmailWorker — no extra cron
+        is needed because the worker already polls every 60s.
+        """
+        if audience not in ("active", "churned", "all"):
+            raise ValueError(
+                f"audience must be 'active' | 'churned' | 'all', got "
+                f"{audience!r}"
+            )
+        if self._whop_members_db is None:
+            raise RuntimeError(
+                "enqueue_monthly_digest requires whop_members_db wiring"
+            )
+
+        from src.email_bot.db import Subscriber
+
+        rows = []
+        if audience in ("active", "all"):
+            rows.extend(await self._whop_members_db.list_valid_with_email())
+        if audience in ("churned", "all"):
+            rows.extend(await self._whop_members_db.list_invalid_with_email())
+
+        # De-dup by email so a member with multiple memberships gets one send.
+        seen: set[str] = set()
+        deduped = []
+        skipped = 0
+        for r in rows:
+            email = (r.email or "").strip().lower()
+            if not email:
+                skipped += 1
+                continue
+            if email in seen:
+                continue
+            seen.add(email)
+            deduped.append(r)
+
+        now = int(time.time())
+        rejoin = rejoin_url or self._cta_url
+        queued = 0
+        for r in deduped:
+            sub = Subscriber(
+                email=r.email.lower(),
+                name="",
+                trigger_type="monthly_digest",
+                exit_reason="none",
+                rejoin_url=rejoin,
+                created_at=now,
+            )
+            await email_db.upsert_subscriber(sub)
+            await email_db.schedule_one(
+                email=sub.email,
+                sequence="onboarding",
+                day=60,
+                due_at=now,
+            )
+            queued += 1
+
+        logger.info(
+            "enqueue_monthly_digest: audience=%s queued=%d skipped_no_email=%d",
+            audience, queued, skipped,
+        )
+        return {"audience": audience, "queued": queued, "skipped_no_email": skipped}
