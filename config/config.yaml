@@ -53,6 +53,20 @@ discord:
       id_env: WALLET_TRACKER_CHANNEL_ID
       ref_link_env: REF_LINK_MEMECOIN
 
+    - key: degen_calls
+      name: "Degen Calls"
+      display_name: "Degen Calls"
+      source_type: memecoin
+      id_env: DEGEN_CALLS_CHANNEL_ID
+      ref_link_env: REF_LINK_MEMECOIN
+
+    - key: wall_street_bets
+      name: "Wall Street Bets"
+      display_name: "Wall Street Bets"
+      source_type: memecoin
+      id_env: WALL_STREET_BETS_CHANNEL_ID
+      ref_link_env: REF_LINK_MEMECOIN
+
 dispatcher:
   # Telegram's global bot limit is ~30 msgs/sec across chats — stay under.
   rate_per_sec: 25
