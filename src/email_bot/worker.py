@@ -33,13 +33,16 @@ class EmailWorker:
         analytics_db_path: str,
         poll_interval_sec: float = 60.0,
         max_per_cycle: int = 50,
-        send_rate_per_sec: float = 8.0,
+        send_rate_per_sec: float = 1.5,
     ):
         """``send_rate_per_sec`` throttles inter-send delays inside a cycle
-        so we stay under Resend's per-second cap. Free tier is 2/sec, Pro
-        is 10/sec; defaulting to 8 leaves headroom on Pro. The worker
-        sleeps ``1/send_rate_per_sec`` between consecutive sends in the
-        same cycle. Cycles themselves are still gated by poll_interval_sec.
+        so we stay under Resend's per-second cap. Resend's transactional
+        /emails endpoint hard-caps at 2/sec on every plan we observe, so
+        defaulting to 1.5 leaves headroom against burst rounding. Bump
+        this if Resend confirms a higher per-account allowance. The
+        worker sleeps ``1/send_rate_per_sec`` between consecutive sends
+        in the same cycle. Cycles themselves are still gated by
+        poll_interval_sec.
         """
         self._db = db
         self._sender = sender
