@@ -33,12 +33,20 @@ class EmailWorker:
         analytics_db_path: str,
         poll_interval_sec: float = 60.0,
         max_per_cycle: int = 50,
+        send_rate_per_sec: float = 8.0,
     ):
+        """``send_rate_per_sec`` throttles inter-send delays inside a cycle
+        so we stay under Resend's per-second cap. Free tier is 2/sec, Pro
+        is 10/sec; defaulting to 8 leaves headroom on Pro. The worker
+        sleeps ``1/send_rate_per_sec`` between consecutive sends in the
+        same cycle. Cycles themselves are still gated by poll_interval_sec.
+        """
         self._db = db
         self._sender = sender
         self._analytics_db_path = analytics_db_path
         self._poll_interval = poll_interval_sec
         self._max_per_cycle = max_per_cycle
+        self._send_interval = 1.0 / max(send_rate_per_sec, 0.1)
         self._task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
 
@@ -95,9 +103,21 @@ class EmailWorker:
             logger.exception("Could not load analytics stats; skipping cycle")
             return
 
-        for send in batch:
+        for i, send in enumerate(batch):
             if self._stop_event.is_set():
                 break
+            # Throttle between sends to stay under Resend's per-second
+            # cap (2/sec free, 10/sec Pro). Skip the sleep before the
+            # very first send so single-send cycles don't add latency.
+            if i > 0:
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(),
+                        timeout=self._send_interval,
+                    )
+                    return  # stop requested mid-cycle
+                except asyncio.TimeoutError:
+                    pass
             try:
                 await self._deliver_one(send, stats)
             except Exception:
