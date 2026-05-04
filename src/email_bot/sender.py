@@ -39,6 +39,7 @@ class ResendClient:
     """Async client for Resend's /emails endpoint."""
 
     API_URL = "https://api.resend.com/emails"
+    BROADCASTS_URL = "https://api.resend.com/broadcasts"
 
     def __init__(
         self,
@@ -128,3 +129,36 @@ class ResendClient:
         except Exception as e:
             logger.exception("Unexpected Resend error for %s", to)
             return SendResult(ok=False, error=f"unexpected: {e}")
+
+    async def get_broadcast(self, broadcast_id: str) -> dict | None:
+        """Read-only lookup of one Resend broadcast's metadata.
+
+        Used by the /email-broadcast-stats Discord slash command to print
+        the broadcast's display name alongside its ID. Returns None on
+        404 (unknown ID), network error, or empty broadcast_id so the
+        caller can fall back to a placeholder without try/except.
+        """
+        if not broadcast_id:
+            return None
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        url = f"{self.BROADCASTS_URL}/{broadcast_id}"
+        try:
+            async with self._session.get(
+                url,
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                timeout=aiohttp.ClientTimeout(total=self._timeout),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:
+                    return None
+                return data if isinstance(data, dict) else None
+        except aiohttp.ClientError as e:
+            logger.warning("Resend get_broadcast transport error: %s", e)
+            return None
+        except Exception:
+            logger.exception("Unexpected Resend get_broadcast error")
+            return None

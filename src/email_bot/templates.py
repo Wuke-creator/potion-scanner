@@ -13,10 +13,19 @@ and 06_Offer_Copy). Dynamic values:
   {top_calls_7d_bullets}- multi-line bullet list of up to 3 wins
   {rejoin_url}          - per-subscriber rejoin link (from subscriber row)
   {discord_free}        - public Potion Discord invite
+
+UTM tagging:
+  After a template returns, render() runs ``_apply_utm`` over the text and
+  html bodies. Any URL on a known domain (whop.com, discord.com, discord.gg,
+  t.me, potion.*) gets tagged with utm_source=potion_email,
+  utm_medium=email, utm_campaign={sequence}_day{day}. This gives the
+  analytics layer's ``top_clicked_urls`` per-template granularity even
+  though the underlying CTAs share the same destinations across sequences.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from html import escape
 
@@ -1238,4 +1247,83 @@ def render(
         raise ValueError(f"unknown sequence: {sequence!r}")
     if renderer is None:
         raise ValueError(f"no template for {sequence!r} day {day}")
-    return renderer(subscriber, stats)
+    rendered = renderer(subscriber, stats)
+    return RenderedEmail(
+        subject=rendered.subject,
+        text=_apply_utm(rendered.text, sequence, day),
+        html=_apply_utm(rendered.html, sequence, day),
+        from_name=rendered.from_name,
+    )
+
+
+# ---------------------------------------------------------------------------
+# UTM tagging
+# ---------------------------------------------------------------------------
+
+# Domains we tag. Discord/Telegram don't honor query params but the URL
+# still works and the click_url Resend records becomes per-(sequence,day),
+# which gives the analytics dashboard per-template top-CTA breakdowns.
+_UTM_DOMAINS = (
+    "whop.com",
+    "discord.com",
+    "discord.gg",
+    "t.me",
+    "potion.wtf",
+    "potion.com",
+)
+
+# Match an http(s) URL on one of the tagged domains. The trailing char
+# class stops at whitespace, HTML attribute terminators, and common text
+# punctuation that wouldn't appear inside a URL we authored. Keep this
+# intentionally lenient: we'd rather miss a malformed URL than corrupt a
+# legitimate one.
+_UTM_URL_RE = re.compile(
+    r"https?://(?:www\.)?(?:"
+    + "|".join(re.escape(d) for d in _UTM_DOMAINS)
+    + r")(?:/[^\s<>\"')\]]*)?",
+    flags=re.IGNORECASE,
+)
+
+
+def _utm_params(sequence: str, day: int) -> str:
+    return (
+        f"utm_source=potion_email"
+        f"&utm_medium=email"
+        f"&utm_campaign={sequence}_day{day}"
+    )
+
+
+def _apply_utm(body: str, sequence: str, day: int) -> str:
+    """Append UTM params to every URL in ``body`` whose host is in
+    ``_UTM_DOMAINS``. Idempotent: URLs that already have ``utm_source``
+    are left alone so a render-after-render-after-render chain never
+    duplicates the params.
+    """
+    if not body:
+        return body
+    params = _utm_params(sequence, day)
+
+    def _rewrite(match: re.Match) -> str:
+        url = match.group(0)
+        # Strip trailing punctuation that the regex picked up but a human
+        # reader would consider end-of-sentence punctuation (rare but
+        # happens in plain-text bodies). We re-append it after tagging.
+        trailing = ""
+        while url and url[-1] in ".,;:!?":
+            trailing = url[-1] + trailing
+            url = url[:-1]
+        if not url:
+            return match.group(0)
+        # Skip URLs that already have UTM tracking. Catches double-renders
+        # and any links the templates pre-tagged manually.
+        lower = url.lower()
+        if "utm_source=" in lower:
+            return url + trailing
+        # Don't touch the path-less host (e.g. "https://discord.gg" with
+        # nothing after) — adding query params there would be confusing.
+        # The regex requires at least the protocol+host, so an empty path
+        # is fine; we still tag it for consistency.
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}{params}{trailing}"
+
+    return _UTM_URL_RE.sub(_rewrite, body)

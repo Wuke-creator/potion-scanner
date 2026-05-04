@@ -43,6 +43,7 @@ from src.discord_listener import DiscordListener, IncomingMessage
 from src.dispatcher import Dispatcher
 from src.email_bot import EmailDB
 from src.email_bot.discord_commands import EmailSlashCommands
+from src.email_bot.analytics import EmailAnalytics
 from src.email_bot.events_db import EmailEventsDB
 from src.email_bot.sender import ResendClient
 from src.email_bot.webhook import EmailWebhookHandlers
@@ -422,6 +423,15 @@ async def run(config: Config) -> None:
 
         logger.info("Automations enabled")
 
+    # --- Email analytics (joins email_db + email_events_db + verified_users) ---
+    email_analytics: EmailAnalytics | None = None
+    if email_db is not None and email_events_db is not None:
+        email_analytics = EmailAnalytics(
+            email_db=email_db,
+            events_db=email_events_db,
+            verified_users_db_path=config.verification.db_path,
+        )
+
     # --- Discord slash commands (build LAST so launch_broadcaster is available) ---
     if email_db is not None and config.email_bot.discord_admin_user_ids:
         slash = EmailSlashCommands(
@@ -433,6 +443,7 @@ async def run(config: Config) -> None:
             whop_email_sync=whop_email_sync,
             events_db=email_events_db,
             resend_client=email_sender,
+            analytics=email_analytics,
         )
         slash.register(listener.client)
         logger.info("Discord slash commands registered")

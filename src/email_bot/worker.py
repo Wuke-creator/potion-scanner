@@ -162,7 +162,7 @@ class EmailWorker:
             from_name=email.from_name,
         )
         if result.ok:
-            await self._db.mark_sent(send.id)
+            await self._db.mark_sent(send.id, resend_id=result.resend_id)
             logger.info(
                 "Sent %s day %d to %s (resend_id=%s)",
                 send.sequence, send.day, sub.email, result.resend_id,

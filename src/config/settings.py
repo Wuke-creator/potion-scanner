@@ -154,8 +154,10 @@ class EmailBotConfig:
     resend_from_address: str = "Potion <team@potion.gg>"
     whop_webhook_secret: str = ""
     admin_webhook_secret: str = ""
+    resend_webhook_secret: str = ""
     rejoin_url: str = "https://whop.com/potion"
     db_path: str = "data/email.db"
+    email_events_db_path: str = "data/email_events.db"
     worker_poll_sec: float = 60.0
     worker_max_per_cycle: int = 50
     discord_admin_user_ids: list[int] = field(default_factory=list)
@@ -407,11 +409,16 @@ def load_config(
         ),
         whop_webhook_secret=os.getenv("WHOP_WEBHOOK_SECRET", ""),
         admin_webhook_secret=os.getenv("ADMIN_WEBHOOK_SECRET", ""),
+        resend_webhook_secret=os.getenv("RESEND_WEBHOOK_SECRET", ""),
         rejoin_url=os.getenv(
             "POTION_REJOIN_URL",
             email_yaml.get("rejoin_url", "https://whop.com/potion"),
         ),
         db_path=email_yaml.get("db_path", "data/email.db"),
+        email_events_db_path=os.getenv(
+            "EMAIL_EVENTS_DB_PATH",
+            email_yaml.get("email_events_db_path", "data/email_events.db"),
+        ),
         worker_poll_sec=float(email_yaml.get("worker_poll_sec", 60)),
         worker_max_per_cycle=int(email_yaml.get("worker_max_per_cycle", 50)),
         discord_admin_user_ids=admin_ids,

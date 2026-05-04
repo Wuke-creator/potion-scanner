@@ -50,6 +50,7 @@ class ScheduledSend:
     sent_at: int | None
     status: str              # pending | sent | failed | canceled
     error: str | None
+    resend_id: str | None = None  # Resend message id, set when worker delivers
 
 
 # Valid exit reason codes. Keep in sync with template offer variants.
@@ -85,9 +86,16 @@ CREATE TABLE IF NOT EXISTS scheduled_sends (
   due_at     INTEGER NOT NULL,
   sent_at    INTEGER,
   status     TEXT NOT NULL DEFAULT 'pending',
-  error      TEXT
+  error      TEXT,
+  resend_id  TEXT
 );
 """
+
+# Migrations for DBs that predate the resend_id column. SQLite errors if
+# the column already exists; the open() helper swallows that case.
+_SENDS_MIGRATIONS = (
+    "ALTER TABLE scheduled_sends ADD COLUMN resend_id TEXT",
+)
 
 _SENDS_DUE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_sends_due
@@ -97,6 +105,16 @@ CREATE INDEX IF NOT EXISTS idx_sends_due
 _SENDS_EMAIL_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_sends_email
     ON scheduled_sends (email);
+"""
+
+_SENDS_RESEND_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_sends_resend_id
+    ON scheduled_sends (resend_id);
+"""
+
+_SENDS_SEQ_DAY_SENT_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_sends_seq_day_sent
+    ON scheduled_sends (sequence, day, sent_at);
 """
 
 
@@ -113,8 +131,16 @@ class EmailDB:
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute(_SUBSCRIBERS_DDL)
         await self._conn.execute(_SENDS_DDL)
+        for stmt in _SENDS_MIGRATIONS:
+            try:
+                await self._conn.execute(stmt)
+            except Exception:
+                # Column already exists from a prior migration run.
+                pass
         await self._conn.execute(_SENDS_DUE_INDEX)
         await self._conn.execute(_SENDS_EMAIL_INDEX)
+        await self._conn.execute(_SENDS_RESEND_INDEX)
+        await self._conn.execute(_SENDS_SEQ_DAY_SENT_INDEX)
         await self._conn.commit()
         logger.info("Email DB opened at %s", self._db_path)
 
@@ -181,6 +207,10 @@ class EmailDB:
         "pre_renewal",        # one-shot 3 days before billing
         "pre_pause_return",   # one-shot 3 days before pause expiry
         "inactive_day10",     # one-shot at 10 days of inactivity
+        # AUT-026 Targeted Save Offer (one-shot, fires the moment Whop
+        # signals a cancellation so we hit the user with a personalised
+        # offer BEFORE the standard winback Day 1 lands)
+        "save_offer",         # one-shot, immediate, copy varies by exit reason
     }
 
     # Sequences that are mutually exclusive when scheduling — a fresh
@@ -290,7 +320,8 @@ class EmailDB:
         assert self._conn is not None
         now = now if now is not None else int(time.time())
         async with self._conn.execute(
-            "SELECT id, email, sequence, day, due_at, sent_at, status, error "
+            "SELECT id, email, sequence, day, due_at, sent_at, status, "
+            "       error, resend_id "
             "FROM scheduled_sends "
             "WHERE status = 'pending' AND due_at <= ? "
             "ORDER BY due_at ASC "
@@ -302,18 +333,85 @@ class EmailDB:
             ScheduledSend(
                 id=r[0], email=r[1], sequence=r[2], day=r[3],
                 due_at=r[4], sent_at=r[5], status=r[6], error=r[7],
+                resend_id=r[8],
             )
             for r in rows
         ]
 
-    async def mark_sent(self, send_id: int) -> None:
+    async def mark_sent(
+        self, send_id: int, resend_id: str | None = None,
+    ) -> None:
+        """Mark a send as delivered. ``resend_id`` is the message id Resend
+        returns from POST /emails; we persist it so webhook events
+        (opened/clicked/bounced) can be joined back to the (sequence, day)
+        tuple by the analytics layer.
+        """
         assert self._conn is not None
+        clean_id = (resend_id or "").strip() or None
         await self._conn.execute(
             "UPDATE scheduled_sends "
-            "SET status='sent', sent_at=?, error=NULL WHERE id = ?",
-            (int(time.time()), send_id),
+            "SET status='sent', sent_at=?, error=NULL, "
+            "    resend_id=COALESCE(?, resend_id) "
+            "WHERE id = ?",
+            (int(time.time()), clean_id, send_id),
         )
         await self._conn.commit()
+
+    async def sent_in_window(
+        self,
+        sequence: str | None = None,
+        day: int | None = None,
+        since: int | None = None,
+        until: int | None = None,
+        limit: int = 200_000,
+    ) -> list[dict]:
+        """Sends marked status='sent' in the given window, optionally
+        filtered by sequence + day. Returns dicts with the join-key
+        fields the analytics layer needs.
+
+        Rows whose ``resend_id`` is NULL are skipped: those are pre-Phase-1
+        sends that we have no way to match against email_events, so they
+        would only inflate the 'sent' denominator without contributing to
+        any open/click/bounce counts. The fallback path for those rows is
+        recipient-level history, which we expose separately.
+        """
+        assert self._conn is not None
+        clauses = ["status = 'sent'", "resend_id IS NOT NULL", "resend_id != ''"]
+        params: list = []
+        if sequence is not None:
+            clauses.append("sequence = ?")
+            params.append(sequence)
+        if day is not None:
+            clauses.append("day = ?")
+            params.append(int(day))
+        if since is not None:
+            clauses.append("sent_at >= ?")
+            params.append(int(since))
+        if until is not None:
+            clauses.append("sent_at <= ?")
+            params.append(int(until))
+        sql = (
+            "SELECT id, email, sequence, day, due_at, sent_at, resend_id "
+            "FROM scheduled_sends "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY sent_at DESC "
+            "LIMIT ?"
+        )
+        params.append(int(limit))
+        async with self._conn.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            {
+                "id": r[0],
+                "email": r[1],
+                "sequence": r[2],
+                "day": r[3],
+                "due_at": r[4],
+                "sent_at": r[5],
+                "resend_id": r[6],
+            }
+            for r in rows
+        ]
 
     async def mark_failed(self, send_id: int, error: str) -> None:
         assert self._conn is not None
