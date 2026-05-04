@@ -646,6 +646,50 @@ def _format_price_row(label: str, value: float) -> str:
     return f"{label}: <code>{_format_price_for_display(str(value))}</code>"
 
 
+# Wrap numeric values that follow common price labels (Entry, SL, TP1,
+# Full TP, etc.) and the "@ price" inline shorthand in <code> tags so
+# Telegram renders them as tap-to-copy. Used by format_unknown_message
+# for the freeform/Perp-Pinger forwarder where we don't have a
+# structured ParsedSignal object to drive format_parsed_signal.
+#
+# Label list intentionally narrow to avoid wrapping non-price digits
+# elsewhere in the body (channel mentions, timestamps, etc.). The
+# regex requires a colon or equals between label and value, which
+# excludes incidental phrases like "FARTCOIN LIMIT LONG".
+_PRICE_LABEL_RE = re.compile(
+    r"\b(Entry|Stop\s*Loss|Stop|SL|Full\s*TP|TP\s*\d+|TP|"
+    r"Take\s*Profit\s*\d*|Target\s*\d*|Liquidation|Liq)"
+    r"(\s*[:=]\s*)"
+    r"(\d+(?:[.,]\d+)?)",
+    re.IGNORECASE,
+)
+# Inline "@ 0.1945" shorthand (Perp Pinger header style).
+_AT_PRICE_RE = re.compile(r"(@\s*)(\d+(?:[.,]\d+)?)")
+
+
+def _wrap_prices_in_code(html_text: str) -> str:
+    """Wrap numeric values following known price labels in <code> tags.
+
+    Telegram renders <code>...</code> as tap-to-copy on mobile, which
+    is essential for the Perp Pinger / freeform path where users need
+    to paste entry / SL / TP into their exchange.
+
+    Safe against double-wrapping: the regex requires a price LABEL
+    immediately before the number, so digits already inside <code>
+    blocks (which sit after a HTML tag, not a label word) won't match.
+    """
+    def _label_sub(m: re.Match) -> str:
+        label, sep, value = m.group(1), m.group(2), m.group(3)
+        return f"{label}{sep}<code>{value}</code>"
+
+    def _at_sub(m: re.Match) -> str:
+        return f"{m.group(1)}<code>{m.group(2)}</code>"
+
+    out = _PRICE_LABEL_RE.sub(_label_sub, html_text)
+    out = _AT_PRICE_RE.sub(_at_sub, out)
+    return out
+
+
 def format_unknown_message(
     raw_message: str,
     ref_link: str,
@@ -657,9 +701,12 @@ def format_unknown_message(
 
     Runs Discord markdown through ``discord_to_telegram_html`` so links,
     bold, and italic render correctly on Telegram instead of leaking as
-    literal ``**``/``[…](…)``/``&lt;…&gt;`` tokens.
+    literal ``**``/``[…](…)``/``&lt;…&gt;`` tokens. Then wraps any
+    label-followed-by-price numeric values in <code> tags so subscribers
+    can tap-to-copy entry / SL / TP into their exchange.
     """
     cleaned = discord_to_telegram_html(raw_message.strip())
+    cleaned = _wrap_prices_in_code(cleaned)
     if len(cleaned) > 1500:
         cleaned = cleaned[:1500] + "..."
     ch = escape(channel_name)
