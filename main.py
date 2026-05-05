@@ -207,6 +207,12 @@ async def run(config: Config) -> None:
                 resend_webhook_secret=config.email_bot.resend_webhook_secret,
                 events_db=email_events_db,
                 save_offer_router=save_offer_router,
+                post_retention_survey_url=(
+                    config.automations.post_retention_survey_url
+                ),
+                post_retention_delay_days=(
+                    config.automations.post_retention_delay_days
+                ),
             )
             webhook_handlers.register(verification.callback_server.app)
             logger.info("Email bot enabled (Resend + Whop webhook + SaveOfferRouter)")

@@ -326,6 +326,9 @@ class EmailWebhookHandlers:
         resend_webhook_secret: str = "",
         events_db: EmailEventsDB | None = None,
         save_offer_router=None,
+        post_retention_survey_url: str = "",
+        post_retention_delay_days: int = 7,
+        post_retention_max_lookback_days: int = 30,
     ):
         """``whop_members_db`` is optional. When provided, the new
         payment_failed and payment_succeeded webhook receivers can flip
@@ -347,6 +350,11 @@ class EmailWebhookHandlers:
         self._resend_secret = resend_webhook_secret
         self._events_db = events_db
         self._save_offer_router = save_offer_router
+        self._post_retention_survey_url = post_retention_survey_url
+        self._post_retention_delay_sec = post_retention_delay_days * 86400
+        self._post_retention_lookback_sec = (
+            post_retention_max_lookback_days * 86400
+        )
 
     def register(self, app: web.Application) -> None:
         # Unified Whop dispatcher (recommended). Configure ONE webhook in
@@ -510,9 +518,20 @@ class EmailWebhookHandlers:
 
     async def _dispatch_reactivation(self, data: dict) -> web.Response:
         """membership.activated fires both for first-ever joins and for
-        churned members coming back. We treat both identically: stop any
-        active dunning so the member doesn't keep getting reminders, and
-        log so the (future) AUT-030 Welcome Back automation can fire."""
+        churned members coming back. We:
+
+          1. Stop any active dunning so the member doesn't keep getting
+             reminders.
+          2. Detect the SAVE pattern: an email_db subscriber row exists
+             with trigger_type='cancellation' inside the lookback window.
+             If so, the user previously cancelled and just came back —
+             schedule the AUT-033 post-retention follow-up survey for
+             ``post_retention_delay_days`` from now.
+
+        First-time joiners hit step 1 as a no-op (no dunning row) and
+        step 2 finds no prior cancellation, so the only effect is the
+        log line. Reactivations after a save trigger both.
+        """
         if self._whop_members_db is None:
             return web.json_response({"ok": True, "noted": False})
         whop_user_id = self._extract_whop_user_id(data)
@@ -524,11 +543,78 @@ class EmailWebhookHandlers:
                     "membership.activated: stop_dunning crashed for %s",
                     whop_user_id,
                 )
+
+        # AUT-033 Post-Retention Follow-Up Survey detection.
+        # Look the member up by email; if they were enrolled as a
+        # cancellation within the lookback window, this reactivation
+        # is a save and we owe them the follow-up survey 7 days out.
+        post_retention_scheduled = False
+        if self._post_retention_survey_url:
+            email = (
+                data.get("email")
+                or (data.get("user") or {}).get("email")
+                or (data.get("membership") or {}).get(
+                    "user", {}
+                ).get("email", "")
+            ).strip().lower()
+            if email:
+                try:
+                    sub = await self._db.get_subscriber(email)
+                except Exception:
+                    sub = None
+                    logger.exception(
+                        "post_retention: get_subscriber crashed for %s",
+                        email,
+                    )
+                now = int(time.time())
+                if (
+                    sub is not None
+                    and sub.trigger_type == "cancellation"
+                    and (now - sub.created_at) <= self._post_retention_lookback_sec
+                ):
+                    try:
+                        # Update rejoin_url to the survey URL so the
+                        # template renders the right CTA destination
+                        # without needing a separate column.
+                        sub_to_update = Subscriber(
+                            email=email,
+                            name=sub.name,
+                            trigger_type="post_retention",
+                            exit_reason=sub.exit_reason,
+                            rejoin_url=self._post_retention_survey_url,
+                            created_at=now,
+                        )
+                        await self._db.upsert_subscriber(sub_to_update)
+                        await self._db.schedule_one(
+                            email=email,
+                            sequence="post_retention",
+                            day=0,
+                            due_at=now + self._post_retention_delay_sec,
+                        )
+                        post_retention_scheduled = True
+                        logger.info(
+                            "AUT-033: scheduled post-retention survey for %s "
+                            "(fires in %d days)",
+                            email,
+                            self._post_retention_delay_sec // 86400,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "post_retention: schedule_one crashed for %s",
+                            email,
+                        )
+
         logger.info(
-            "Whop membership.activated: %s reactivated (dunning cleared)",
+            "Whop membership.activated: %s reactivated "
+            "(dunning_cleared=true, post_retention_scheduled=%s)",
             whop_user_id or "unknown",
+            post_retention_scheduled,
         )
-        return web.json_response({"ok": True, "user_id": whop_user_id})
+        return web.json_response({
+            "ok": True,
+            "user_id": whop_user_id,
+            "post_retention_scheduled": post_retention_scheduled,
+        })
 
     async def _dispatch_payment_failed(self, data: dict) -> web.Response:
         if self._whop_members_db is None:

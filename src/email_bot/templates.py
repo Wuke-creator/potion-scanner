@@ -1222,7 +1222,58 @@ _ONESHOT_RENDERERS = {
     "pre_pause_return": _pre_pause_return,
     "inactive_day10": _inactive_day10,
     "save_offer": lambda sub, stats: _save_offer_day0(sub, stats),
+    "post_retention": lambda sub, stats: _post_retention_day7(sub, stats),
 }
+
+
+def _post_retention_day7(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """AUT-033 Post-Retention Follow-Up Survey (one-shot, fires 7 days
+    after a cancelled member reactivates).
+
+    Drive spec: 05_Survey_Feedback.docx Task 23. The intent is to learn
+    WHY the save offer worked — what did the offer surface that the
+    user actually wanted? Different from the cancellation survey
+    (which asks why they're leaving) — this one asks what convinced
+    them to stay so we can lean into it for future at-risk members.
+
+    URL comes through ``sub.rejoin_url``, which the cron sets to the
+    configured ``post_retention_survey_url`` env var when scheduling.
+    If unset, falls back to a generic CTA pointing at the rejoin URL
+    so the email still sends rather than crashing.
+    """
+    name = _pretty_name(sub)
+    survey = sub.rejoin_url or "https://whop.com/potion"
+
+    subject = f"Quick one, {name} — what made you stay?"
+    text = (
+        f"Hey {name},\n\n"
+        f"Glad to have you back. Thanks for giving Potion another shot.\n\n"
+        f"One quick favour while it’s fresh: what was the thing that "
+        f"actually made you click stay? The offer? The pause option? "
+        f"Specific calls you didn’t want to miss? Something else?\n\n"
+        f"Two-minute survey, your answers go straight to the team and "
+        f"directly shape what we offer next time someone’s on the fence:\n\n"
+        f"{survey}\n\n"
+        f"No pressure. If you’d rather just reply to this email with "
+        f"a one-liner, that works too — we read every response.\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Glad to have you back. Thanks for giving Potion another shot.</p>"
+        f"<p>One quick favour while it’s fresh: <strong>what was the thing "
+        f"that actually made you click stay?</strong> The offer? The "
+        f"pause option? Specific calls you didn’t want to miss? Something "
+        f"else?</p>"
+        f"<p>Two-minute survey, your answers go straight to the team and "
+        f"directly shape what we offer next time someone’s on the fence:</p>"
+        f"{_cta_button_html('Take the 2-minute survey', survey)}"
+        f"<p style='color:#666;font-size:14px;'>No pressure. If you’d "
+        f"rather just reply to this email with a one-liner, that works "
+        f"too — we read every response.</p>"
+    )
+    return RenderedEmail(
+        subject=subject, text=text, html=_wrap_html(html_body),
+    )
 
 
 def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:

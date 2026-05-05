@@ -211,6 +211,10 @@ class EmailDB:
         # signals a cancellation so we hit the user with a personalised
         # offer BEFORE the standard winback Day 1 lands)
         "save_offer",         # one-shot, immediate, copy varies by exit reason
+        # AUT-033 Post-Retention Follow-Up Survey (one-shot, fires 7 days
+        # after a cancelled member reactivates — the "save was successful,
+        # what convinced you to stay?" survey).
+        "post_retention",
     }
 
     # Sequences that are mutually exclusive when scheduling — a fresh

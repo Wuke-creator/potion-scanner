@@ -221,6 +221,13 @@ class AutomationsConfig:
     whop_promo_api_key: str = ""  # WHOP_PROMO_API_KEY env var
     cancel_survey_promo_ttl_days: int = 30
 
+    # AUT-033 Post-Retention Follow-Up Survey URL. Sent 7 days after a
+    # cancelled member reactivates (the "what convinced you to stay?"
+    # survey). Leave blank to disable scheduling — the email won't fire
+    # without a real URL since the CTA would dead-end.
+    post_retention_survey_url: str = ""  # POST_RETENTION_SURVEY_URL env var
+    post_retention_delay_days: int = 7
+
 
 @dataclass
 class Config:
@@ -509,6 +516,13 @@ def load_config(
         ).strip(),
         cancel_survey_promo_ttl_days=int(
             automations_yaml.get("cancel_survey_promo_ttl_days", 30),
+        ),
+        post_retention_survey_url=os.getenv(
+            "POST_RETENTION_SURVEY_URL",
+            automations_yaml.get("post_retention_survey_url", ""),
+        ).strip(),
+        post_retention_delay_days=int(
+            automations_yaml.get("post_retention_delay_days", 7),
         ),
     )
 
