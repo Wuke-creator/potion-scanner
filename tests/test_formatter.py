@@ -116,6 +116,57 @@ class TestFormatLifecycleEvent:
         assert "..." in text
 
 
+class TestOstiumPlugInOnboardingDay0:
+    """The onboarding Day 0 email needs an Ostium 'Trading perps?'
+    section per the team conversation 2026-05-04. The CTA always renders;
+    the banner image is optional (env-var driven)."""
+
+    def _render_day0(self, banner_url: str = ""):
+        from src.email_bot import templates as t
+        from src.email_bot.db import Subscriber
+        from src.email_bot.stats import StatsBundle
+        prev_banner = t._OSTIUM_BANNER_URL
+        t._OSTIUM_BANNER_URL = banner_url
+        try:
+            sub = Subscriber(
+                email="t@example.com", name="Tester",
+                trigger_type="onboarding", exit_reason="none",
+                rejoin_url="", created_at=0,
+            )
+            stats = StatsBundle(
+                calls_7d_total=0, wins_7d_over_50pct=0,
+                top_call_7d=None, top_calls_7d=[],
+                calls_30d_total=0, top_call_30d=None, top_calls_30d=[],
+            )
+            return t._onboard_day0(sub, stats)
+        finally:
+            t._OSTIUM_BANNER_URL = prev_banner
+
+    def test_text_contains_ostium_url(self):
+        rendered = self._render_day0()
+        assert "Trading perps?" in rendered.text
+        assert "https://app.ostium.com/?ref=PTION" in rendered.text
+
+    def test_html_contains_cta_to_ostium(self):
+        rendered = self._render_day0()
+        assert "Trading perps?" in rendered.html
+        assert "Set up Ostium" in rendered.html
+        assert "https://app.ostium.com/?ref=PTION" in rendered.html
+
+    def test_html_omits_banner_when_url_unset(self):
+        rendered = self._render_day0(banner_url="")
+        assert "<img" not in rendered.html
+
+    def test_html_includes_banner_when_url_set(self):
+        rendered = self._render_day0(
+            banner_url="https://example.com/ostium-banner.png",
+        )
+        assert "<img" in rendered.html
+        assert "ostium-banner.png" in rendered.html
+        # Banner is wrapped in an anchor pointing at the trade URL
+        assert "app.ostium.com" in rendered.html
+
+
 class TestFormatUnknownMessage:
     def test_forwards_raw_text_with_link(self):
         text = format_unknown_message(

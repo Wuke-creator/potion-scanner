@@ -27,7 +27,19 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+import os
 from html import escape
+
+# Ostium plug shown at the bottom of the Day 0 onboarding email so new
+# Elite members know perp trading is part of the offering. Both fields
+# are env-var driven so the URL or banner can change without a code
+# change. ``OSTIUM_BANNER_URL`` is optional — when empty we render the
+# section as text + CTA button only (no image). When set, we add a
+# linked banner image above the heading.
+_OSTIUM_TRADE_URL = os.environ.get(
+    "OSTIUM_TRADE_URL", "https://app.ostium.com/?ref=PTION",
+)
+_OSTIUM_BANNER_URL = os.environ.get("OSTIUM_BANNER_URL", "")
 
 from src.email_bot.db import Subscriber
 from src.email_bot.stats import StatsBundle
@@ -669,7 +681,7 @@ def _reengage_day7(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
 
 
 def _onboard_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
-    """Day 0: welcome + 3 quickstart steps. Fires on first_seen_at."""
+    """Day 0: welcome + 3 quickstart steps + Ostium plug. Fires on first_seen_at."""
     name = _pretty_name(sub)
     discord = "https://discord.com/channels/1260259552763580537"
     telegram_bot = "https://t.me/PotionScannerBot"
@@ -687,7 +699,29 @@ def _onboard_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"the room is to ask.\n\n"
         f"Calls fire at all hours. The Telegram bot is what catches them "
         f"when you’re not at the screen. Set it up first.\n\n"
-        f"Discord: {discord}\n"
+        f"Discord: {discord}\n\n"
+        f"Trading perps? Set up your Ostium account here:\n"
+        f"{_OSTIUM_TRADE_URL}\n"
+    )
+    # Ostium plug section (optional banner image + CTA button). Banner
+    # only renders when OSTIUM_BANNER_URL is configured; CTA always renders.
+    banner_html = ""
+    if _OSTIUM_BANNER_URL:
+        banner_html = (
+            f"<p style='margin:24px 0 0 0;'>"
+            f"<a href='{escape(_OSTIUM_TRADE_URL)}'>"
+            f"<img src='{escape(_OSTIUM_BANNER_URL)}' alt='Ostium' "
+            f"style='width:100%;max-width:560px;border-radius:8px;'/>"
+            f"</a></p>"
+        )
+    ostium_section_html = (
+        "<hr style='margin:32px 0;border:none;border-top:1px solid #2a2a2a;'/>"
+        f"{banner_html}"
+        "<p style='margin:16px 0 4px 0;'><strong>Trading perps?</strong></p>"
+        "<p style='margin:0 0 12px 0;'>"
+        "Set up your Ostium account and trade onchain perps with one tap "
+        "from any signal we drop:</p>"
+        f"{_cta_button_html('Set up Ostium', _OSTIUM_TRADE_URL)}"
     )
     html_body = (
         f"<p>Hey {escape(name)},</p>"
@@ -706,6 +740,7 @@ def _onboard_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"<p>Calls fire at all hours. The Telegram bot is what catches "
         f"them when you’re not at the screen. Set it up first.</p>"
         f"{_cta_button_html('Open Discord', discord)}"
+        f"{ostium_section_html}"
     )
     return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
 
