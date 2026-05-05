@@ -104,6 +104,26 @@ class OAuthCallbackServer:
             "/oauth/discord/callback", self._handle_callback,
         )
         self._app.router.add_get("/health", self._handle_health)
+        # Serve repo-bundled assets (email banners, etc.) over the same
+        # aiohttp app on port 8080 so we have a stable HTTPS URL on the
+        # Railway public domain without needing a separate CDN. show_index
+        # is off so directory traversal can't list the folder contents.
+        # Path is repo-root-relative; uvicorn-style cwd-anchored. If the
+        # static dir doesn't exist (fresh clone before the asset is
+        # checked in), aiohttp logs a warning and skips registration
+        # rather than crashing.
+        from pathlib import Path
+        _static_dir = Path("static").resolve()
+        if _static_dir.is_dir():
+            self._app.router.add_static(
+                "/static/", path=str(_static_dir), show_index=False,
+            )
+        else:
+            logger.warning(
+                "Static dir %s not present at startup; /static/* routes "
+                "skipped",
+                _static_dir,
+            )
         self._runner: web.AppRunner | None = None
         self._site: web.BaseSite | None = None
 
