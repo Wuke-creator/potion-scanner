@@ -243,6 +243,13 @@ export function listTickets(opts: {
   // the result set on noisy chat channels.
   const limit = opts.limit ?? 200;
   const fetchCap = opts.mode === "complaints" ? Math.max(limit * 5, 1000) : limit;
+  // SQLite returns author_is_staff as 0/1 ints. The TicketRow public
+  // type has it as boolean. Use a private "raw" shape here so the
+  // spread that maps raw -> TicketRow doesn't hit a never-type
+  // conflict (boolean & number = never).
+  type RawTicketRow = Omit<TicketRow, "author_is_staff" | "complaint_severity"> & {
+    author_is_staff: number;
+  };
   const rows = ops
     .prepare(
       `SELECT message_id, channel_id, channel_name, parent_id, thread_name, source,
@@ -253,7 +260,7 @@ export function listTickets(opts: {
          ORDER BY created_at DESC
          LIMIT ?`
     )
-    .all(...params, fetchCap) as Array<TicketRow & { author_is_staff: number }>;
+    .all(...params, fetchCap) as RawTicketRow[];
 
   const severityRank: Record<string, number> = { none: 0, low: 1, medium: 2, high: 3 };
   const minRank = opts.minSeverity ? severityRank[opts.minSeverity] : 0;
