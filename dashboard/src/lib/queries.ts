@@ -288,6 +288,11 @@ export function listTickets(opts: {
 export function getTicket(messageId: number): TicketRow | null {
   const ops = tryOpenDb("ops");
   if (!ops) return null;
+  // Same RawTicketRow trick as listTickets above — boolean & number
+  // intersects to never, so use Omit + override to keep the spread valid.
+  type RawTicketRow = Omit<TicketRow, "author_is_staff" | "complaint_severity"> & {
+    author_is_staff: number;
+  };
   const r = ops
     .prepare(
       `SELECT message_id, channel_id, channel_name, parent_id, thread_name, source,
@@ -295,7 +300,7 @@ export function getTicket(messageId: number): TicketRow | null {
               captured_at, status, staff_notes, last_action_at, jump_url
          FROM tickets WHERE message_id = ?`
     )
-    .get(messageId) as (TicketRow & { author_is_staff: number }) | undefined;
+    .get(messageId) as RawTicketRow | undefined;
   if (!r) return null;
   return {
     ...r,
