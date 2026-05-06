@@ -24,6 +24,9 @@ COPY main.py .
 COPY src/ src/
 COPY config/ config/
 COPY signals/ signals/
+# Static assets served by the OAuth callback aiohttp app at /static/*
+# (e.g. ostium-banner.png embedded in the Day 0 onboarding email)
+COPY static/ static/
 
 # Runtime data + logs (volumes mounted from host in production)
 RUN mkdir -p data logs
