@@ -42,10 +42,9 @@ COPY --from=builder --chown=nextjs:nodejs /app/.next ./.next
 COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
 COPY --from=builder --chown=nextjs:nodejs /app/package.json ./package.json
 COPY --from=builder --chown=nextjs:nodejs /app/next.config.ts ./next.config.ts
-# public/ is optional in Next.js 15. Copy only if it exists in the
-# builder stage — the [ ] glob trick makes the COPY a no-op rather
-# than an error when the directory's missing.
-COPY --from=builder --chown=nextjs:nodejs /app/public[/] ./public/
+# Static assets served at the site root (banner images referenced from
+# outbound emails, plus anything else dropped under dashboard/public/).
+COPY --from=builder --chown=nextjs:nodejs /app/public ./public
 
 USER nextjs
 
