@@ -14,8 +14,12 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Python distutils/setuptools build dirs. ANCHORED to repo root via the
+# leading slash so the pattern doesn't accidentally catch nested
+# directories named lib/ (e.g. dashboard/src/lib/, which IS source code
+# that needs to be tracked).
+/lib/
+/lib64/
 parts/
 sdist/
 var/
