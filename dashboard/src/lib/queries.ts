@@ -701,7 +701,9 @@ export function listLeadershipMentions(opts: {
          ORDER BY created_at DESC
          LIMIT ?`
     )
-    .all(...params, limit) as Array<LeadershipMention & { acknowledged: number }>;
+    .all(...params, limit) as Array<
+      Omit<LeadershipMention, "acknowledged"> & { acknowledged: number }
+    >;
   return rows.map((r) => ({ ...r, acknowledged: !!r.acknowledged }));
 }
 
