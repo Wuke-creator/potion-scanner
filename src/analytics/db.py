@@ -63,13 +63,14 @@ class StatsWindow:
 
 _TRADES_DDL = """
 CREATE TABLE IF NOT EXISTS trades (
-  trade_id     INTEGER NOT NULL,
-  channel_key  TEXT NOT NULL,
-  pair         TEXT NOT NULL,
-  side         TEXT NOT NULL,
-  entry        REAL NOT NULL,
-  leverage     INTEGER NOT NULL,
-  opened_at    INTEGER NOT NULL,
+  trade_id                INTEGER NOT NULL,
+  channel_key             TEXT NOT NULL,
+  pair                    TEXT NOT NULL,
+  side                    TEXT NOT NULL,
+  entry                   REAL NOT NULL,
+  leverage                INTEGER NOT NULL,
+  opened_at               INTEGER NOT NULL,
+  source_discord_user_id  TEXT,
   PRIMARY KEY (trade_id, channel_key)
 );
 """
@@ -77,6 +78,14 @@ CREATE TABLE IF NOT EXISTS trades (
 _TRADES_OPENED_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_trades_opened
     ON trades (opened_at);
+"""
+
+# Idempotent migration: existing databases pre-date the source_discord_user_id
+# column. ALTER TABLE ADD COLUMN throws if the column is already present, so
+# we swallow OperationalError when the migration has already run. SQLite is
+# fine with NULLs for this column and it becomes the default for old rows.
+_TRADES_AUTHOR_MIGRATION = """
+ALTER TABLE trades ADD COLUMN source_discord_user_id TEXT
 """
 
 _EVENTS_DDL = """
@@ -118,6 +127,14 @@ class AnalyticsDB:
         await self._conn.execute(_EVENTS_DDL)
         await self._conn.execute(_EVENTS_RECORDED_INDEX)
         await self._conn.execute(_EVENTS_TRADE_INDEX)
+        # Migrate existing databases to add source_discord_user_id. Re-running
+        # the migration on a DB that already has the column raises
+        # OperationalError, which we swallow.
+        try:
+            await self._conn.execute(_TRADES_AUTHOR_MIGRATION)
+        except Exception as exc:  # noqa: BLE001
+            if "duplicate column name" not in str(exc).lower():
+                raise
         await self._conn.commit()
         logger.info("Analytics DB opened at %s", self._db_path)
 
@@ -136,14 +153,24 @@ class AnalyticsDB:
         side: str,
         entry: float,
         leverage: int,
+        source_discord_user_id: str | None = None,
     ) -> None:
-        """Record a new SIGNAL_ALERT. Idempotent on (trade_id, channel_key)."""
+        """Record a new SIGNAL_ALERT. Idempotent on (trade_id, channel_key).
+
+        ``source_discord_user_id`` is the Discord user ID of whoever posted
+        the signal in the source channel. NULL for legacy rows recorded
+        before the per-caller migration.
+        """
         assert self._conn is not None
         await self._conn.execute(
             "INSERT OR IGNORE INTO trades "
-            "(trade_id, channel_key, pair, side, entry, leverage, opened_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (trade_id, channel_key, pair, side, entry, leverage, int(time.time())),
+            "(trade_id, channel_key, pair, side, entry, leverage, opened_at, source_discord_user_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                trade_id, channel_key, pair, side, entry, leverage,
+                int(time.time()),
+                source_discord_user_id or None,
+            ),
         )
         await self._conn.commit()
 

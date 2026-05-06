@@ -143,6 +143,38 @@ async def run(config: Config) -> None:
                 discord_user_id, channel_id,
             )
 
+    # --- Ops capture: tickets / leadership / staff activity for the dashboard ---
+    ops_db = None
+    ops_capture = None
+    ops_flat_channels: set[int] = set()
+    ops_thread_parents: set[int] = set()
+    if config.ops_capture.enabled:
+        from src.ops import OpsCapture, OpsDB
+
+        ops_db = OpsDB(db_path=config.ops_capture.db_path)
+        await ops_db.open()
+        ops_capture = OpsCapture(
+            ops_db=ops_db,
+            general_channel_id=config.ops_capture.general_channel_id,
+            alpha_channel_id=config.ops_capture.alpha_channel_id,
+            ticket_forum_id=config.ops_capture.ticket_forum_id,
+            senior_staff_ids=set(config.ops_capture.senior_staff_ids),
+        )
+        ops_flat_channels = {
+            c for c in (
+                config.ops_capture.general_channel_id,
+                config.ops_capture.alpha_channel_id,
+            ) if c
+        }
+        if config.ops_capture.ticket_forum_id:
+            ops_thread_parents = {config.ops_capture.ticket_forum_id}
+        logger.info(
+            "Ops capture enabled: flat=%s thread_parents=%s staff=%d",
+            sorted(ops_flat_channels),
+            sorted(ops_thread_parents),
+            len(config.ops_capture.senior_staff_ids),
+        )
+
     # --- Discord listener: push messages onto an async queue ---
     queue: asyncio.Queue[IncomingMessage] = asyncio.Queue()
     listener = DiscordListener(
@@ -151,6 +183,9 @@ async def run(config: Config) -> None:
         queue=queue,
         activity_hook=_record_activity if activity_db is not None else None,
         activity_channel_ids=set(config.automations.activity_tracking_channel_ids),
+        ops_hook=ops_capture.handle if ops_capture is not None else None,
+        ops_flat_channel_ids=ops_flat_channels,
+        ops_thread_parent_ids=ops_thread_parents,
     )
 
     # --- Email bot DB + sender (construction only; registration later) ---
@@ -576,6 +611,11 @@ async def run(config: Config) -> None:
                 await activity_db.close()
             except Exception:
                 logger.exception("Activity DB close error")
+        if ops_db is not None:
+            try:
+                await ops_db.close()
+            except Exception:
+                logger.exception("Ops DB close error")
         if whop_members_db is not None:
             try:
                 await whop_members_db.close()

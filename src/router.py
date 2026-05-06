@@ -623,6 +623,7 @@ class Router:
                         side=signal.side.value,
                         entry=signal.entry,
                         leverage=signal.leverage,
+                        source_discord_user_id=getattr(message, "author_id", "") or None,
                     )
                 except Exception:
                     logger.exception("Analytics: failed to record signal")

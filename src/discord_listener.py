@@ -64,6 +64,12 @@ class IncomingMessage:
     author_name: str
     author_is_bot: bool
     content: str
+    # Stringified Discord user ID of the message author. Empty string if
+    # the listener could not resolve it (defensive, should never happen
+    # for messages received via on_message). Stored on the analytics row
+    # so the dashboard can surface per-caller signal performance without
+    # joining back to the activity DB.
+    author_id: str = ""
     # Image attachment URLs (Discord CDN). Used by the OCR pipeline for
     # image-bot channels (Pingu Charts etc.) where the actual signal data
     # lives baked into a chart image rather than the message text. Empty
@@ -179,6 +185,9 @@ class DiscordListener:
         queue: asyncio.Queue[IncomingMessage],
         activity_hook=None,
         activity_channel_ids: set[int] | None = None,
+        ops_hook=None,
+        ops_flat_channel_ids: set[int] | None = None,
+        ops_thread_parent_ids: set[int] | None = None,
     ):
         """
         Args:
@@ -190,12 +199,25 @@ class DiscordListener:
             activity_channel_ids: set of channel IDs to record activity for.
                 Independent from ``monitored_channel_ids`` (signals). Empty
                 or None disables the hook.
+            ops_hook: optional async callable
+                ``async def (message: discord.Message)`` invoked for every
+                non-bot message in either a flat ops channel or a thread
+                under a configured ops forum. Used by the ops dashboard to
+                capture tickets / leadership mentions / staff activity.
+            ops_flat_channel_ids: set of plain channel IDs (general, alpha)
+                that should fire the ops_hook directly.
+            ops_thread_parent_ids: set of forum / parent channel IDs whose
+                child threads should fire the ops_hook. The hook fires on
+                messages where ``message.channel.parent_id`` matches.
         """
         self._bot_token = bot_token
         self._monitored = set(monitored_channel_ids)
         self._queue = queue
         self._activity_hook = activity_hook
         self._activity_channels = set(activity_channel_ids or set())
+        self._ops_hook = ops_hook
+        self._ops_flat_channels = set(ops_flat_channel_ids or set())
+        self._ops_thread_parents = set(ops_thread_parent_ids or set())
 
         intents = discord.Intents.default()
         intents.message_content = True
@@ -233,6 +255,7 @@ class DiscordListener:
                 return
 
             channel_id = message.channel.id
+            parent_id = getattr(message.channel, "parent_id", None)
 
             # Activity hook fires for any tracked channel regardless of whether
             # the channel is a signal source. Ignore bot authors so we don't
@@ -250,6 +273,26 @@ class DiscordListener:
                     logger.exception(
                         "activity_hook crashed for user=%s channel=%d",
                         message.author.id, channel_id,
+                    )
+
+            # Ops capture fires for messages in the configured general/alpha
+            # channels OR for thread messages whose parent forum is in the
+            # configured ticket-forum set. Bots are skipped so the ticket bot's
+            # system messages aren't logged as user complaints.
+            if (
+                self._ops_hook is not None
+                and not getattr(message.author, "bot", False)
+                and (
+                    channel_id in self._ops_flat_channels
+                    or (parent_id is not None and parent_id in self._ops_thread_parents)
+                )
+            ):
+                try:
+                    await self._ops_hook(message)
+                except Exception:
+                    logger.exception(
+                        "ops_hook crashed for message_id=%s channel_id=%s",
+                        message.id, channel_id,
                     )
 
             # Only queue for routing if this is a monitored signal channel.
@@ -311,6 +354,7 @@ class DiscordListener:
                 content=text,
                 image_urls=image_urls or None,
                 buttons=buttons or None,
+                author_id=str(getattr(message.author, "id", "")),
             )
             logger.debug(
                 "Discord message captured: channel=%s author=%s len=%d",

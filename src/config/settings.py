@@ -230,6 +230,28 @@ class AutomationsConfig:
 
 
 @dataclass
+class OpsCaptureConfig:
+    """Ops dashboard capture: tickets / leadership / staff activity.
+
+    Listens to the Potion #general, #alpha, and the need-support forum
+    (whose threads are tickets) and persists every non-bot message to
+    ops.db. Empty channel/forum IDs disable the listener.
+
+    Senior staff IDs are used for two things: leadership @mention
+    detection (we log a row whenever any of these IDs gets pinged in a
+    captured channel) and staff activity tracking (we increment a daily
+    bucket whenever any of these IDs posts a message).
+    """
+
+    enabled: bool = False
+    db_path: str = "data/ops.db"
+    general_channel_id: int = 0
+    alpha_channel_id: int = 0
+    ticket_forum_id: int = 0
+    senior_staff_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Config:
     discord: DiscordConfig = field(default_factory=DiscordConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
@@ -240,6 +262,7 @@ class Config:
     email_bot: EmailBotConfig = field(default_factory=EmailBotConfig)
     automations: AutomationsConfig = field(default_factory=AutomationsConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    ops_capture: OpsCaptureConfig = field(default_factory=OpsCaptureConfig)
 
 
 def _env_int(name: str, default: int = 0) -> int:
@@ -526,6 +549,39 @@ def load_config(
         ),
     )
 
+    ops_yaml = yaml_data.get("ops_capture", {})
+    senior_ids_raw = os.getenv("POTION_SENIOR_STAFF_IDS", "").strip()
+    senior_ids: list[str] = []
+    if senior_ids_raw:
+        for part in senior_ids_raw.split(","):
+            part = part.strip()
+            if part.isdigit():
+                senior_ids.append(part)
+    else:
+        senior_ids = [
+            str(x) for x in ops_yaml.get("senior_staff_ids", [])
+            if str(x).strip().isdigit()
+        ]
+    ops_cfg = OpsCaptureConfig(
+        enabled=bool(
+            os.getenv("OPS_CAPTURE_ENABLED", "").strip().lower() in ("1", "true", "yes")
+        ),
+        db_path=ops_yaml.get("db_path", "data/ops.db"),
+        general_channel_id=_env_int(
+            "POTION_GENERAL_CHANNEL_ID",
+            int(ops_yaml.get("general_channel_id", 0) or 0),
+        ),
+        alpha_channel_id=_env_int(
+            "POTION_ALPHA_CHANNEL_ID",
+            int(ops_yaml.get("alpha_channel_id", 0) or 0),
+        ),
+        ticket_forum_id=_env_int(
+            "POTION_TICKET_FORUM_ID",
+            int(ops_yaml.get("ticket_forum_id", 0) or 0),
+        ),
+        senior_staff_ids=senior_ids,
+    )
+
     config = Config(
         discord=discord_cfg,
         telegram=telegram_cfg,
@@ -536,6 +592,7 @@ def load_config(
         email_bot=email_cfg,
         automations=automations_cfg,
         logging=logging_cfg,
+        ops_capture=ops_cfg,
     )
 
     _validate(config)
