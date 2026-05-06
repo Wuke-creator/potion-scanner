@@ -57,6 +57,10 @@ export function middleware(req: NextRequest) {
 
 export const config = {
   // Skip /auth (the token entry page), /api/auth (the cookie-setter
-  // endpoint), and Next.js internals + static files.
-  matcher: ["/((?!auth|api/auth|_next/static|_next/image|favicon.ico).*)"],
+  // endpoint), Next.js internals + static files, and /email-assets
+  // (public banner images referenced from outbound emails — must be
+  // reachable to Gmail's image proxy without the dashboard auth cookie).
+  matcher: [
+    "/((?!auth|api/auth|email-assets|_next/static|_next/image|favicon.ico).*)",
+  ],
 };
