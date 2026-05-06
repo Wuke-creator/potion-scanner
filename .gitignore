@@ -192,3 +192,16 @@ Thumbs.db
 
 # Docker
 docker-compose.override.yml
+
+# Node / Next.js (admin dashboard)
+node_modules/
+dashboard/.next/
+dashboard/out/
+.next/
+
+# One-off broadcast staging artifacts (rendered locally before each blast,
+# not source — keep them out of git so a stale copy never gets re-sent
+# accidentally and so they don't bloat the repo).
+potion-2.0-announcement.html
+potion-2.0-announcement.txt
+potion_logo_datauri.txt
