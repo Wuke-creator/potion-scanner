@@ -9,14 +9,16 @@
 FROM node:20-alpine AS builder
 WORKDIR /app
 
+# Build context on Railway is the REPO ROOT (not dashboard/), even
+# with RAILWAY_DOCKERFILE_PATH=dashboard/Dockerfile. So all COPY paths
+# below have to be prefixed with `dashboard/` to scope correctly.
+
 # Copy lockfile + package.json for layer-cached deps install.
-# (Build context is the dashboard/ subdir on Railway when
-# RAILWAY_DOCKERFILE_PATH=dashboard/Dockerfile.)
-COPY package.json package-lock.json* ./
+COPY dashboard/package.json dashboard/package-lock.json* ./
 RUN npm ci --no-audit --no-fund
 
-# Copy source + build
-COPY . .
+# Copy the rest of the dashboard source + build.
+COPY dashboard/ ./
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
