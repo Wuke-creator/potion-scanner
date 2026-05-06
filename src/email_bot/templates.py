@@ -107,25 +107,187 @@ def _top_bullets_html(stats: StatsBundle) -> str:
     return "<ul>" + "".join(items) + "</ul>"
 
 
+_BRAND_PURPLE = "#6b4fbb"
+_BRAND_PURPLE_LIGHT = "#b39ddb"
+_BG_PAGE = "#0a0a0f"
+_BG_CARD = "#14141c"
+_BG_CALLOUT = "#1c1630"
+_DIVIDER = "#2a2a3e"
+_TEXT_PRIMARY = "#ffffff"
+_TEXT_BODY = "#e8e8ea"
+_TEXT_SECONDARY = "#c8c8d0"
+_TEXT_FOOTER = "#b0b0b8"
+_TEXT_FOOTER_DIM = "#808088"
+_FONT_STACK = (
+    "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', "
+    "'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', "
+    "'Helvetica Neue', sans-serif"
+)
+
+
 def _cta_button_html(label: str, href: str) -> str:
-    safe = escape(href)
+    """Brand-purple pill CTA button matching the Potion 2.0 broadcast.
+
+    Wrapped in a centered <p> so the button always sits on its own line.
+    Inline styles only — email clients strip <style> blocks.
+    """
+    safe_href = escape(href, quote=True)
+    safe_label = escape(label)
     return (
-        f'<p style="margin:32px 0;"><a href="{safe}" '
-        'style="background:#6b4fbb;color:white;padding:14px 28px;'
-        'text-decoration:none;border-radius:8px;font-weight:bold;'
-        'display:inline-block;">'
-        f'{escape(label)}</a></p>'
+        f'<p style="margin:24px 0 8px 0;padding:0;text-align:center;">'
+        f'<a href="{safe_href}" target="_blank" rel="noopener noreferrer" '
+        f'style="display:inline-block;background-color:{_BRAND_PURPLE};'
+        f'color:{_TEXT_PRIMARY};padding:16px 36px;border-radius:8px;'
+        f'font-size:16px;font-weight:700;text-decoration:none;'
+        f'font-family:{_FONT_STACK};">'
+        f'{safe_label} &rarr;</a></p>'
     )
 
 
-def _wrap_html(body: str) -> str:
-    """Minimal responsive HTML wrapper."""
+def _wrap_html(
+    body: str,
+    *,
+    eyebrow: str = "POTION ALPHA",
+    headline: str = "",
+    footer_note: str = "",
+) -> str:
+    """Wrap email body in the dark-card layout from the Potion 2.0 broadcast.
+
+    Structure (table-based for max email-client compatibility):
+
+      page (bg #0a0a0f, padded)
+        card (max 600px, bg #14141c, rounded 16)
+          header (eyebrow + optional headline, divider beneath)
+          body slot (caller-supplied HTML)
+          footer (Potion Alpha Team + Unsubscribe link placeholder)
+
+    Backward-compatible: existing callers that pass only ``body`` get
+    a default eyebrow ("POTION ALPHA") and no headline. New callers
+    can pass ``headline=...`` to render a big white H1 below the
+    eyebrow (matching the broadcast's "The next chapter is here").
+
+    Resend's ``{{{RESEND_UNSUBSCRIBE_URL}}}`` macro is rendered raw so
+    the same template ships through both the transactional and broadcast
+    paths cleanly.
+    """
+    eyebrow_html = (
+        f'<p style="margin:0;padding:0;color:{_BRAND_PURPLE};font-size:13px;'
+        f'font-weight:700;letter-spacing:3px;text-transform:uppercase;">'
+        f'{escape(eyebrow)}</p>'
+        if eyebrow else ""
+    )
+    headline_html = (
+        f'<h1 style="margin:20px 0 0 0;padding:0;color:{_TEXT_PRIMARY};'
+        f'font-size:30px;line-height:1.2;font-weight:700;'
+        f'text-align:center;">{escape(headline)}</h1>'
+        if headline else ""
+    )
+    header_section = (
+        f'<tr><td align="center" '
+        f'style="margin:0;padding:36px 32px 28px 32px;'
+        f'border-bottom:1px solid {_DIVIDER};text-align:center;">'
+        f'{eyebrow_html}{headline_html}'
+        f'</td></tr>'
+    ) if (eyebrow_html or headline_html) else ""
+    body_section = (
+        f'<tr><td '
+        f'style="margin:0;padding:24px 32px;color:{_TEXT_BODY};'
+        f'font-size:16px;line-height:1.6;font-family:{_FONT_STACK};">'
+        f'{body}'
+        f'</td></tr>'
+    )
+    footer_note_html = (
+        f'<p style="margin:0 0 12px 0;padding:0;color:{_TEXT_FOOTER};'
+        f'font-size:14px;line-height:1.6;">{escape(footer_note)}</p>'
+        if footer_note else ""
+    )
+    footer_section = (
+        f'<tr><td align="center" '
+        f'style="margin:0;padding:20px 32px;'
+        f'border-top:1px solid {_DIVIDER};text-align:center;">'
+        f'{footer_note_html}'
+        f'<p style="margin:0 0 8px 0;padding:0;color:{_TEXT_FOOTER_DIM};'
+        f'font-size:12px;">Potion Alpha Team</p>'
+        f'<p style="margin:0;padding:0;color:{_TEXT_FOOTER_DIM};'
+        f'font-size:12px;">'
+        f'<a href="{{{{{{RESEND_UNSUBSCRIBE_URL}}}}}}" '
+        f'style="color:{_TEXT_FOOTER_DIM};text-decoration:underline;" '
+        f'target="_blank">Unsubscribe</a> &middot; '
+        f'<a href="https://whop.com/potion" '
+        f'style="color:{_TEXT_FOOTER_DIM};text-decoration:underline;" '
+        f'target="_blank">Visit Potion</a></p>'
+        f'</td></tr>'
+    )
+
     return (
-        '<!doctype html><html><body style="font-family:system-ui,sans-serif;'
-        'max-width:560px;margin:0 auto;padding:24px;color:#222;'
-        'line-height:1.5;">'
-        + body
-        + '</body></html>'
+        '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" '
+        '"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">'
+        '<html dir="ltr" lang="en"><head>'
+        '<meta charset="UTF-8" />'
+        '<meta name="viewport" content="width=device-width" />'
+        '<meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />'
+        '<meta name="x-apple-disable-message-reformatting" />'
+        '<meta http-equiv="X-UA-Compatible" content="IE=edge" />'
+        '<meta name="format-detection" '
+        'content="telephone=no,address=no,email=no,date=no,url=no" />'
+        '</head>'
+        f'<body style="margin:0;padding:0;background-color:{_BG_PAGE};'
+        f'font-family:{_FONT_STACK};">'
+        '<table border="0" width="100%" cellpadding="0" cellspacing="0" '
+        'role="presentation" align="center">'
+        '<tr><td align="center" '
+        f'style="background-color:{_BG_PAGE};padding:32px 16px;">'
+        '<table border="0" width="600" cellpadding="0" cellspacing="0" '
+        f'role="presentation" '
+        f'style="max-width:600px;width:100%;'
+        f'background-color:{_BG_CARD};border-radius:16px;overflow:hidden;">'
+        '<tbody>'
+        f'{header_section}{body_section}{footer_section}'
+        '</tbody></table>'
+        '</td></tr></table>'
+        '</body></html>'
+    )
+
+
+def _section_divider_html() -> str:
+    """Thin horizontal divider used between sections inside the card body."""
+    return (
+        f'<div style="margin:24px 0;height:1px;'
+        f'background-color:{_DIVIDER};line-height:1px;font-size:1px;">'
+        f'<p style="margin:0;padding:0;">&nbsp;</p></div>'
+    )
+
+
+def _purple_accent_p(text_html: str) -> str:
+    """A short purple-text paragraph used as a brand subhead."""
+    return (
+        f'<p style="margin:24px 0 8px 0;padding:0;'
+        f'color:{_BRAND_PURPLE_LIGHT};font-size:18px;font-weight:700;'
+        f'line-height:1.4;">{text_html}</p>'
+    )
+
+
+def _callout_box_html(eyebrow: str, headline: str, sub: str = "") -> str:
+    """Purple-bordered dark-purple card used to highlight a key offer
+    (matches the broadcast's '$99/month / 3-day free trial' block)."""
+    sub_html = (
+        f'<p style="margin:0;padding:0;color:{_TEXT_BODY};font-size:15px;">'
+        f'{escape(sub)}</p>'
+        if sub else ""
+    )
+    return (
+        f'<table width="100%" border="0" cellpadding="0" cellspacing="0" '
+        f'role="presentation" '
+        f'style="margin:24px 0;background-color:{_BG_CALLOUT};'
+        f'border:1px solid {_BRAND_PURPLE};border-radius:12px;">'
+        f'<tr><td align="center" style="padding:24px 20px;text-align:center;">'
+        f'<p style="margin:0;padding:0;color:{_BRAND_PURPLE_LIGHT};'
+        f'font-size:12px;font-weight:700;letter-spacing:2px;'
+        f'text-transform:uppercase;">{escape(eyebrow)}</p>'
+        f'<h2 style="margin:12px 0 4px 0;padding:0;color:{_TEXT_PRIMARY};'
+        f'font-size:26px;font-weight:700;">{escape(headline)}</h2>'
+        f'{sub_html}'
+        f'</td></tr></table>'
     )
 
 
@@ -181,7 +343,7 @@ def _winback_day1(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"<p>Your Concierge thread is still there. Your setup is still "
         f"saved. If you want to get it back, it takes 30 seconds.</p>"
         f"{_cta_button_html('Pick up where you left off', rejoin)}"
-        f"<p style='color:#666;font-size:14px;'>P.S. If something about "
+        f"<p style='color:#b0b0b8;font-size:14px;'>P.S. If something about "
         f"Potion wasn\u2019t working for you, reply to this email. We "
         f"actually take the time to read all the feedback, suggestions and "
         f"thoughts you may have. We are an ever-evolving group that is "
@@ -372,7 +534,7 @@ def _winback_day5_legacy(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"<p>{escape(name)},</p>"
         f"{body_html_content}"
         f"{_cta_button_html(cta, rejoin)}"
-        f"<p style='color:#666;font-size:14px;'>No pressure, just wanted "
+        f"<p style='color:#b0b0b8;font-size:14px;'>No pressure, just wanted "
         f"to be transparent about what\u2019s on the table.</p>"
     )
     return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
@@ -411,12 +573,12 @@ def _winback_day7(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"best shot.</p>"
         f"<p><strong>\U0001f449 $79/month. No lock-in. Cancel anytime.</strong></p>"
         f"{_cta_button_html('One click and you\u2019re back in', rejoin)}"
-        f"<p style='color:#666;font-size:14px;'>If you do decide to come "
+        f"<p style='color:#b0b0b8;font-size:14px;'>If you do decide to come "
         f"back later at full price, you\u2019re always welcome. The free "
         f"Discord link is always open: "
         f"<a href='{escape(DISCORD_FREE_INVITE)}'>{escape(DISCORD_FREE_INVITE)}</a>"
         f"</p>"
-        f"<p style='color:#666;font-size:14px;'>Either way \u2014 good luck "
+        f"<p style='color:#b0b0b8;font-size:14px;'>Either way \u2014 good luck "
         f"out there. The markets don\u2019t sleep and neither does Potion.</p>"
     )
     _ = stats
@@ -449,7 +611,7 @@ def _reengage_day1(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"it\u2019s not the same when you\u2019re not here.</p>"
         f"<p>No pressure at all, just bumping it up in case you got busy.</p>"
         f"{_cta_button_html('Come back to the chat', rejoin)}"
-        f"<p style='color:#666;font-size:14px;'>Tip: Turn on notifications "
+        f"<p style='color:#b0b0b8;font-size:14px;'>Tip: Turn on notifications "
         f"for #calls and #alerts so you never miss a setup, even when "
         f"you\u2019re not actively in the room.</p>"
     )
@@ -589,7 +751,7 @@ def _reengage_day4(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"<p>Most members don\u2019t even realize how much is inside until "
         f"they start using it properly. Take another look.</p>"
         f"{_cta_button_html('Reclaim your seat', rejoin)}"
-        f"<p style='color:#666;font-size:14px;'>If you need any help feel "
+        f"<p style='color:#b0b0b8;font-size:14px;'>If you need any help feel "
         f"free to <a href='{escape(TICKETS_CHANNEL)}'>open a ticket</a> and "
         f"get live support from our team.</p>"
     )
@@ -665,7 +827,7 @@ def _reengage_day7(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"direction so you don\u2019t feel lost or behind. Reply to this "
         f"email and we\u2019ll help you directly. No pressure.</p>"
         f"{_cta_button_html('Come back', rejoin)}"
-        f"<p style='color:#666;font-size:14px;'>If you have any further "
+        f"<p style='color:#b0b0b8;font-size:14px;'>If you have any further "
         f"questions, feel free to "
         f"<a href='{escape(TICKETS_CHANNEL)}'>open a ticket</a>.</p>"
         f"<p>Potion Team</p>"
@@ -708,41 +870,57 @@ def _onboard_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
     banner_html = ""
     if _OSTIUM_BANNER_URL:
         banner_html = (
-            f"<p style='margin:24px 0 0 0;'>"
-            f"<a href='{escape(_OSTIUM_TRADE_URL)}'>"
+            f"<p style='margin:8px 0 0 0;text-align:center;'>"
+            f"<a href='{escape(_OSTIUM_TRADE_URL)}' target='_blank' "
+            f"rel='noopener noreferrer'>"
             f"<img src='{escape(_OSTIUM_BANNER_URL)}' alt='Ostium' "
-            f"style='width:100%;max-width:560px;border-radius:8px;'/>"
+            f"style='width:100%;max-width:540px;border-radius:12px;display:block;margin:0 auto;'/>"
             f"</a></p>"
         )
     ostium_section_html = (
-        "<hr style='margin:32px 0;border:none;border-top:1px solid #2a2a2a;'/>"
+        f"{_section_divider_html()}"
         f"{banner_html}"
-        "<p style='margin:16px 0 4px 0;'><strong>Trading perps?</strong></p>"
-        "<p style='margin:0 0 12px 0;'>"
-        "Set up your Ostium account and trade onchain perps with one tap "
-        "from any signal we drop:</p>"
+        f"<p style='margin:16px 0 4px 0;color:{_TEXT_PRIMARY};font-size:18px;font-weight:700;'>"
+        f"Trading perps?</p>"
+        f"<p style='margin:0 0 12px 0;'>"
+        f"Set up your Ostium account and trade onchain perps with one tap "
+        f"from any signal we drop:</p>"
         f"{_cta_button_html('Set up Ostium', _OSTIUM_TRADE_URL)}"
     )
     html_body = (
-        f"<p>Hey {escape(name)},</p>"
-        f"<p>Welcome to Potion Alpha. Glad you’re here.</p>"
-        f"<p><strong>Three things to do in the next 5 minutes so you "
-        f"don’t miss the next move:</strong></p>"
-        f"<ol>"
-        f"<li>Open Discord and head to #start-here. Read the pinned post.</li>"
-        f"<li>Set up the Telegram alert bot: "
-        f"<a href='{escape(telegram_bot)}'>{escape(telegram_bot)}</a>. "
-        f"<code>/start</code>, then <code>/verify</code>. Calls land in "
-        f"your DMs the second they fire.</li>"
-        f"<li>Drop into #alpha-chat and say hi. The fastest way to learn "
-        f"the room is to ask.</li>"
+        f"<p style='margin:0 0 16px 0;'>Hey {escape(name)},</p>"
+        f"<p style='margin:0 0 16px 0;'>Welcome to Potion Alpha. Glad you’re here.</p>"
+        f"<p style='margin:24px 0 12px 0;color:{_TEXT_PRIMARY};font-size:18px;font-weight:700;'>"
+        f"Three things to do in the next 5 minutes so you don’t miss the next move:</p>"
+        f"<ol style='margin:0 0 16px 0;padding-left:20px;'>"
+        f"<li style='margin:0 0 10px 0;'>Open Discord and head to "
+        f"<strong>#start-here</strong>. Read the pinned post.</li>"
+        f"<li style='margin:0 0 10px 0;'>Set up the Telegram alert bot: "
+        f"<a href='{escape(telegram_bot)}' style='color:{_BRAND_PURPLE_LIGHT};'>"
+        f"{escape(telegram_bot)}</a>. "
+        f"<code style='background:#1f1f2a;color:{_TEXT_BODY};padding:2px 6px;"
+        f"border-radius:4px;'>/start</code>, then "
+        f"<code style='background:#1f1f2a;color:{_TEXT_BODY};padding:2px 6px;"
+        f"border-radius:4px;'>/verify</code>. Calls land in your DMs the "
+        f"second they fire.</li>"
+        f"<li style='margin:0;'>Drop into <strong>#alpha-chat</strong> and "
+        f"say hi. The fastest way to learn the room is to ask.</li>"
         f"</ol>"
-        f"<p>Calls fire at all hours. The Telegram bot is what catches "
-        f"them when you’re not at the screen. Set it up first.</p>"
+        f"<p style='margin:16px 0;'>Calls fire at all hours. The Telegram "
+        f"bot is what catches them when you’re not at the screen. Set it "
+        f"up first.</p>"
         f"{_cta_button_html('Open Discord', discord)}"
         f"{ostium_section_html}"
     )
-    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+    return RenderedEmail(
+        subject=subject,
+        text=text,
+        html=_wrap_html(
+            html_body,
+            eyebrow="Welcome to Potion Alpha",
+            headline="The next move is one tap away.",
+        ),
+    )
 
 
 def _onboard_day3(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
@@ -863,7 +1041,7 @@ def _onboard_day7(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"The members who participate in week 1 are the ones still here "
         f"at month 6.</p>"
         f"{_cta_button_html('Open Discord', discord)}"
-        f"<p style='color:#666;font-size:14px;'>Manage your Whop: "
+        f"<p style='color:#b0b0b8;font-size:14px;'>Manage your Whop: "
         f"<a href='{escape(rejoin)}'>{escape(rejoin)}</a></p>"
     )
     return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
@@ -1029,7 +1207,7 @@ def _dunning_day3(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"do either.</p>"
         f"<p>It takes 60 seconds to update your payment method.</p>"
         f"{_cta_button_html('Update payment', rejoin)}"
-        f"<p style='color:#666;font-size:14px;'>Already done? Ignore "
+        f"<p style='color:#b0b0b8;font-size:14px;'>Already done? Ignore "
         f"this. The retry will succeed on the next attempt.</p>"
     )
     return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
@@ -1064,7 +1242,7 @@ def _dunning_day10(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"No new signup, no friction — your settings, your "
         f"Concierge thread, everything is still there.</p>"
         f"{_cta_button_html('Reactivate', rejoin)}"
-        f"<p style='color:#666;font-size:14px;'>If you’re leaving "
+        f"<p style='color:#b0b0b8;font-size:14px;'>If you’re leaving "
         f"for another reason, reply to this email and tell us why. We "
         f"read every reply.</p>"
     )
@@ -1302,7 +1480,7 @@ def _post_retention_day7(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"<p>Two-minute survey, your answers go straight to the team and "
         f"directly shape what we offer next time someone’s on the fence:</p>"
         f"{_cta_button_html('Take the 2-minute survey', survey)}"
-        f"<p style='color:#666;font-size:14px;'>No pressure. If you’d "
+        f"<p style='color:#b0b0b8;font-size:14px;'>No pressure. If you’d "
         f"rather just reply to this email with a one-liner, that works "
         f"too — we read every response.</p>"
     )
@@ -1355,7 +1533,7 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
             f"the next 3 months (20% off our standard rate)</strong>. No "
             f"commitment, cancel anytime if it’s still not the right fit.</p>"
             f"{_cta_button_html(cta, rejoin)}"
-            f"<p style='color:#666;font-size:14px;'>This personal link "
+            f"<p style='color:#b0b0b8;font-size:14px;'>This personal link "
             f"expires in 14 days. If you’d rather go annual, we also "
             f"offer $69/mo billed yearly ($828) — same full Elite access "
             f"for a lower monthly rate.</p>"
@@ -1384,7 +1562,7 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
             f"everything’s exactly where you left it. Auto-reactivates "
             f"after 30 days unless you extend.</p>"
             f"{_cta_button_html(cta, rejoin)}"
-            f"<p style='color:#666;font-size:14px;'>Zero effort, zero cost, "
+            f"<p style='color:#b0b0b8;font-size:14px;'>Zero effort, zero cost, "
             f"you stay in the network.</p>"
         )
     elif reason == "market_slow":
@@ -1412,7 +1590,7 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
             f"30 days</strong>. Cycle through, see what shifts, come back "
             f"when the environment’s working for you again.</p>"
             f"{_cta_button_html(cta, rejoin)}"
-            f"<p style='color:#666;font-size:14px;'>You won’t be billed "
+            f"<p style='color:#b0b0b8;font-size:14px;'>You won’t be billed "
             f"during the pause. Auto-reactivates on day 31 unless you "
             f"extend or cancel.</p>"
         )
@@ -1503,7 +1681,7 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
             f"<p><strong>Here’s 25% off for 2 months</strong> — no "
             f"strings, just our way of saying we hear you.</p>"
             f"{_cta_button_html(cta, rejoin)}"
-            f"<p style='color:#666;font-size:14px;'>This link is personal "
+            f"<p style='color:#b0b0b8;font-size:14px;'>This link is personal "
             f"to you and expires in 14 days. If there’s something "
             f"specific that drove you to cancel, reply to this email — we "
             f"read every one and we’re actively reshaping the room "
