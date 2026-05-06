@@ -61,6 +61,6 @@ export const config = {
   // (public banner images referenced from outbound emails — must be
   // reachable to Gmail's image proxy without the dashboard auth cookie).
   matcher: [
-    "/((?!auth|api/auth|email-assets|_next/static|_next/image|favicon.ico).*)",
+    "/((?!auth|api/auth|email-assets/|_next/static|_next/image|favicon.ico).*)",
   ],
 };

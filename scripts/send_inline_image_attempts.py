@@ -42,7 +42,13 @@ sys.path.insert(0, str(ROOT))
 # ---------------------------------------------------------------------------
 TO = os.environ["PREVIEW_TO_EMAIL"]
 API_KEY = os.environ["RESEND_API_KEY"]
-FROM = "Potion Alpha Team <seniormod@updates.potionalpha.com>"
+# Read FROM from the same env var the production bot uses, so we always
+# test from the address that's actually going to subscribers. Fall back
+# to the canonical Day 0 sender if unset.
+FROM = os.environ.get(
+    "RESEND_FROM_ADDRESS",
+    "Potion Alpha Team <seniormod@updates.potionalpha.com>",
+)
 BANNER_PATH = ROOT / "static" / "ostium-banner.png"
 BANNER_BYTES = BANNER_PATH.read_bytes()
 BANNER_B64 = base64.b64encode(BANNER_BYTES).decode("ascii")
