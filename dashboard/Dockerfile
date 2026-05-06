@@ -1,0 +1,51 @@
+# Multi-stage Next.js build for Railway.
+#
+# Used by the potion-dashboard Railway service. The bot service still
+# uses the repo-root Dockerfile (Python). Two services on the same repo,
+# two different Dockerfiles, selected per-service via the
+# RAILWAY_DOCKERFILE_PATH env var.
+
+# ---- Stage 1: build ----
+FROM node:20-alpine AS builder
+WORKDIR /app
+
+# Copy lockfile + package.json for layer-cached deps install.
+# (Build context is the dashboard/ subdir on Railway when
+# RAILWAY_DOCKERFILE_PATH=dashboard/Dockerfile.)
+COPY package.json package-lock.json* ./
+RUN npm ci --no-audit --no-fund
+
+# Copy source + build
+COPY . .
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN npm run build
+
+# ---- Stage 2: runtime ----
+FROM node:20-alpine AS runtime
+WORKDIR /app
+
+# Non-root user for the Next.js process. Railway mounts volumes as
+# root-owned by default, so if the dashboard ever needs WRITE access
+# to /app/data we'd flip back to running as root. Read-only SQLite
+# access works fine as the nextjs user.
+RUN addgroup --system --gid 1001 nodejs \
+ && adduser --system --uid 1001 nextjs
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV PORT=3000
+
+# Copy only what's needed for runtime: built output + node_modules + package.json.
+COPY --from=builder --chown=nextjs:nodejs /app/.next ./.next
+COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
+COPY --from=builder --chown=nextjs:nodejs /app/package.json ./package.json
+COPY --from=builder --chown=nextjs:nodejs /app/next.config.ts ./next.config.ts
+# public/ is optional in Next.js 15. Copy only if it exists in the
+# builder stage — the [ ] glob trick makes the COPY a no-op rather
+# than an error when the directory's missing.
+COPY --from=builder --chown=nextjs:nodejs /app/public[/] ./public/
+
+USER nextjs
+
+EXPOSE 3000
+CMD ["npm", "start"]
