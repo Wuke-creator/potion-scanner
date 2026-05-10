@@ -202,6 +202,9 @@ node_modules/
 dashboard/.next/
 dashboard/out/
 .next/
+# TypeScript incremental compile cache. Regenerated on every build,
+# would churn the repo + hide real source changes if committed.
+*.tsbuildinfo
 
 # One-off broadcast staging artifacts (rendered locally before each blast,
 # not source — keep them out of git so a stale copy never gets re-sent

@@ -20,20 +20,22 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 # Set env vars BEFORE importing templates so module-level constants pick up.
-banner_path = ROOT / "static" / "ostium-banner.png"
-banner_bytes = banner_path.read_bytes()
-banner_b64 = base64.b64encode(banner_bytes).decode("ascii")
-banner_data_url = f"data:image/png;base64,{banner_b64}"
-
 os.environ["OSTIUM_TRADE_URL"] = "https://app.ostium.com/?ref=PTION"
+
+# Pre-load the banner bytes so we can attach inline below.
+banner_path = ROOT / "static" / "ostium-banner.png"
+banner_b64 = base64.b64encode(banner_path.read_bytes()).decode("ascii")
 
 from src.email_bot.db import Subscriber  # noqa: E402
 from src.email_bot.stats import StatsBundle  # noqa: E402
 from src.email_bot import templates  # noqa: E402
 
-# Set the banner URL via module attr (env var is capped at 32k on Windows
-# and our base64 banner is ~500K).
-templates._OSTIUM_BANNER_URL = banner_data_url
+# Banner URL passed via env var. For preview sends we use a Discord CDN
+# URL Luke pasted; for production the OSTIUM_BANNER_URL env var on
+# Railway will point at /static/ostium-banner.png served by the bot.
+banner_url = os.environ.get("OSTIUM_BANNER_URL", "").strip()
+if banner_url:
+    templates._OSTIUM_BANNER_URL = banner_url
 
 
 def make_subscriber(email: str, name: str) -> Subscriber:
@@ -61,12 +63,15 @@ def main() -> None:
     if not api_key:
         sys.exit("RESEND_API_KEY env var not set")
 
-    # Patch the module constant after import (env reads happen at import).
-    templates._OSTIUM_BANNER_URL = banner_data_url
-
     to_addr = os.environ.get("PREVIEW_TO_EMAIL", "").strip()
     if not to_addr:
         sys.exit("PREVIEW_TO_EMAIL env var not set")
+
+    # Force the banner to a CID reference so Gmail can't block it as an
+    # external image. The CID is satisfied by an inline attachment below.
+    use_cid = os.environ.get("USE_CID_ATTACHMENT", "").strip() == "1"
+    if use_cid:
+        templates._OSTIUM_BANNER_URL = "cid:ostium-banner-inline"
 
     rendered = templates._onboard_day0(
         make_subscriber(to_addr, "Luke"), make_stats(),
@@ -79,6 +84,14 @@ def main() -> None:
         "html": rendered.html,
         "text": rendered.text,
     }
+    if use_cid:
+        payload["attachments"] = [{
+            "filename": "ostium-banner.png",
+            "content": banner_b64,
+            "content_type": "image/png",
+            "content_id": "ostium-banner-inline",
+            "disposition": "inline",
+        }]
     body = json.dumps(payload).encode("utf-8")
 
     req = urllib.request.Request(
