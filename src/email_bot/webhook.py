@@ -431,6 +431,13 @@ class EmailWebhookHandlers:
         if not event:
             logger.warning("Whop dispatcher: payload has no event field")
             return web.json_response({"error": "missing event"}, status=400)
+        # Whop emits event names in either dot ('payment.succeeded') or
+        # underscore ('payment_succeeded') format depending on which
+        # webhook version / dashboard config was used. Normalise to dots
+        # so the dispatcher matches both — confirmed via Nourek's
+        # 2026-05-10 webhook config which uses underscores.
+        event_normalised = event.replace("_", ".").lower()
+        event = event_normalised
 
         # The event payload nests details under "data" by Whop's convention.
         # Inner handlers call _read_json themselves; we instead pass the
