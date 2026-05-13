@@ -8,3 +8,7 @@ logs/
 .claude/
 tests/
 *.pyc
+trade-executor/node_modules
+trade-executor/dist
+dashboard/node_modules
+dashboard/.next
