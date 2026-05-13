@@ -26,7 +26,7 @@ import re
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from src.analytics import AnalyticsDB
-from src.config import ChannelRoute, DiscordConfig
+from src.config import SOURCE_PERPS, ChannelRoute, DiscordConfig
 from src.discord_listener import IncomingMessage
 from src.dispatcher import Dispatcher
 from src.formatter import (
@@ -114,6 +114,7 @@ class Router:
         dispatcher: Dispatcher,
         analytics: AnalyticsDB | None = None,
         open_signals: OpenSignalsDB | None = None,
+        quick_trade_enabled: bool = False,
     ):
         self._discord_cfg = discord_cfg
         self._dispatcher = dispatcher
@@ -125,6 +126,9 @@ class Router:
         # gracefully (image-bot updates still forward, just without the
         # 'From the original call' block).
         self._open_signals = open_signals
+        # When True, perps signals get an extra "1-Tap Trade" callback
+        # button that routes through the trade-executor for Ostium fills.
+        self._quick_trade_enabled = quick_trade_enabled
         # Debouncer for rapid same-trader same-token same-action buys on
         # the Wallet Tracker channel. Instantiated lazily (needs a stable
         # emit callback bound to this router instance).
@@ -631,9 +635,10 @@ class Router:
             # lifecycle events (TP1 hit, SL moved, etc.) can be enriched
             # with the original entry/SL/TP prices when the update post
             # itself is just a sparse caption.
+            open_signal_id: int | None = None
             if self._open_signals is not None:
                 try:
-                    await self._open_signals.record_signal(
+                    open_signal_id = await self._open_signals.record_signal(
                         channel_id=message.channel_id,
                         pair=signal.pair,
                         side=signal.side.value,
@@ -654,8 +659,19 @@ class Router:
                 channel_name=route.name,
                 source_type_label=source_label,
             )
+            quick_trade_id = (
+                open_signal_id
+                if (
+                    self._quick_trade_enabled
+                    and route.source_type == SOURCE_PERPS
+                    and open_signal_id
+                )
+                else None
+            )
             keyboard = build_signal_keyboard(
-                ref_link=route.ref_link, pair=signal.pair,
+                ref_link=route.ref_link,
+                pair=signal.pair,
+                quick_trade_signal_id=quick_trade_id,
             )
             return (text, signal.pair, keyboard)
 

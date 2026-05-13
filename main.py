@@ -108,12 +108,66 @@ async def run(config: Config) -> None:
         config=config.dispatcher,
     )
 
+    # --- Trading subsystem (Ostium Builder SDK 1-Tap Trade) ---
+    # Disabled by default; flip TRADING_ENABLED=true on Railway after the
+    # trade-executor sidecar service is deployed and reachable on the
+    # private network. Until then the bot ships the code but does not
+    # surface the 1-Tap button on signal alerts.
+    delegates_db = None
+    trading_settings_db = None
+    trade_executor_client = None
+    if config.trading.enabled:
+        from src.trading.commands import TradingCommands
+        from src.trading.delegates_db import DelegatesDB
+        from src.trading.executor_client import TradeExecutorClient
+        from src.trading.settings_ui import TradingSettingsUI
+        from src.trading.trade_flow import TradeFlow
+        from src.trading.user_settings_db import UserTradingSettingsDB
+
+        delegates_db = DelegatesDB(db_path=config.trading.delegates_db_path)
+        await delegates_db.open()
+        trading_settings_db = UserTradingSettingsDB(
+            db_path=config.trading.user_settings_db_path,
+        )
+        await trading_settings_db.open()
+        trade_executor_client = TradeExecutorClient(
+            base_url=config.trading.executor_base_url,
+            shared_secret=config.trading.executor_secret,
+            request_timeout_sec=config.trading.executor_timeout_sec,
+        )
+        await trade_executor_client.open()
+
+        trading_commands = TradingCommands(
+            config=config,
+            verification_db=verification.db,
+            delegates_db=delegates_db,
+            settings_db=trading_settings_db,
+        )
+        trading_commands.register(verification.application)
+        trade_flow = TradeFlow(
+            config=config,
+            verification_db=verification.db,
+            delegates_db=delegates_db,
+            settings_db=trading_settings_db,
+            open_signals_db=open_signals_db,
+            executor=trade_executor_client,
+        )
+        trade_flow.register(verification.application)
+        trading_settings_ui = TradingSettingsUI(settings_db=trading_settings_db)
+        trading_settings_ui.register(verification.application)
+        logger.info(
+            "Trading subsystem enabled: executor=%s builder_fee_bps=%d",
+            config.trading.executor_base_url,
+            config.trading.builder_fee_bps,
+        )
+
     # --- Router: classify + parse + format, enqueue to dispatcher ---
     router = Router(
         discord_cfg=config.discord,
         dispatcher=dispatcher,
         analytics=analytics,
         open_signals=open_signals_db,
+        quick_trade_enabled=config.trading.enabled,
     )
 
     # --- Automations: shared activity tracker (feeds Features 2 + 4) ---
@@ -651,6 +705,21 @@ async def run(config: Config) -> None:
                 await email_events_db.close()
             except Exception:
                 logger.exception("Email events DB close error")
+        if trade_executor_client is not None:
+            try:
+                await trade_executor_client.close()
+            except Exception:
+                logger.exception("Trade executor client close error")
+        if delegates_db is not None:
+            try:
+                await delegates_db.close()
+            except Exception:
+                logger.exception("Trading delegates DB close error")
+        if trading_settings_db is not None:
+            try:
+                await trading_settings_db.close()
+            except Exception:
+                logger.exception("Trading settings DB close error")
         try:
             await verification.stop()
         except Exception:

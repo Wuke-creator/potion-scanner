@@ -134,6 +134,17 @@ automations:
   email_sync_on_startup: true
   email_sync_interval_hours: 24
 
+trading:
+  # 1-Tap Trade subsystem. The master switch is the TRADING_ENABLED env
+  # var; these are the tunables.
+  delegates_db_path: data/trading_delegates.db
+  user_settings_db_path: data/trading_user_settings.db
+  # Per-trade collateral cap (USDC). Hard ceiling regardless of user input.
+  # Set lower while testing; raise once smoke trades go well.
+  max_collateral_usdc: 5000.0
+  executor_timeout_sec: 30.0
+
+
 logging:
   level: INFO
   file: logs/bot.log

@@ -14,6 +14,7 @@ from src.config.settings import (
     LoggingConfig,
     OAuthConfig,
     TelegramConfig,
+    TradingConfig,
     VerificationConfig,
     load_config,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "SOURCE_MEMECOIN",
     "SOURCE_PERPS",
     "TelegramConfig",
+    "TradingConfig",
     "VerificationConfig",
     "load_config",
 ]

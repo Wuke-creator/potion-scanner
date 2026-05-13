@@ -40,7 +40,7 @@ Run `python -m scripts.stress_test --users 1000 --alerts 3` to reproduce.
    - `NOISE` and free-form messages on memecoin channels -> forwarded verbatim
    - `PREPARATION` teasers -> dropped
 3. The router attaches the right referral link based on the source channel:
-   - Perp channels -> `REF_LINK_PERPS` (default: https://partner.blofin.com/d/potion)
+   - Perp channels -> `REF_LINK_PERPS` (default: https://app.ostium.com/?ref=PTION)
    - Memecoin channel -> `REF_LINK_MEMECOIN` (default: https://trade.padre.gg/rk/orangie)
 4. The **Dispatcher** fans the formatted alert out as a direct message
    to every active verified user, rate-limited at 25 msgs/sec to stay
@@ -268,9 +268,67 @@ level via the `is_active` flag on each verified user row.
 | Adjust reverify frequency | `config/config.yaml` `verification.reverify_interval_seconds` |
 | Change the welcome message | `src/verification/commands.py` `_WELCOME` |
 
+## 1-Tap Trade (Ostium Builder SDK)
+
+Optional feature on top of the signal forwarder. When enabled, Elite
+users can fire a prefilled Ostium trade straight from a Telegram DM,
+supplying only the size in USDC. Pair, side, leverage, entry, TP1,
+and SL are pulled from the parsed signal automatically.
+
+### How it works
+
+1. A second Railway service (`trade-executor/`, Node + TypeScript)
+   sits alongside `potion-scanner` in the `fantastic-energy` project.
+   It exposes an internal `POST /trade` endpoint and uses
+   `@ostium/builder-sdk` in `createDelegatedAndGasless` mode.
+2. The user runs `/connect` in the bot (Elite-only). The bot shows a
+   risk disclosure, links them to `app.ostium.com/sdk-export`, and
+   they paste the delegate private key + trader address back.
+3. The key is Fernet-encrypted in `data/trading_delegates.db`. It
+   never leaves the bot's RAM in plaintext except over the Railway
+   private network to the executor at trade time.
+4. When the user taps **1-Tap Trade** on a perps signal, the bot DMs a
+   prefilled card. They tap a size preset (or a custom amount), tap
+   Confirm, and the executor submits a gasless ERC-4337 user operation
+   via Pimlico. Builder fee bps (0..50) accrue to the configured
+   builder address.
+
+### Commands
+
+- `/connect` — one-time delegate setup (Elite only)
+- `/disconnect` — wipe the delegate key from our DB
+- `/trading` — status: last trade, last error, current trader address
+- `/trading_settings` — slippage tolerance + size presets per user
+
+### Env vars (potion-scanner side)
+
+- `TRADING_ENABLED` — master switch (`true` / `false`)
+- `TRADE_EXECUTOR_BASE_URL` — internal URL of the trade-executor service
+- `TRADE_EXECUTOR_SECRET` — shared secret for service-to-service auth
+- `OSTIUM_BUILDER_ADDRESS` — wallet receiving fee bps (optional)
+- `OSTIUM_BUILDER_FEE_BPS` — 0..50; 0 disables fee accrual
+- `TRADING_MAX_COLLATERAL_USDC` — hard per-trade cap (default 5000)
+
+### Env vars (trade-executor side)
+
+See `trade-executor/.env.example`.
+
+### Deploy
+
+```
+cd trade-executor
+railway link --project fantastic-energy
+railway add --service potion-trade-executor
+railway up
+railway variables --set "TRADE_EXECUTOR_SECRET=<same as scanner>"
+```
+
+Then flip `TRADING_ENABLED=true` on `potion-scanner` and restart.
+
 ## Out of scope (for v1)
 
-- No trade execution (the bot only forwards calls, never trades)
+- No position management beyond open (close, modify, view live PnL).
+  Users manage open positions on `app.ostium.com`.
 - No analytics or trade outcome tracking
 - No per-user routing within Telegram (one shared Elite group)
 - No webhook ingestion (Discord gateway only)
