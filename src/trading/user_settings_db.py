@@ -42,6 +42,7 @@ class UserTradingSettings:
     size_presets: list[float]
     last_used_size: float | None
     updated_at: int
+    last_used_leverage: int | None = None
 
 
 _DDL = """
@@ -50,9 +51,16 @@ CREATE TABLE IF NOT EXISTS user_trading_settings (
   slippage_bps      INTEGER NOT NULL DEFAULT 50,
   size_presets_json TEXT NOT NULL DEFAULT '[25,50,100,250]',
   last_used_size    REAL,
-  updated_at        INTEGER NOT NULL
+  updated_at        INTEGER NOT NULL,
+  last_used_leverage INTEGER
 );
 """
+
+# Migration for DBs that predate the leverage column. SQLite rejects ALTER
+# if the column already exists, so we swallow.
+_MIGRATIONS = (
+    "ALTER TABLE user_trading_settings ADD COLUMN last_used_leverage INTEGER",
+)
 
 
 class UserTradingSettingsDB:
@@ -65,6 +73,12 @@ class UserTradingSettingsDB:
         self._conn = await aiosqlite.connect(self._db_path)
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute(_DDL)
+        for stmt in _MIGRATIONS:
+            try:
+                await self._conn.execute(stmt)
+            except Exception as e:
+                if "duplicate column" not in str(e).lower():
+                    logger.debug("user_trading_settings migration skipped: %s", e)
         await self._conn.commit()
         logger.info("User trading settings DB opened at %s", self._db_path)
 
@@ -77,7 +91,7 @@ class UserTradingSettingsDB:
         assert self._conn is not None
         async with self._conn.execute(
             "SELECT telegram_user_id, slippage_bps, size_presets_json, "
-            "       last_used_size, updated_at "
+            "       last_used_size, updated_at, last_used_leverage "
             "FROM user_trading_settings WHERE telegram_user_id = ?",
             (telegram_user_id,),
         ) as cursor:
@@ -89,6 +103,7 @@ class UserTradingSettingsDB:
                 size_presets=list(DEFAULT_SIZE_PRESETS),
                 last_used_size=None,
                 updated_at=0,
+                last_used_leverage=None,
             )
         try:
             presets = json.loads(row[2])
@@ -102,7 +117,26 @@ class UserTradingSettingsDB:
             size_presets=[float(p) for p in presets],
             last_used_size=float(row[3]) if row[3] is not None else None,
             updated_at=int(row[4]),
+            last_used_leverage=int(row[5]) if row[5] is not None else None,
         )
+
+    async def set_last_used_leverage(
+        self, telegram_user_id: int, leverage: int,
+    ) -> None:
+        if leverage < 1 or leverage > 500:
+            raise ValueError(f"leverage {leverage} outside [1, 500]")
+        assert self._conn is not None
+        now = int(time.time())
+        await self._conn.execute(
+            "INSERT INTO user_trading_settings "
+            "(telegram_user_id, last_used_leverage, updated_at) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(telegram_user_id) DO UPDATE SET "
+            "  last_used_leverage = excluded.last_used_leverage, "
+            "  updated_at = excluded.updated_at",
+            (telegram_user_id, int(leverage), now),
+        )
+        await self._conn.commit()
 
     async def set_slippage(
         self, telegram_user_id: int, slippage_bps: int,

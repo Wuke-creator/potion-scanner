@@ -78,24 +78,53 @@ def _fmt_price(value: float | None) -> str:
     return f"{value:.6g}"
 
 
+_DEFAULT_LEVERAGE_FALLBACK = 5
+
+
+def _effective_leverage(
+    signal: OpenSignal, settings_last_used: int | None,
+) -> int:
+    """Decide the leverage to prefill on the card.
+
+    Priority: (1) leverage on the signal itself (structured perp bot
+    calls always have it); (2) the user's last-used leverage from
+    user_trading_settings; (3) the hard fallback of 5x.
+    """
+    if signal.leverage and signal.leverage > 0:
+        return int(signal.leverage)
+    if settings_last_used and settings_last_used > 0:
+        return int(settings_last_used)
+    return _DEFAULT_LEVERAGE_FALLBACK
+
+
+_CONDITIONAL_SL_WARNING = (
+    "<i>Note: SL fires on price touch, not candle close. "
+    "Adjust on Ostium after if you want a candle-close SL.</i>"
+)
+
+
 def _format_card(
     signal: OpenSignal,
     *,
     slippage_bps: int,
     presets: list[float],
     last_used_size: float | None,
+    effective_leverage: int,
 ) -> tuple[str, InlineKeyboardMarkup]:
     side_label = signal.side or "?"
-    lev = signal.leverage or 0
     lines = [
         f"<b>1-Tap Trade — {signal.pair}</b>",
         "",
-        f"Direction: <b>{side_label}</b>   Leverage: <b>{lev}x</b>",
+        f"Direction: <b>{side_label}</b>   Leverage: <b>{effective_leverage}x</b>",
         f"Entry: <code>{_fmt_price(signal.entry)}</code>",
         f"TP1: <code>{_fmt_price(signal.tp1)}</code>"
         + (f"   TP2: <code>{_fmt_price(signal.tp2)}</code>" if signal.tp2 else "")
         + (f"   TP3: <code>{_fmt_price(signal.tp3)}</code>" if signal.tp3 else ""),
         f"Stop: <code>{_fmt_price(signal.stop_loss)}</code>",
+    ]
+    if signal.stop_loss_is_conditional:
+        lines.append(_CONDITIONAL_SL_WARNING)
+    lines += [
         "",
         f"Slippage: {slippage_bps / 100:.2f}%",
         "",
@@ -123,27 +152,38 @@ def _format_card(
 
 
 def _format_confirm(
-    signal: OpenSignal, size: float, slippage_bps: int,
+    signal: OpenSignal,
+    size: float,
+    slippage_bps: int,
+    effective_leverage: int,
 ) -> tuple[str, InlineKeyboardMarkup]:
     side_label = signal.side or "?"
-    lev = signal.leverage or 0
-    text = (
-        f"<b>Confirm Trade</b>\n\n"
-        f"{signal.pair}  <b>{side_label} {lev}x</b>\n"
-        f"Size: <b>${size:g}</b> USDC\n"
+    sl_line = (
         f"Entry: <code>{_fmt_price(signal.entry)}</code>   "
-        f"Stop: <code>{_fmt_price(signal.stop_loss)}</code>\n"
-        f"TP1: <code>{_fmt_price(signal.tp1)}</code>\n"
-        f"Slippage: {slippage_bps / 100:.2f}%\n\n"
-        f"This will fire immediately on Ostium."
+        f"Stop: <code>{_fmt_price(signal.stop_loss)}</code>"
     )
+    text_parts = [
+        "<b>Confirm Trade</b>",
+        "",
+        f"{signal.pair}  <b>{side_label} {effective_leverage}x</b>",
+        f"Size: <b>${size:g}</b> USDC",
+        sl_line,
+    ]
+    if signal.stop_loss_is_conditional:
+        text_parts.append(_CONDITIONAL_SL_WARNING)
+    text_parts += [
+        f"TP1: <code>{_fmt_price(signal.tp1)}</code>",
+        f"Slippage: {slippage_bps / 100:.2f}%",
+        "",
+        "This will fire immediately on Ostium.",
+    ]
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("Confirm", callback_data=_CB_CONFIRM),
             InlineKeyboardButton("Cancel", callback_data=_CB_CANCEL),
         ],
     ])
-    return text, keyboard
+    return "\n".join(text_parts), keyboard
 
 
 class TradeFlow:
@@ -285,16 +325,21 @@ class TradeFlow:
             return
 
         settings = await self._settings_db.get_or_default(user_id)
+        effective_leverage = _effective_leverage(
+            signal, settings.last_used_leverage,
+        )
         text, keyboard = _format_card(
             signal,
             slippage_bps=settings.slippage_bps,
             presets=settings.size_presets,
             last_used_size=settings.last_used_size,
+            effective_leverage=effective_leverage,
         )
         self._set_state(ctx, {
             "signal_id": signal_id,
             "size": None,
             "awaiting_size": False,
+            "effective_leverage": effective_leverage,
         })
         await query.answer()
         await ctx.bot.send_message(
@@ -402,10 +447,18 @@ class TradeFlow:
             return
 
         settings = await self._settings_db.get_or_default(user_id)
-        text, keyboard = _format_confirm(signal, size, settings.slippage_bps)
+        effective_leverage = state.get("effective_leverage") if state else None
+        if not isinstance(effective_leverage, int) or effective_leverage <= 0:
+            effective_leverage = _effective_leverage(
+                signal, settings.last_used_leverage,
+            )
+        text, keyboard = _format_confirm(
+            signal, size, settings.slippage_bps, effective_leverage,
+        )
 
         state["size"] = size
         state["awaiting_size"] = False
+        state["effective_leverage"] = effective_leverage
         self._set_state(ctx, state)
 
         if update.callback_query:
@@ -462,6 +515,12 @@ class TradeFlow:
             signal.normalised_base or (signal.pair.split("/")[0] if signal.pair else "")
         ).upper()
 
+        effective_leverage = state.get("effective_leverage") if state else None
+        if not isinstance(effective_leverage, int) or effective_leverage <= 0:
+            effective_leverage = _effective_leverage(
+                signal, settings.last_used_leverage,
+            )
+
         await query.answer()
         await query.edit_message_text(
             "Submitting trade...", parse_mode="HTML",
@@ -475,7 +534,7 @@ class TradeFlow:
                 builder_fee_bps=self._config.trading.builder_fee_bps,
                 pair_base=pair_base,
                 direction=signal.side or "LONG",
-                leverage=int(signal.leverage or 1),
+                leverage=int(effective_leverage),
                 collateral_usdc=float(size),
                 slippage_bps=settings.slippage_bps,
                 take_profit=signal.tp1,
@@ -512,10 +571,18 @@ class TradeFlow:
 
         await self._delegates_db.mark_trade_success(user_id)
         await self._settings_db.mark_size_used(user_id, float(size))
+        try:
+            await self._settings_db.set_last_used_leverage(
+                user_id, int(effective_leverage),
+            )
+        except Exception:
+            logger.exception(
+                "set_last_used_leverage failed for user=%d", user_id,
+            )
         self._set_state(ctx, None)
         await query.edit_message_text(
             f"<b>Trade submitted ✅</b>\n\n"
-            f"{signal.pair} {signal.side} {signal.leverage}x  "
+            f"{signal.pair} {signal.side} {effective_leverage}x  "
             f"size <b>${size:g}</b>\n"
             f"Tx: <a href=\"https://arbiscan.io/tx/{result.tx_hash}\">"
             f"{result.tx_hash[:10]}...{result.tx_hash[-6:]}</a>\n\n"

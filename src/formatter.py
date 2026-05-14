@@ -17,6 +17,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from src.parser import ParsedSignal, Side
+from src.parser.perp_pinger_parser import PerpPingerSignal
 
 
 def _utc_now() -> str:
@@ -263,6 +264,62 @@ def discord_to_telegram_html(text: str) -> str:
     for i in range(len(tags) - 1, -1, -1):
         text = text.replace(_PLACEHOLDER_FMT.format(i=i), tags[i])
     return text
+
+
+def _format_price(value: float | None) -> str:
+    """Render a price for display, picking a sensible precision based on
+    magnitude (so 65000.0 -> '65000', 0.2350 -> '0.2350', 0.00001234 ->
+    '0.00001234')."""
+    if value is None:
+        return "—"
+    if abs(value) >= 100:
+        return f"{value:,.2f}".rstrip("0").rstrip(".") if "." in f"{value:.2f}" else f"{value:,.2f}"
+    if abs(value) >= 1:
+        return f"{value:.4f}".rstrip("0").rstrip(".")
+    return f"{value:.8f}".rstrip("0").rstrip(".")
+
+
+def format_perp_pinger_signal(
+    parsed: PerpPingerSignal,
+    ref_link: str,
+    channel_name: str,
+    source_type_label: str,
+    timestamp: str | None = None,
+) -> str:
+    """Build a Telegram alert from a parsed Perp Pinger new-call signal.
+
+    Mirrors the visual style of ``format_parsed_signal`` (emoji bullets,
+    <code> tap-to-copy on every numeric and the ticker) but adapted for
+    the slimmer Perp Pinger payload: no trade_id, no leverage, no risk
+    level enum, single TP, optional conditional-SL phrase.
+    """
+    ch = escape(channel_name)
+    direction = parsed.side
+    direction_icon = "\U0001f4c8" if direction == "LONG" else "\U0001f4c9"
+    pair_display = escape(parsed.pair)
+
+    lines = [
+        "\U0001f514 <b>New Perp Call</b>",
+        f"\U0001f4e1 Source: Potion #{ch}",
+        "",
+        f"\U0001f4b1 Pair: <code>{pair_display}</code>",
+        f"{direction_icon} Direction: <b>{direction}</b>",
+        "",
+        f"\U0001f3af Entry: <code>{_format_price(parsed.entry)}</code>",
+    ]
+    if parsed.stop_loss is not None:
+        sl_line = f"\U0001f6e1️ Stop: <code>{_format_price(parsed.stop_loss)}</code>"
+        if parsed.stop_loss_is_conditional and parsed.stop_loss_raw:
+            sl_line += f"   <i>({escape(parsed.stop_loss_raw)})</i>"
+        lines.append(sl_line)
+    if parsed.take_profit is not None:
+        lines.append(
+            f"\U0001f48e Target: <code>{_format_price(parsed.take_profit)}</code>"
+        )
+    if parsed.risk_rr is not None:
+        lines.append(f"⚠️ Risk: {parsed.risk_rr:g}RR")
+
+    return "\n".join(lines)
 
 
 def format_parsed_signal(

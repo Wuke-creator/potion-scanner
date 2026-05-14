@@ -71,6 +71,9 @@ class OpenSignal:
     opened_at: int
     last_event_at: int
     raw_message: str
+    stop_loss_is_conditional: bool = False
+    image_telegram_file_id: str | None = None
+    id: int | None = None
 
 
 def _normalise_base(pair: str) -> str:
@@ -123,10 +126,25 @@ class OpenSignalsDB:
                 status          TEXT    NOT NULL DEFAULT 'open',
                 opened_at       INTEGER NOT NULL,
                 last_event_at   INTEGER NOT NULL,
-                raw_message     TEXT    NOT NULL DEFAULT ''
+                raw_message     TEXT    NOT NULL DEFAULT '',
+                stop_loss_is_conditional INTEGER NOT NULL DEFAULT 0,
+                image_telegram_file_id TEXT
             )
             """
         )
+        # Migrations for DBs that predate the perp_pinger / image_archive columns.
+        # SQLite rejects ALTER if the column already exists, so we swallow.
+        for stmt in (
+            "ALTER TABLE open_signals ADD COLUMN "
+            "stop_loss_is_conditional INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE open_signals ADD COLUMN "
+            "image_telegram_file_id TEXT",
+        ):
+            try:
+                await self._conn.execute(stmt)
+            except Exception as e:
+                if "duplicate column" not in str(e).lower():
+                    logger.debug("open_signals migration skipped: %s", e)
         # Lookup indexes: latest open by channel+base, and by trade_id
         # (trade_id lookups happen on lifecycle events that carry the ID).
         await self._conn.execute(
@@ -149,6 +167,39 @@ class OpenSignalsDB:
             raise RuntimeError("OpenSignalsDB not opened — call open() first")
         return self._conn
 
+    # Shared column list + row->dataclass helper so find_* methods stay in
+    # sync as the schema grows. `id` is last to avoid shifting existing
+    # positional indices in callers / tests.
+    _SELECT_COLS = (
+        "channel_id, pair, normalised_base, side, leverage, "
+        "entry, stop_loss, tp1, tp2, tp3, trade_id, status, "
+        "opened_at, last_event_at, raw_message, "
+        "stop_loss_is_conditional, image_telegram_file_id, id"
+    )
+
+    @staticmethod
+    def _row_to_signal(row: tuple) -> "OpenSignal":
+        return OpenSignal(
+            channel_id=int(row[0]),
+            pair=row[1],
+            normalised_base=row[2],
+            side=row[3],
+            leverage=row[4],
+            entry=row[5],
+            stop_loss=row[6],
+            tp1=row[7],
+            tp2=row[8],
+            tp3=row[9],
+            trade_id=row[10],
+            status=row[11],
+            opened_at=int(row[12]),
+            last_event_at=int(row[13]),
+            raw_message=row[14] or "",
+            stop_loss_is_conditional=bool(row[15] or 0),
+            image_telegram_file_id=row[16],
+            id=int(row[17]) if row[17] is not None else None,
+        )
+
     async def record_signal(
         self,
         *,
@@ -164,6 +215,8 @@ class OpenSignalsDB:
         trade_id: int | None,
         raw_message: str,
         opened_at: int | None = None,
+        stop_loss_is_conditional: bool = False,
+        image_telegram_file_id: str | None = None,
     ) -> int:
         """Insert a new signal row. Returns the row id.
 
@@ -193,14 +246,16 @@ class OpenSignalsDB:
             INSERT INTO open_signals (
                 channel_id, pair, normalised_base, side, leverage,
                 entry, stop_loss, tp1, tp2, tp3, trade_id,
-                status, opened_at, last_event_at, raw_message
+                status, opened_at, last_event_at, raw_message,
+                stop_loss_is_conditional, image_telegram_file_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)
             """,
             (
                 channel_id, pair.upper(), base, side, leverage,
                 entry, stop_loss, tp1, tp2, tp3, trade_id,
                 now, now, raw_message,
+                1 if stop_loss_is_conditional else 0, image_telegram_file_id,
             ),
         )
         await conn.commit()
@@ -211,6 +266,27 @@ class OpenSignalsDB:
             pair, channel_id, row_id, trade_id,
         )
         return int(row_id)
+
+    async def update_image_file_id(
+        self, *, row_id: int, image_telegram_file_id: str,
+    ) -> bool:
+        """Set the telegram file_id for an already-recorded signal.
+
+        Used by the ImageArchive flow: signal is recorded first (synchronous
+        with router classification), image is downloaded + uploaded
+        asynchronously, then this method writes the resulting file_id back
+        so future lookups (lifecycle re-sends) can attach the chart without
+        another download.
+        """
+        conn = self._require()
+        cur = await conn.execute(
+            "UPDATE open_signals SET image_telegram_file_id = ? WHERE id = ?",
+            (image_telegram_file_id, row_id),
+        )
+        await conn.commit()
+        updated = (cur.rowcount or 0) > 0
+        await cur.close()
+        return updated
 
     async def find_latest_open(
         self, *, channel_id: int, pair_or_base: str,
@@ -233,40 +309,14 @@ class OpenSignalsDB:
             ", ".join(f"'{s}'" for s in _TERMINAL_STATUSES) + ")"
         )
         cur = await conn.execute(
-            f"""
-            SELECT channel_id, pair, normalised_base, side, leverage,
-                   entry, stop_loss, tp1, tp2, tp3, trade_id, status,
-                   opened_at, last_event_at, raw_message
-            FROM open_signals
-            WHERE channel_id = ?
-              AND normalised_base = ?
-              {terminal_clause}
-            ORDER BY opened_at DESC
-            LIMIT 1
-            """,
+            f"SELECT {self._SELECT_COLS} FROM open_signals "
+            f"WHERE channel_id = ? AND normalised_base = ? {terminal_clause} "
+            "ORDER BY opened_at DESC LIMIT 1",
             (channel_id, base),
         )
         row = await cur.fetchone()
         await cur.close()
-        if row is None:
-            return None
-        return OpenSignal(
-            channel_id=int(row[0]),
-            pair=row[1],
-            normalised_base=row[2],
-            side=row[3],
-            leverage=row[4],
-            entry=row[5],
-            stop_loss=row[6],
-            tp1=row[7],
-            tp2=row[8],
-            tp3=row[9],
-            trade_id=row[10],
-            status=row[11],
-            opened_at=int(row[12]),
-            last_event_at=int(row[13]),
-            raw_message=row[14],
-        )
+        return self._row_to_signal(row) if row is not None else None
 
     async def find_by_trade_id(
         self, *, channel_id: int, trade_id: int,
@@ -276,38 +326,14 @@ class OpenSignalsDB:
         symbol matching when available."""
         conn = self._require()
         cur = await conn.execute(
-            """
-            SELECT channel_id, pair, normalised_base, side, leverage,
-                   entry, stop_loss, tp1, tp2, tp3, trade_id, status,
-                   opened_at, last_event_at, raw_message
-            FROM open_signals
-            WHERE channel_id = ? AND trade_id = ?
-            ORDER BY opened_at DESC
-            LIMIT 1
-            """,
+            f"SELECT {self._SELECT_COLS} FROM open_signals "
+            "WHERE channel_id = ? AND trade_id = ? "
+            "ORDER BY opened_at DESC LIMIT 1",
             (channel_id, trade_id),
         )
         row = await cur.fetchone()
         await cur.close()
-        if row is None:
-            return None
-        return OpenSignal(
-            channel_id=int(row[0]),
-            pair=row[1],
-            normalised_base=row[2],
-            side=row[3],
-            leverage=row[4],
-            entry=row[5],
-            stop_loss=row[6],
-            tp1=row[7],
-            tp2=row[8],
-            tp3=row[9],
-            trade_id=row[10],
-            status=row[11],
-            opened_at=int(row[12]),
-            last_event_at=int(row[13]),
-            raw_message=row[14],
-        )
+        return self._row_to_signal(row) if row is not None else None
 
     async def find_by_id(self, row_id: int) -> OpenSignal | None:
         """Direct lookup by SQLite primary key. Used by the 1-Tap Trade
@@ -316,36 +342,12 @@ class OpenSignalsDB:
         """
         conn = self._require()
         cur = await conn.execute(
-            """
-            SELECT channel_id, pair, normalised_base, side, leverage,
-                   entry, stop_loss, tp1, tp2, tp3, trade_id, status,
-                   opened_at, last_event_at, raw_message
-            FROM open_signals
-            WHERE id = ?
-            """,
+            f"SELECT {self._SELECT_COLS} FROM open_signals WHERE id = ?",
             (row_id,),
         )
         row = await cur.fetchone()
         await cur.close()
-        if row is None:
-            return None
-        return OpenSignal(
-            channel_id=int(row[0]),
-            pair=row[1],
-            normalised_base=row[2],
-            side=row[3],
-            leverage=row[4],
-            entry=row[5],
-            stop_loss=row[6],
-            tp1=row[7],
-            tp2=row[8],
-            tp3=row[9],
-            trade_id=row[10],
-            status=row[11],
-            opened_at=int(row[12]),
-            last_event_at=int(row[13]),
-            raw_message=row[14],
-        )
+        return self._row_to_signal(row) if row is not None else None
 
     async def update_status(
         self, *, channel_id: int, pair_or_base: str, new_status: str,
