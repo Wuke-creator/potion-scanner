@@ -383,30 +383,43 @@ def _build_blofin_trade_url(ref_link: str, pair: str) -> str:
     return f"https://blofin.com/futures/{base}-USDT?{qs}"
 
 
+QUICK_TRADE_CALLBACK_PREFIX = "qt:open:"
+
+
 def build_signal_keyboard(
-    ref_link: str, pair: str,
+    ref_link: str,
+    pair: str,
+    quick_trade_signal_id: int | None = None,
 ) -> InlineKeyboardMarkup:
     """Build inline buttons for a parsed signal alert.
 
-    Row 1: "Trade now" (ref link) + "Chart" (DexScreener search)
+    Layout when quick_trade_signal_id is provided:
+      Row 1: "1-Tap Trade" (callback) — fires the prefilled trade flow
+      Row 2: "Trade now" (ref URL) + "Chart" (DexScreener)
 
-    For Ostium ref links we rewrite the Trade-now URL to a per-pair deeplink
-    so the right market opens with one tap (matching the Padre/Terminal
-    per-CA deeplink behaviour on memecoin alerts).
+    Layout otherwise (legacy): single row of [Trade now] + [Chart].
+
+    For Ostium ref links the Trade-now URL is rewritten to a per-pair
+    deeplink so the right market opens with one tap (matching the
+    Padre/Terminal per-CA deeplink behaviour on memecoin alerts).
     """
-    # Build a DexScreener search URL from the base token (first in the pair)
     base_token = pair.split("/")[0].strip() if "/" in pair else pair.strip()
     chart_url = f"https://dexscreener.com/search?q={base_token}"
-
     trade_url = _resolve_trade_url(ref_link, pair)
 
-    buttons = [
-        [
-            InlineKeyboardButton(text="\U0001f7e2 Trade now", url=trade_url),
-            InlineKeyboardButton(text="\U0001f4ca Chart", url=chart_url),
-        ],
-    ]
-    return InlineKeyboardMarkup(buttons)
+    rows: list[list[InlineKeyboardButton]] = []
+    if quick_trade_signal_id is not None:
+        rows.append([
+            InlineKeyboardButton(
+                text="⚡ 1-Tap Trade",
+                callback_data=f"{QUICK_TRADE_CALLBACK_PREFIX}{quick_trade_signal_id}",
+            ),
+        ])
+    rows.append([
+        InlineKeyboardButton(text="\U0001f7e2 Trade now", url=trade_url),
+        InlineKeyboardButton(text="\U0001f4ca Chart", url=chart_url),
+    ])
+    return InlineKeyboardMarkup(rows)
 
 
 def _resolve_trade_url(ref_link: str, pair: str) -> str:

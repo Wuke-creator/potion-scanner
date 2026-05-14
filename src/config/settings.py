@@ -252,6 +252,27 @@ class OpsCaptureConfig:
 
 
 @dataclass
+class TradingConfig:
+    """Ostium Builder SDK 1-Tap Trade subsystem.
+
+    Disabled by default. When ``enabled=False`` the /connect command
+    short-circuits and the Quick Trade callback responds with a "not
+    available" message, so the bot can ship and stage the code without
+    activating the trading path.
+    """
+
+    enabled: bool = False
+    executor_base_url: str = ""
+    executor_secret: str = ""
+    delegates_db_path: str = "data/trading_delegates.db"
+    user_settings_db_path: str = "data/trading_user_settings.db"
+    builder_address: str = ""        # 0x... receiver of fee bps; blank = no fee accrual
+    builder_fee_bps: int = 0         # 0..50; 0 = no fee charged on opens
+    max_collateral_usdc: float = 5000.0  # safety cap on single-trade size
+    executor_timeout_sec: float = 30.0
+
+
+@dataclass
 class Config:
     discord: DiscordConfig = field(default_factory=DiscordConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
@@ -263,6 +284,7 @@ class Config:
     automations: AutomationsConfig = field(default_factory=AutomationsConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     ops_capture: OpsCaptureConfig = field(default_factory=OpsCaptureConfig)
+    trading: TradingConfig = field(default_factory=TradingConfig)
 
 
 def _env_int(name: str, default: int = 0) -> int:
@@ -582,6 +604,35 @@ def load_config(
         senior_staff_ids=senior_ids,
     )
 
+    trading_yaml = yaml_data.get("trading", {})
+    trading_cfg = TradingConfig(
+        enabled=bool(
+            os.getenv("TRADING_ENABLED", "").strip().lower() in ("1", "true", "yes")
+        ),
+        executor_base_url=os.getenv(
+            "TRADE_EXECUTOR_BASE_URL",
+            trading_yaml.get("executor_base_url", ""),
+        ),
+        executor_secret=os.getenv("TRADE_EXECUTOR_SECRET", ""),
+        delegates_db_path=trading_yaml.get(
+            "delegates_db_path", "data/trading_delegates.db",
+        ),
+        user_settings_db_path=trading_yaml.get(
+            "user_settings_db_path", "data/trading_user_settings.db",
+        ),
+        builder_address=os.getenv("OSTIUM_BUILDER_ADDRESS", "").strip(),
+        builder_fee_bps=_env_int("OSTIUM_BUILDER_FEE_BPS", 0),
+        max_collateral_usdc=float(
+            os.getenv(
+                "TRADING_MAX_COLLATERAL_USDC",
+                trading_yaml.get("max_collateral_usdc", 5000.0),
+            )
+        ),
+        executor_timeout_sec=float(
+            trading_yaml.get("executor_timeout_sec", 30.0)
+        ),
+    )
+
     config = Config(
         discord=discord_cfg,
         telegram=telegram_cfg,
@@ -593,6 +644,7 @@ def load_config(
         automations=automations_cfg,
         logging=logging_cfg,
         ops_capture=ops_cfg,
+        trading=trading_cfg,
     )
 
     _validate(config)
@@ -636,6 +688,26 @@ def _validate(config: Config) -> None:
         errors.append("OAUTH_STATE_SECRET not set")
     if not config.oauth.refresh_token_encryption_key:
         errors.append("WHOP_REFRESH_TOKEN_ENCRYPTION_KEY not set")
+
+    if config.trading.enabled:
+        if not config.trading.executor_base_url:
+            errors.append(
+                "TRADE_EXECUTOR_BASE_URL must be set when TRADING_ENABLED=true"
+            )
+        if not config.trading.executor_secret:
+            errors.append(
+                "TRADE_EXECUTOR_SECRET must be set when TRADING_ENABLED=true"
+            )
+        if config.trading.builder_fee_bps < 0 or config.trading.builder_fee_bps > 50:
+            errors.append("OSTIUM_BUILDER_FEE_BPS must be between 0 and 50")
+        if (
+            config.trading.builder_fee_bps > 0
+            and not config.trading.builder_address
+        ):
+            errors.append(
+                "OSTIUM_BUILDER_ADDRESS must be set when "
+                "OSTIUM_BUILDER_FEE_BPS > 0"
+            )
 
     if errors:
         raise ConfigError("Config validation failed:\n  " + "\n  ".join(errors))

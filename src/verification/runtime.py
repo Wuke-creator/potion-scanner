@@ -64,6 +64,14 @@ class VerificationRuntime:
         extra aiohttp routes on its shared app (port 8080)."""
         return self._callback_server
 
+    @property
+    def application(self) -> Application:
+        """Expose the telegram Application so add-on subsystems (trading
+        commands, trade flow, settings UI) can register their own
+        handlers before start() initializes the app.
+        """
+        return self._telegram_application
+
     async def start(self) -> None:
         if self._started:
             return

@@ -309,6 +309,44 @@ class OpenSignalsDB:
             raw_message=row[14],
         )
 
+    async def find_by_id(self, row_id: int) -> OpenSignal | None:
+        """Direct lookup by SQLite primary key. Used by the 1-Tap Trade
+        callback flow: the keyboard embeds the row id and the callback
+        handler resolves the parsed signal from it.
+        """
+        conn = self._require()
+        cur = await conn.execute(
+            """
+            SELECT channel_id, pair, normalised_base, side, leverage,
+                   entry, stop_loss, tp1, tp2, tp3, trade_id, status,
+                   opened_at, last_event_at, raw_message
+            FROM open_signals
+            WHERE id = ?
+            """,
+            (row_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row is None:
+            return None
+        return OpenSignal(
+            channel_id=int(row[0]),
+            pair=row[1],
+            normalised_base=row[2],
+            side=row[3],
+            leverage=row[4],
+            entry=row[5],
+            stop_loss=row[6],
+            tp1=row[7],
+            tp2=row[8],
+            tp3=row[9],
+            trade_id=row[10],
+            status=row[11],
+            opened_at=int(row[12]),
+            last_event_at=int(row[13]),
+            raw_message=row[14],
+        )
+
     async def update_status(
         self, *, channel_id: int, pair_or_base: str, new_status: str,
         when: int | None = None,
