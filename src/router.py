@@ -35,13 +35,21 @@ from src.formatter import (
     build_wallet_tracker_keyboard,
     format_lifecycle_event,
     format_parsed_signal,
+    format_perp_pinger_signal,
     format_unknown_message,
     format_wallet_tracker_alert,
     label_for_source_type,
 )
 from src.parser import MessageType, SignalParseError, classify, parse_signal
+from src.parser.perp_pinger_parser import parse_perp_pinger_new_call
+from src.parser.perp_pinger_update_parser import (
+    LABELS as _PERP_PINGER_UPDATE_LABELS,
+    UpdateKind as _PerpPingerUpdateKind,
+    parse_perp_pinger_update,
+)
 from src.parser.wallet_tracker_parser import parse_wallet_tracker
 from src.parser.image_ocr import ocr_available, ocr_image_url, parse_ocr_text
+from src.automations.image_archive import ImageArchive
 from src.automations.open_signals_db import OpenSignalsDB
 from src.automations.wallet_tracker_debouncer import WalletTrackerDebouncer
 from src.parser.update_parser import (
@@ -115,6 +123,7 @@ class Router:
         analytics: AnalyticsDB | None = None,
         open_signals: OpenSignalsDB | None = None,
         quick_trade_enabled: bool = False,
+        image_archive: ImageArchive | None = None,
     ):
         self._discord_cfg = discord_cfg
         self._dispatcher = dispatcher
@@ -129,6 +138,11 @@ class Router:
         # When True, perps signals get an extra "1-Tap Trade" callback
         # button that routes through the trade-executor for Ostium fills.
         self._quick_trade_enabled = quick_trade_enabled
+        # When present, signal-attached Discord images get archived to
+        # Telegram once (returning a permanent file_id) and re-attached
+        # to lifecycle events later. When None, image forwarding falls
+        # back to URL passthrough (works for ~24h via Discord CDN signing).
+        self._image_archive = image_archive
         # Debouncer for rapid same-trader same-token same-action buys on
         # the Wallet Tracker channel. Instantiated lazily (needs a stable
         # emit callback bound to this router instance).
@@ -172,6 +186,33 @@ class Router:
                 "Router crashed on message from channel=%d", message.channel_id,
             )
 
+    async def _resolve_image(
+        self,
+        *,
+        message: IncomingMessage,
+        open_signal_id: int | None,
+    ) -> tuple[str | None, str | None]:
+        """Resolve a Discord-attached image to (file_id, url_fallback).
+
+        Returns (None, None) when no image is attached.
+        Returns (file_id, None) when ImageArchive successfully pinned a
+        permanent Telegram file_id.
+        Returns (None, url) when ImageArchive is disabled or upload failed —
+        the dispatcher falls back to URL passthrough (~24h Discord CDN
+        signature is fine for real-time delivery).
+        """
+        if not getattr(message, "image_urls", None):
+            return (None, None)
+        image_url = message.image_urls[0]
+        if self._image_archive is None:
+            return (None, image_url)
+        file_id = await self._image_archive.get_or_upload(
+            image_url=image_url, open_signal_id=open_signal_id,
+        )
+        if file_id:
+            return (file_id, None)
+        return (None, image_url)
+
     def _build_discord_channel_url(self, channel_id: int) -> str:
         """Deep link back to the source Discord channel. Returns empty
         string when guild_id isn't configured (defensive — URL is optional
@@ -204,11 +245,16 @@ class Router:
                 len(message.buttons or []),
                 route.name,
             )
+            image_file_id, image_url_fallback = await self._resolve_image(
+                message=message, open_signal_id=None,
+            )
             await self._dispatcher.dispatch(
                 text=message.content,
                 source_key=route.key,
                 pair="",
                 keyboard=keyboard,
+                image_file_id=image_file_id,
+                image_url_fallback=image_url_fallback,
             )
             return
 
@@ -327,9 +373,17 @@ class Router:
         if result is None:
             return
 
-        text, pair, keyboard = result
+        text, pair, keyboard, open_signal_id = result
+        image_file_id, image_url_fallback = await self._resolve_image(
+            message=message, open_signal_id=open_signal_id,
+        )
         await self._dispatcher.dispatch(
-            text=text, source_key=route.key, pair=pair, keyboard=keyboard,
+            text=text,
+            source_key=route.key,
+            pair=pair,
+            keyboard=keyboard,
+            image_file_id=image_file_id,
+            image_url_fallback=image_url_fallback,
         )
         logger.info("Enqueued %s from #%s for fan-out", msg_type.value, route.name)
 
@@ -580,12 +634,15 @@ class Router:
         msg_type: MessageType,
         message: IncomingMessage,
         route: ChannelRoute,
-    ) -> tuple[str, str, object] | None:
-        """Returns (text, pair, keyboard) or None to drop the message.
+    ) -> tuple[str, str, object, int | None] | None:
+        """Returns (text, pair, keyboard, open_signal_id) or None to drop.
 
         ``pair`` is the token pair string (e.g. "ETH/USDT") used by the
         dispatcher for muted-token filtering. Empty string when unknown.
         ``keyboard`` is an InlineKeyboardMarkup or None.
+        ``open_signal_id`` is the row id from open_signals_db when this
+        message recorded (or matched) a signal — used by the image
+        archive to attach the chart to the right row. None when no row.
         """
         source_label = label_for_source_type(route.source_type)
 
@@ -616,7 +673,7 @@ class Router:
                     channel_name=route.name,
                     source_type_label=source_label,
                 )
-                return (text, "", None)
+                return (text, "", None, None)
             # Record the signal for analytics (idempotent on trade_id + channel)
             if self._analytics is not None:
                 try:
@@ -673,7 +730,7 @@ class Router:
                 pair=signal.pair,
                 quick_trade_signal_id=quick_trade_id,
             )
-            return (text, signal.pair, keyboard)
+            return (text, signal.pair, keyboard, open_signal_id)
 
         if msg_type in _LIFECYCLE_LABELS:
             # Look up the originating signal so we can render the entry,
@@ -708,7 +765,13 @@ class Router:
                 keyboard = build_signal_keyboard(
                     ref_link=route.ref_link, pair=pair_for_filter,
                 )
-            return (text, pair_for_filter, keyboard)
+            # Pass the original signal's row id through so the image
+            # archive can re-attach the chart from the original call to
+            # the lifecycle event. None when no original was found.
+            original_signal_id = (
+                original_signal.id if original_signal is not None else None
+            )
+            return (text, pair_for_filter, keyboard, original_signal_id)
 
         # Unknown / free-form fallback. Forward verbatim for:
         #   - memecoin source types (humans + bots, always)
@@ -720,6 +783,35 @@ class Router:
             route.source_type in _BOT_FORWARD_SOURCE_TYPES
             and message.author_is_bot
         )
+
+        if is_bot_perp:
+            # 1. Manual lifecycle / update / close phrase (highest priority).
+            #    "Closing LAB", "Stopped JUP", "AAVE TP1 hit", "Moved SL to BE".
+            update = parse_perp_pinger_update(message.content)
+            if update is not None:
+                pp_text, pp_pair, pp_keyboard, pp_signal_id = (
+                    await self._build_perp_pinger_update(
+                        update=update,
+                        message=message,
+                        route=route,
+                        source_label=source_label,
+                    )
+                )
+                return (pp_text, pp_pair, pp_keyboard, pp_signal_id)
+
+            # 2. New-call format: "SHORT JUP @ 0.2350" with Entry / Sl / Tp.
+            parsed = parse_perp_pinger_new_call(message.content)
+            if parsed is not None:
+                pp_text, pp_pair, pp_keyboard, pp_signal_id = (
+                    await self._build_perp_pinger_new_call(
+                        parsed=parsed,
+                        message=message,
+                        route=route,
+                        source_label=source_label,
+                    )
+                )
+                return (pp_text, pp_pair, pp_keyboard, pp_signal_id)
+
         if is_freeform or is_bot_perp:
             text = format_unknown_message(
                 raw_message=message.content,
@@ -735,12 +827,146 @@ class Router:
                 build_signal_keyboard(ref_link=route.ref_link, pair=pair)
                 if pair else None
             )
-            return (text, pair, keyboard)
+            return (text, pair, keyboard, None)
 
         logger.debug(
             "Unrecognized message in non-freeform channel #%s: dropped", route.name,
         )
         return None
+
+    async def _build_perp_pinger_new_call(
+        self,
+        *,
+        parsed,
+        message: IncomingMessage,
+        route: ChannelRoute,
+        source_label: str,
+    ) -> tuple[str, str, object, int | None]:
+        """Branch for Perp Pinger new-call signals.
+
+        Records the signal into open_signals_db, formats with the
+        structured tap-to-copy renderer, and attaches the 1-Tap Trade
+        button when trading is enabled on a perps channel.
+        """
+        open_signal_id: int | None = None
+        if self._open_signals is not None:
+            try:
+                open_signal_id = await self._open_signals.record_signal(
+                    channel_id=message.channel_id,
+                    pair=parsed.pair,
+                    side=parsed.side,
+                    leverage=None,
+                    entry=parsed.entry,
+                    stop_loss=parsed.stop_loss,
+                    tp1=parsed.take_profit,
+                    tp2=None,
+                    tp3=None,
+                    trade_id=None,
+                    raw_message=message.content,
+                    stop_loss_is_conditional=parsed.stop_loss_is_conditional,
+                )
+            except Exception:
+                logger.exception(
+                    "open_signals: failed to record perp_pinger signal",
+                )
+
+        text = format_perp_pinger_signal(
+            parsed=parsed,
+            ref_link=route.ref_link,
+            channel_name=route.name,
+            source_type_label=source_label,
+        )
+        quick_trade_id = (
+            open_signal_id
+            if (
+                self._quick_trade_enabled
+                and route.source_type == SOURCE_PERPS
+                and open_signal_id
+            )
+            else None
+        )
+        keyboard = build_signal_keyboard(
+            ref_link=route.ref_link,
+            pair=parsed.pair,
+            quick_trade_signal_id=quick_trade_id,
+        )
+        logger.info(
+            "Perp Pinger new call parsed: #%s pair=%s side=%s entry=%s open_signal_id=%s",
+            route.name, parsed.pair, parsed.side, parsed.entry, open_signal_id,
+        )
+        return (text, parsed.pair, keyboard, open_signal_id)
+
+    async def _build_perp_pinger_update(
+        self,
+        *,
+        update,
+        message: IncomingMessage,
+        route: ChannelRoute,
+        source_label: str,
+    ) -> tuple[str, str, object, int | None]:
+        """Branch for Perp Pinger update / close / stop / BE / TP-hit.
+
+        Looks up the original call in open_signals_db, renders the
+        structured lifecycle card via format_lifecycle_event with the
+        original entry / SL / TP context, and flips the row to a
+        terminal status for CLOSE / STOP kinds so we don't double-enrich.
+        """
+        original_signal = None
+        original_signal_id: int | None = None
+        if self._open_signals is not None:
+            try:
+                original_signal = await self._open_signals.find_latest_open(
+                    channel_id=message.channel_id, pair_or_base=update.pair,
+                )
+                if original_signal is not None:
+                    original_signal_id = original_signal.id
+            except Exception:
+                logger.exception(
+                    "open_signals: lookup failed for perp_pinger update %s/%s",
+                    route.name, update.pair,
+                )
+
+        label = _PERP_PINGER_UPDATE_LABELS.get(update.kind, "Manual Update")
+        text = format_lifecycle_event(
+            label=label,
+            raw_message=message.content,
+            ref_link=route.ref_link,
+            channel_name=route.name,
+            source_type_label=source_label,
+            original_signal=original_signal,
+        )
+        keyboard = build_signal_keyboard(
+            ref_link=route.ref_link,
+            pair=update.pair,
+            quick_trade_signal_id=None,
+        )
+
+        # Flip status for terminal kinds so future updates don't pull a
+        # stale-but-closed row as 'original context'.
+        if (
+            self._open_signals is not None
+            and update.kind in (_PerpPingerUpdateKind.CLOSE, _PerpPingerUpdateKind.STOP)
+        ):
+            new_status = (
+                "closed" if update.kind == _PerpPingerUpdateKind.CLOSE else "stopped"
+            )
+            try:
+                await self._open_signals.update_status(
+                    channel_id=message.channel_id,
+                    pair_or_base=update.pair,
+                    new_status=new_status,
+                )
+            except Exception:
+                logger.exception(
+                    "open_signals: failed to flip status %s for %s/%s",
+                    new_status, route.name, update.pair,
+                )
+
+        logger.info(
+            "Perp Pinger update parsed: #%s pair=%s kind=%s original=%s",
+            route.name, update.pair, update.kind.value, original_signal_id,
+        )
+        return (text, update.pair, keyboard, original_signal_id)
 
     async def _lookup_original_for_lifecycle(
         self,

@@ -71,6 +71,9 @@ class DispatchStats:
         )
 
 
+_CAPTION_LIMIT = 1024
+
+
 @dataclass
 class _AlertJob:
     alert_id: int
@@ -78,6 +81,12 @@ class _AlertJob:
     source_key: str            # channel key for subscription filtering
     pair: str = ""             # e.g. "ETH/USDT" for muted-token filtering
     keyboard: object = None    # InlineKeyboardMarkup (optional)
+    # Permanent Telegram file_id from ImageArchive (preferred). Used as
+    # photo arg to send_photo — no re-download, no Discord involvement.
+    image_file_id: str | None = None
+    # Discord CDN URL fallback when ImageArchive couldn't pin a file_id.
+    # Still works for ~24h thanks to Telegram fetching at send time.
+    image_url_fallback: str | None = None
 
 
 class Dispatcher:
@@ -139,9 +148,22 @@ class Dispatcher:
         logger.info("Dispatcher stopped")
 
     async def dispatch(
-        self, text: str, source_key: str = "", pair: str = "", keyboard=None,
+        self,
+        text: str,
+        source_key: str = "",
+        pair: str = "",
+        keyboard=None,
+        image_file_id: str | None = None,
+        image_url_fallback: str | None = None,
     ) -> None:
-        """Enqueue an alert for fan-out. Never blocks longer than queue wait."""
+        """Enqueue an alert for fan-out. Never blocks longer than queue wait.
+
+        When ``image_file_id`` is set the dispatcher sends a photo via
+        Telegram's CDN reference (fastest, permanent). When only
+        ``image_url_fallback`` is set the photo is fetched by Telegram
+        from the Discord CDN at send time (works for ~24h). When both are
+        None the alert is sent as a plain text message.
+        """
         self._alert_counter += 1
         job = _AlertJob(
             alert_id=self._alert_counter,
@@ -149,6 +171,8 @@ class Dispatcher:
             source_key=source_key,
             pair=pair,
             keyboard=keyboard,
+            image_file_id=image_file_id,
+            image_url_fallback=image_url_fallback,
         )
         try:
             self._queue.put_nowait(job)
@@ -212,7 +236,7 @@ class Dispatcher:
                     if await self._db.is_token_muted(user_id, job.pair):
                         return
                 await self._bucket.take(1)
-                await self._send_with_retries(user_id, job.text, job.keyboard, stats)
+                await self._send_with_retries(user_id, job, stats)
 
         await asyncio.gather(
             *(_one(uid) for uid in user_ids),
@@ -221,8 +245,73 @@ class Dispatcher:
         stats.finished_at = time.monotonic()
         return stats
 
+    async def _send_one(
+        self, user_id: int, job: _AlertJob,
+    ) -> None:
+        """Perform a single send (photo or text) with the right strategy.
+
+        - File_id + caption fits → single send_photo with caption.
+        - File_id + caption overflows → send_photo (empty caption) then
+          send_message with the full text (keyboard rides the text msg).
+        - URL fallback + caption fits → single send_photo by URL.
+        - URL fallback + caption overflows → same two-message split.
+        - No photo → plain send_message.
+
+        On send_photo BadRequest (broken URL, unsupported format, etc.),
+        falls through to text-only so the alert is never dropped.
+        """
+        photo_ref = job.image_file_id or job.image_url_fallback
+        if photo_ref is None:
+            await self._bot.send_message(
+                chat_id=user_id,
+                text=job.text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=job.keyboard,
+            )
+            return
+
+        text_len = len(job.text or "")
+        try:
+            if text_len <= _CAPTION_LIMIT:
+                await self._bot.send_photo(
+                    chat_id=user_id,
+                    photo=photo_ref,
+                    caption=job.text,
+                    parse_mode="HTML",
+                    reply_markup=job.keyboard,
+                )
+            else:
+                await self._bot.send_photo(
+                    chat_id=user_id,
+                    photo=photo_ref,
+                    caption="",
+                )
+                await self._bot.send_message(
+                    chat_id=user_id,
+                    text=job.text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=job.keyboard,
+                )
+        except TelegramError as e:
+            # Photo path failed (bad URL, unsupported type, file_id expired
+            # in some unusual way). Fall back to text-only so the alert
+            # still lands.
+            logger.warning(
+                "send_photo failed for user %d (%s) — falling back to text",
+                user_id, e,
+            )
+            await self._bot.send_message(
+                chat_id=user_id,
+                text=job.text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=job.keyboard,
+            )
+
     async def _send_with_retries(
-        self, user_id: int, text: str, keyboard, stats: DispatchStats,
+        self, user_id: int, job: _AlertJob, stats: DispatchStats,
     ) -> None:
         """Send one DM, classifying failures into the stats counters."""
         attempts = 0
@@ -230,13 +319,7 @@ class Dispatcher:
         while attempts < max_attempts:
             try:
                 await asyncio.wait_for(
-                    self._bot.send_message(
-                        chat_id=user_id,
-                        text=text,
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
-                        reply_markup=keyboard,
-                    ),
+                    self._send_one(user_id, job),
                     timeout=self._cfg.per_send_timeout_sec,
                 )
                 stats.sent += 1

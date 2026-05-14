@@ -1,7 +1,8 @@
 """Admin-only HTTP endpoint for firing a synthetic signal at a specific user.
 
-Used for smoke-testing the 1-Tap Trade flow without waiting for a real
-perp signal AND without fanning out to all verified subscribers.
+Used for smoke-testing the 1-Tap Trade flow + image forwarding + the
+Perp Pinger paths without waiting for a real Discord post AND without
+fanning out to all verified subscribers.
 
 Mounts on the OAuth callback server's aiohttp app at:
 
@@ -9,23 +10,34 @@ Mounts on the OAuth callback server's aiohttp app at:
     Headers: X-Admin-Secret: <ADMIN_WEBHOOK_SECRET>
     Body: {
       "discord_user_id": "901091776977338419",
-      "pair": "BTC/USD",
-      "side": "LONG",          // or "SHORT"
-      "leverage": 10,
-      "entry": 65000,
-      "stop_loss": 63500,
-      "tp1": 67000,
-      "tp2": 69000,
-      "tp3": 72000,
-      "risk_level": "MEDIUM",  // optional, defaults MEDIUM
-      "trade_id": 99999,       // optional, defaults to time-based int
-      "include_quick_trade": true  // optional, defaults true
+      "forward_as": "structured" | "perp_pinger_new" | "perp_pinger_update",
+                       # defaults to "structured" (existing behavior)
+      "pair": "BTC/USD" | "JUP" | "LAB",
+      "side": "LONG" | "SHORT",   # required for structured + perp_pinger_new
+      "leverage": 10,             # structured only
+      "entry": 65000,             # required for structured + perp_pinger_new
+      "stop_loss": 63500,         # optional for perp_pinger_new
+      "tp1": 67000,               # optional for perp_pinger_new
+      "tp2": 69000,               # structured only
+      "tp3": 72000,               # structured only
+      "risk_level": "MEDIUM",     # optional, defaults MEDIUM (structured only)
+      "trade_id": 99999,          # optional, defaults to time-based int
+      "include_quick_trade": true,# optional, defaults true
+
+      # perp_pinger_update only:
+      "update_kind": "close" | "stop" | "be" | "tp_hit" | "adjust",
+      "raw_message": "Closing LAB here in full closed",
+
+      # all forwards (optional):
+      "image_url": "https://cdn.discordapp.com/...",
+      "stop_loss_is_conditional": false,
+      "stop_loss_raw": "4h candle close above 0.2470$"
     }
     -> 200 { ok: true, telegram_user_id, signal_id, message_id }
     -> 401 unauthorized
     -> 404 user not verified
 
-Synthetic signals get channel_id=0 in open_signals_db so they cannot
+Synthetic signals use channel_id=0 in open_signals_db so they can't
 collide with real Discord channel IDs.
 """
 
@@ -41,7 +53,17 @@ from telegram import Bot
 
 from src.automations.open_signals_db import OpenSignalsDB
 from src.config import Config
-from src.formatter import build_signal_keyboard, format_parsed_signal
+from src.formatter import (
+    build_signal_keyboard,
+    format_lifecycle_event,
+    format_parsed_signal,
+    format_perp_pinger_signal,
+)
+from src.parser.perp_pinger_parser import PerpPingerSignal
+from src.parser.perp_pinger_update_parser import (
+    LABELS as _PERP_PINGER_UPDATE_LABELS,
+    UpdateKind as _PerpPingerUpdateKind,
+)
 from src.parser.signal_parser import ParsedSignal, RiskLevel, Side
 from src.verification.db import VerificationDB
 
@@ -49,6 +71,7 @@ logger = logging.getLogger(__name__)
 
 
 _SYNTHETIC_CHANNEL_ID = 0
+_CAPTION_LIMIT = 1024
 
 
 class AdminTradingEndpoint:
@@ -80,6 +103,44 @@ class AdminTradingEndpoint:
         given = request.headers.get("X-Admin-Secret", "").strip()
         return hmac.compare_digest(given, self._admin_secret)
 
+    async def _send(
+        self,
+        *,
+        chat_id: int,
+        text: str,
+        keyboard,
+        image_url: str | None,
+    ):
+        """Send via send_photo when image_url is set, with caption-overflow
+        fallback. Otherwise send_message. Returns the Telegram Message."""
+        if image_url:
+            if len(text) <= _CAPTION_LIMIT:
+                return await self._telegram_bot.send_photo(
+                    chat_id=chat_id,
+                    photo=image_url,
+                    caption=text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard,
+                )
+            else:
+                await self._telegram_bot.send_photo(
+                    chat_id=chat_id, photo=image_url, caption="",
+                )
+                return await self._telegram_bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=keyboard,
+                )
+        return await self._telegram_bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=keyboard,
+        )
+
     async def _handle_test_signal(
         self, request: web.Request,
     ) -> web.Response:
@@ -91,8 +152,61 @@ class AdminTradingEndpoint:
         except Exception:
             return web.json_response({"error": "invalid_json"}, status=400)
 
+        forward_as = str(body.get("forward_as", "structured")).lower().strip()
+        if forward_as not in ("structured", "perp_pinger_new", "perp_pinger_update"):
+            return web.json_response(
+                {"error": "forward_as must be structured | perp_pinger_new | perp_pinger_update"},
+                status=400,
+            )
+
         try:
             discord_user_id = str(body["discord_user_id"]).strip()
+        except KeyError as e:
+            return web.json_response({"error": f"missing: {e}"}, status=400)
+
+        user = await self._verification_db.get_by_discord_user_id(discord_user_id)
+        if user is None or not user.is_active:
+            return web.json_response(
+                {"error": "user not verified or inactive"}, status=404,
+            )
+
+        image_url = body.get("image_url") or None
+        include_quick_trade = bool(body.get("include_quick_trade", True))
+        ref_link = "https://app.ostium.com/?ref=PTION"
+
+        if forward_as == "structured":
+            return await self._send_structured(
+                body=body,
+                user=user,
+                discord_user_id=discord_user_id,
+                image_url=image_url,
+                include_quick_trade=include_quick_trade,
+                ref_link=ref_link,
+            )
+        if forward_as == "perp_pinger_new":
+            return await self._send_perp_pinger_new(
+                body=body,
+                user=user,
+                discord_user_id=discord_user_id,
+                image_url=image_url,
+                include_quick_trade=include_quick_trade,
+                ref_link=ref_link,
+            )
+        # perp_pinger_update
+        return await self._send_perp_pinger_update(
+            body=body,
+            user=user,
+            discord_user_id=discord_user_id,
+            image_url=image_url,
+            ref_link=ref_link,
+        )
+
+    # ---- structured (legacy / Potion Perps Bot template) -------------------
+
+    async def _send_structured(
+        self, *, body, user, discord_user_id, image_url, include_quick_trade, ref_link,
+    ) -> web.Response:
+        try:
             pair = str(body["pair"]).strip()
             side_str = str(body["side"]).strip().upper()
             leverage = int(body["leverage"])
@@ -102,10 +216,7 @@ class AdminTradingEndpoint:
             tp2 = float(body["tp2"])
             tp3 = float(body["tp3"])
         except (KeyError, TypeError, ValueError) as e:
-            return web.json_response(
-                {"error": f"bad_request: {e}"}, status=400,
-            )
-
+            return web.json_response({"error": f"bad_request: {e}"}, status=400)
         if side_str not in ("LONG", "SHORT"):
             return web.json_response(
                 {"error": "side must be LONG or SHORT"}, status=400,
@@ -114,53 +225,26 @@ class AdminTradingEndpoint:
         if risk_str not in ("LOW", "MEDIUM", "HIGH"):
             risk_str = "MEDIUM"
         trade_id = int(body.get("trade_id", int(time.time()) % 1_000_000))
-        include_quick_trade = bool(body.get("include_quick_trade", True))
-
-        user = await self._verification_db.get_by_discord_user_id(discord_user_id)
-        if user is None or not user.is_active:
-            return web.json_response(
-                {"error": "user not verified or inactive"}, status=404,
-            )
 
         open_signal_id = await self._open_signals_db.record_signal(
             channel_id=_SYNTHETIC_CHANNEL_ID,
-            pair=pair,
-            side=side_str,
-            leverage=leverage,
-            entry=entry,
-            stop_loss=stop_loss,
-            tp1=tp1,
-            tp2=tp2,
-            tp3=tp3,
-            trade_id=trade_id,
-            raw_message="(admin test signal)",
+            pair=pair, side=side_str, leverage=leverage,
+            entry=entry, stop_loss=stop_loss, tp1=tp1, tp2=tp2, tp3=tp3,
+            trade_id=trade_id, raw_message="(admin test: structured)",
         )
 
         parsed = ParsedSignal(
-            pair=pair,
-            trade_id=trade_id,
-            risk_level=RiskLevel[risk_str],
-            trade_type="SCALP",
-            size="1-2%",
-            side=Side[side_str],
-            entry=entry,
-            stop_loss=stop_loss,
-            tp1=tp1,
-            tp2=tp2,
-            tp3=tp3,
+            pair=pair, trade_id=trade_id, risk_level=RiskLevel[risk_str],
+            trade_type="SCALP", size="1-2%", side=Side[side_str],
+            entry=entry, stop_loss=stop_loss, tp1=tp1, tp2=tp2, tp3=tp3,
             leverage=leverage,
         )
-
-        ref_link = "https://app.ostium.com/?ref=PTION"
         text = format_parsed_signal(
-            signal=parsed,
-            ref_link=ref_link,
-            channel_name="Test Signal",
-            source_type_label="PERPS",
+            signal=parsed, ref_link=ref_link,
+            channel_name="Test Signal", source_type_label="PERPS",
         )
         keyboard = build_signal_keyboard(
-            ref_link=ref_link,
-            pair=pair,
+            ref_link=ref_link, pair=pair,
             quick_trade_signal_id=(
                 open_signal_id
                 if include_quick_trade and self._config.trading.enabled
@@ -168,12 +252,129 @@ class AdminTradingEndpoint:
             ),
         )
 
+        return await self._send_and_respond(
+            user=user, discord_user_id=discord_user_id,
+            text=text, keyboard=keyboard, image_url=image_url,
+            open_signal_id=open_signal_id,
+        )
+
+    # ---- perp_pinger_new (free-form new-call) ------------------------------
+
+    async def _send_perp_pinger_new(
+        self, *, body, user, discord_user_id, image_url, include_quick_trade, ref_link,
+    ) -> web.Response:
         try:
-            message = await self._telegram_bot.send_message(
+            pair = str(body["pair"]).strip().upper()
+            side_str = str(body["side"]).strip().upper()
+            entry = float(body["entry"])
+        except (KeyError, TypeError, ValueError) as e:
+            return web.json_response({"error": f"bad_request: {e}"}, status=400)
+        if side_str not in ("LONG", "SHORT"):
+            return web.json_response(
+                {"error": "side must be LONG or SHORT"}, status=400,
+            )
+
+        stop_loss = body.get("stop_loss")
+        stop_loss = float(stop_loss) if stop_loss is not None else None
+        take_profit = body.get("tp1") or body.get("take_profit")
+        take_profit = float(take_profit) if take_profit is not None else None
+        risk_rr = body.get("risk_rr")
+        risk_rr = float(risk_rr) if risk_rr is not None else None
+        stop_loss_is_conditional = bool(body.get("stop_loss_is_conditional", False))
+        stop_loss_raw = body.get("stop_loss_raw")
+
+        open_signal_id = await self._open_signals_db.record_signal(
+            channel_id=_SYNTHETIC_CHANNEL_ID,
+            pair=pair, side=side_str, leverage=None,
+            entry=entry, stop_loss=stop_loss,
+            tp1=take_profit, tp2=None, tp3=None,
+            trade_id=None,
+            raw_message="(admin test: perp_pinger_new)",
+            stop_loss_is_conditional=stop_loss_is_conditional,
+        )
+
+        parsed = PerpPingerSignal(
+            pair=pair, side=side_str, entry=entry,
+            stop_loss=stop_loss,
+            stop_loss_is_conditional=stop_loss_is_conditional,
+            stop_loss_raw=stop_loss_raw,
+            take_profit=take_profit, risk_rr=risk_rr,
+        )
+        text = format_perp_pinger_signal(
+            parsed=parsed, ref_link=ref_link,
+            channel_name="Test Signal", source_type_label="PERPS",
+        )
+        keyboard = build_signal_keyboard(
+            ref_link=ref_link, pair=pair,
+            quick_trade_signal_id=(
+                open_signal_id
+                if include_quick_trade and self._config.trading.enabled
+                else None
+            ),
+        )
+
+        return await self._send_and_respond(
+            user=user, discord_user_id=discord_user_id,
+            text=text, keyboard=keyboard, image_url=image_url,
+            open_signal_id=open_signal_id,
+        )
+
+    # ---- perp_pinger_update (free-form close/stop/BE/TP-hit) ---------------
+
+    async def _send_perp_pinger_update(
+        self, *, body, user, discord_user_id, image_url, ref_link,
+    ) -> web.Response:
+        try:
+            pair = str(body["pair"]).strip().upper()
+            kind_str = str(body["update_kind"]).strip().lower()
+        except (KeyError, TypeError) as e:
+            return web.json_response({"error": f"bad_request: {e}"}, status=400)
+
+        try:
+            kind = _PerpPingerUpdateKind(kind_str)
+        except ValueError:
+            return web.json_response(
+                {"error": f"update_kind must be one of "
+                          f"{[k.value for k in _PerpPingerUpdateKind]}"},
+                status=400,
+            )
+
+        raw_message = body.get("raw_message") or f"Manual {kind.value} on {pair}"
+
+        original_signal = await self._open_signals_db.find_latest_open(
+            channel_id=_SYNTHETIC_CHANNEL_ID, pair_or_base=pair,
+        )
+        label = _PERP_PINGER_UPDATE_LABELS.get(kind, "Manual Update")
+        text = format_lifecycle_event(
+            label=label, raw_message=raw_message, ref_link=ref_link,
+            channel_name="Test Signal", source_type_label="PERPS",
+            original_signal=original_signal,
+        )
+        keyboard = build_signal_keyboard(
+            ref_link=ref_link, pair=pair, quick_trade_signal_id=None,
+        )
+
+        original_signal_id = (
+            original_signal.id if original_signal is not None else None
+        )
+        return await self._send_and_respond(
+            user=user, discord_user_id=discord_user_id,
+            text=text, keyboard=keyboard, image_url=image_url,
+            open_signal_id=original_signal_id,
+        )
+
+    # ---- shared send + JSON response builder -------------------------------
+
+    async def _send_and_respond(
+        self, *, user, discord_user_id, text, keyboard,
+        image_url, open_signal_id,
+    ) -> web.Response:
+        try:
+            message = await self._send(
                 chat_id=user.telegram_user_id,
                 text=text,
-                parse_mode="HTML",
-                reply_markup=keyboard,
+                keyboard=keyboard,
+                image_url=image_url,
             )
         except Exception as e:
             logger.exception(
@@ -185,7 +386,7 @@ class AdminTradingEndpoint:
             )
 
         logger.info(
-            "Admin test-signal sent: discord=%s tg=%d signal_id=%d",
+            "Admin test-signal sent: discord=%s tg=%d signal_id=%s",
             discord_user_id, user.telegram_user_id, open_signal_id,
         )
         return web.json_response({
@@ -193,7 +394,4 @@ class AdminTradingEndpoint:
             "telegram_user_id": user.telegram_user_id,
             "signal_id": open_signal_id,
             "message_id": message.message_id,
-            "quick_trade_button": (
-                include_quick_trade and self._config.trading.enabled
-            ),
         })

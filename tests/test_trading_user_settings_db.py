@@ -119,6 +119,52 @@ async def test_mark_size_used(db_path: str):
 
 
 @pytest.mark.asyncio
+async def test_default_last_used_leverage_is_none(db_path: str):
+    from src.trading.user_settings_db import UserTradingSettingsDB
+
+    db = UserTradingSettingsDB(db_path=db_path)
+    await db.open()
+    try:
+        s = await db.get_or_default(7)
+        assert s.last_used_leverage is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_set_last_used_leverage_round_trip(db_path: str):
+    from src.trading.user_settings_db import UserTradingSettingsDB
+
+    db = UserTradingSettingsDB(db_path=db_path)
+    await db.open()
+    try:
+        await db.set_last_used_leverage(7, 12)
+        s = await db.get_or_default(7)
+        assert s.last_used_leverage == 12
+        # Updating preserves slippage + presets (each setter only touches its column).
+        await db.set_last_used_leverage(7, 25)
+        s2 = await db.get_or_default(7)
+        assert s2.last_used_leverage == 25
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_set_last_used_leverage_rejects_out_of_range(db_path: str):
+    from src.trading.user_settings_db import UserTradingSettingsDB
+
+    db = UserTradingSettingsDB(db_path=db_path)
+    await db.open()
+    try:
+        with pytest.raises(ValueError):
+            await db.set_last_used_leverage(1, 0)
+        with pytest.raises(ValueError):
+            await db.set_last_used_leverage(1, 9999)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_independent_users_do_not_collide(db_path: str):
     from src.trading.user_settings_db import UserTradingSettingsDB
 

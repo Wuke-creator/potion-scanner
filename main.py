@@ -179,6 +179,30 @@ async def run(config: Config) -> None:
         admin_trading_endpoint.register(verification.callback_server.app)
         logger.info("Admin trading endpoint registered at /admin/trading/test-signal")
 
+    # --- Image archive: Discord URL -> permanent Telegram file_id ---
+    # When IMAGE_ARCHIVE_CHAT_ID is set, every signal-attached chart is
+    # uploaded once to the archive chat and reused for fan-out + lifecycle
+    # re-sends. When unset, image forwarding falls back to URL passthrough
+    # (works for ~24h while Discord's CDN signature is valid).
+    image_archive = None
+    if config.image_archive.enabled:
+        from src.automations.image_archive import ImageArchive
+
+        image_archive = ImageArchive(
+            bot=telegram_bot,
+            archive_chat_id=config.image_archive.archive_chat_id,
+            open_signals_db=open_signals_db,
+        )
+        logger.info(
+            "Image archive enabled: chat_id=%d",
+            config.image_archive.archive_chat_id,
+        )
+    else:
+        logger.info(
+            "Image archive disabled (set IMAGE_ARCHIVE_CHAT_ID to enable). "
+            "Signal images will fall back to Discord-URL passthrough."
+        )
+
     # --- Router: classify + parse + format, enqueue to dispatcher ---
     router = Router(
         discord_cfg=config.discord,
@@ -186,6 +210,7 @@ async def run(config: Config) -> None:
         analytics=analytics,
         open_signals=open_signals_db,
         quick_trade_enabled=config.trading.enabled,
+        image_archive=image_archive,
     )
 
     # --- Automations: shared activity tracker (feeds Features 2 + 4) ---
@@ -723,6 +748,11 @@ async def run(config: Config) -> None:
                 await email_events_db.close()
             except Exception:
                 logger.exception("Email events DB close error")
+        if image_archive is not None:
+            try:
+                await image_archive.close()
+            except Exception:
+                logger.exception("Image archive close error")
         if trade_executor_client is not None:
             try:
                 await trade_executor_client.close()

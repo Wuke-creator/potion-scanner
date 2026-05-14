@@ -273,6 +273,28 @@ class TradingConfig:
 
 
 @dataclass
+class ImageArchiveConfig:
+    """Permanent image archive on Telegram's CDN.
+
+    When ``enabled`` is True (i.e. ``archive_chat_id`` is set), every
+    signal-attached Discord image is downloaded once and uploaded to
+    the archive chat, yielding a permanent Telegram ``file_id`` saved
+    on the open_signals row. Fan-out and lifecycle re-sends reuse the
+    file_id, which doesn't expire (unlike Discord CDN URLs).
+
+    Recommended setup: create a private Telegram channel called
+    "Potion Signal Archive", add the bot as admin, set
+    IMAGE_ARCHIVE_CHAT_ID to the channel id.
+    """
+
+    archive_chat_id: int = 0      # 0 disables (URL passthrough fallback)
+
+    @property
+    def enabled(self) -> bool:
+        return self.archive_chat_id != 0
+
+
+@dataclass
 class Config:
     discord: DiscordConfig = field(default_factory=DiscordConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
@@ -285,6 +307,9 @@ class Config:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     ops_capture: OpsCaptureConfig = field(default_factory=OpsCaptureConfig)
     trading: TradingConfig = field(default_factory=TradingConfig)
+    image_archive: ImageArchiveConfig = field(
+        default_factory=ImageArchiveConfig,
+    )
 
 
 def _env_int(name: str, default: int = 0) -> int:
@@ -633,6 +658,10 @@ def load_config(
         ),
     )
 
+    image_archive_cfg = ImageArchiveConfig(
+        archive_chat_id=_env_int("IMAGE_ARCHIVE_CHAT_ID", 0),
+    )
+
     config = Config(
         discord=discord_cfg,
         telegram=telegram_cfg,
@@ -645,6 +674,7 @@ def load_config(
         logging=logging_cfg,
         ops_capture=ops_cfg,
         trading=trading_cfg,
+        image_archive=image_archive_cfg,
     )
 
     _validate(config)
