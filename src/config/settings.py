@@ -155,6 +155,8 @@ class EmailBotConfig:
     whop_webhook_secret: str = ""
     admin_webhook_secret: str = ""
     resend_webhook_secret: str = ""
+    email_unsub_secret: str = ""
+    public_base_url: str = ""
     rejoin_url: str = "https://whop.com/potion"
     db_path: str = "data/email.db"
     email_events_db_path: str = "data/email_events.db"
@@ -487,6 +489,11 @@ def load_config(
         whop_webhook_secret=os.getenv("WHOP_WEBHOOK_SECRET", ""),
         admin_webhook_secret=os.getenv("ADMIN_WEBHOOK_SECRET", ""),
         resend_webhook_secret=os.getenv("RESEND_WEBHOOK_SECRET", ""),
+        email_unsub_secret=os.getenv("EMAIL_UNSUB_SECRET", ""),
+        public_base_url=os.getenv(
+            "EMAIL_BOT_PUBLIC_URL",
+            email_yaml.get("public_base_url", ""),
+        ),
         rejoin_url=os.getenv(
             "POTION_REJOIN_URL",
             email_yaml.get("rejoin_url", "https://whop.com/potion"),

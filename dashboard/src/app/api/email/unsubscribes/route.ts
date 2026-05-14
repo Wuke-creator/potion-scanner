@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getEmailKpis } from "@/lib/queries";
+import { getUnsubscribes } from "@/lib/queries";
 
 export const dynamic = "force-dynamic";
 
@@ -12,10 +12,10 @@ function readWindow(req: NextRequest): number {
 
 export async function GET(req: NextRequest) {
   try {
-    return NextResponse.json(getEmailKpis(readWindow(req)));
+    return NextResponse.json(getUnsubscribes(readWindow(req)));
   } catch (e) {
     return NextResponse.json(
-      { error: e instanceof Error ? e.message : "kpis failed" },
+      { error: e instanceof Error ? e.message : "unsubscribes failed" },
       { status: 500 }
     );
   }

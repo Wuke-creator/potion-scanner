@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS email_events (
   resend_email_id TEXT NOT NULL,
   broadcast_id    TEXT NOT NULL DEFAULT '',
   recipient       TEXT NOT NULL,
+  recipient_domain TEXT NOT NULL DEFAULT '',
   event_type      TEXT NOT NULL,
   event_at        INTEGER NOT NULL,
   click_url       TEXT,
@@ -66,6 +67,11 @@ CREATE TABLE IF NOT EXISTS email_events (
 );
 """
 
+# Try-except ALTER on open lets older DBs upgrade in place without a rebuild.
+_EVENTS_MIGRATIONS = (
+    "ALTER TABLE email_events ADD COLUMN recipient_domain TEXT NOT NULL DEFAULT ''",
+)
+
 _EVENTS_BROADCAST_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_events_broadcast
     ON email_events(broadcast_id, event_type);
@@ -75,6 +81,49 @@ _EVENTS_RECIPIENT_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_events_recipient
     ON email_events(recipient, event_type);
 """
+
+_EVENTS_DOMAIN_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_events_domain
+    ON email_events(recipient_domain, event_type);
+"""
+
+_EVENTS_AT_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_events_at
+    ON email_events(event_at);
+"""
+
+_UNSUB_DDL = """
+CREATE TABLE IF NOT EXISTS email_unsubscribes (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  recipient        TEXT NOT NULL,
+  recipient_domain TEXT NOT NULL DEFAULT '',
+  source           TEXT NOT NULL DEFAULT '',
+  resend_email_id  TEXT NOT NULL DEFAULT '',
+  unsubscribed_at  INTEGER NOT NULL,
+  ip_address       TEXT,
+  user_agent       TEXT,
+  UNIQUE(recipient)
+);
+"""
+
+_UNSUB_AT_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_unsub_at
+    ON email_unsubscribes(unsubscribed_at DESC);
+"""
+
+_UNSUB_DOMAIN_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_unsub_domain
+    ON email_unsubscribes(recipient_domain);
+"""
+
+
+def _domain_from_email(recipient: str) -> str:
+    if not recipient:
+        return ""
+    at = recipient.rfind("@")
+    if at < 0 or at >= len(recipient) - 1:
+        return ""
+    return recipient[at + 1:].strip().lower()
 
 
 class EmailEventsDB:
@@ -89,8 +138,28 @@ class EmailEventsDB:
         self._conn = await aiosqlite.connect(self._db_path)
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute(_EVENTS_DDL)
+        # In-place migrations for older DB schemas. Each ALTER adds a single
+        # column with a safe default; SQLite raises "duplicate column" on
+        # already-migrated DBs which we swallow.
+        for stmt in _EVENTS_MIGRATIONS:
+            try:
+                await self._conn.execute(stmt)
+            except aiosqlite.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
         await self._conn.execute(_EVENTS_BROADCAST_INDEX)
         await self._conn.execute(_EVENTS_RECIPIENT_INDEX)
+        await self._conn.execute(_EVENTS_DOMAIN_INDEX)
+        await self._conn.execute(_EVENTS_AT_INDEX)
+        await self._conn.execute(_UNSUB_DDL)
+        await self._conn.execute(_UNSUB_AT_INDEX)
+        await self._conn.execute(_UNSUB_DOMAIN_INDEX)
+        # One-shot domain backfill for any rows from before the column existed.
+        await self._conn.execute(
+            "UPDATE email_events "
+            "SET recipient_domain = LOWER(SUBSTR(recipient, INSTR(recipient, '@') + 1)) "
+            "WHERE recipient_domain = '' AND INSTR(recipient, '@') > 0"
+        )
         await self._conn.commit()
         logger.info("Email events DB opened at %s", self._db_path)
 
@@ -119,18 +188,64 @@ class EmailEventsDB:
         retry on a non-200 we've actually already processed).
         """
         assert self._conn is not None
+        domain = _domain_from_email(recipient)
         cur = await self._conn.execute(
             "INSERT OR IGNORE INTO email_events "
-            "(resend_email_id, broadcast_id, recipient, event_type, "
-            " event_at, click_url, bounce_type, bounce_message, raw_payload) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(resend_email_id, broadcast_id, recipient, recipient_domain, "
+            " event_type, event_at, click_url, bounce_type, bounce_message, "
+            " raw_payload) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                resend_email_id, broadcast_id, recipient, event_type,
+                resend_email_id, broadcast_id, recipient, domain, event_type,
                 event_at, click_url, bounce_type, bounce_message, raw_payload,
             ),
         )
         await self._conn.commit()
         return (cur.rowcount or 0) > 0
+
+    async def record_unsubscribe(
+        self,
+        *,
+        recipient: str,
+        source: str = "",
+        resend_email_id: str = "",
+        ip_address: str | None = None,
+        user_agent: str | None = None,
+        when: int | None = None,
+    ) -> bool:
+        """Record an unsubscribe. Idempotent: re-clicks of the same link
+        produce no new row (UNIQUE on recipient). Returns True if a new
+        row was inserted, False if the recipient was already unsubscribed.
+        """
+        assert self._conn is not None
+        if not recipient:
+            return False
+        ts = when if when is not None else int(time.time())
+        domain = _domain_from_email(recipient)
+        cur = await self._conn.execute(
+            "INSERT OR IGNORE INTO email_unsubscribes "
+            "(recipient, recipient_domain, source, resend_email_id, "
+            " unsubscribed_at, ip_address, user_agent) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                recipient.lower(), domain, source, resend_email_id, ts,
+                ip_address, user_agent,
+            ),
+        )
+        await self._conn.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def is_unsubscribed(self, recipient: str) -> bool:
+        """Quick lookup used by worker.py before enqueueing a send."""
+        assert self._conn is not None
+        if not recipient:
+            return False
+        async with self._conn.execute(
+            "SELECT 1 FROM email_unsubscribes WHERE recipient = ? LIMIT 1",
+            (recipient.lower(),),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row is not None
 
     # ---- reads --------------------------------------------------------
 

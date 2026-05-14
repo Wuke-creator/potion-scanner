@@ -16,6 +16,7 @@ import asyncio
 import logging
 
 from src.email_bot.db import EmailDB, Subscriber
+from src.email_bot.events_db import EmailEventsDB
 from src.email_bot.sender import ResendClient, SendResult
 from src.email_bot.stats import gather_stats
 from src.email_bot.templates import render
@@ -34,6 +35,7 @@ class EmailWorker:
         poll_interval_sec: float = 60.0,
         max_per_cycle: int = 50,
         send_rate_per_sec: float = 1.5,
+        events_db: EmailEventsDB | None = None,
     ):
         """``send_rate_per_sec`` throttles inter-send delays inside a cycle
         so we stay under Resend's per-second cap. Resend's transactional
@@ -50,6 +52,7 @@ class EmailWorker:
         self._poll_interval = poll_interval_sec
         self._max_per_cycle = max_per_cycle
         self._send_interval = 1.0 / max(send_rate_per_sec, 0.1)
+        self._events_db = events_db
         self._task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
 
@@ -142,6 +145,28 @@ class EmailWorker:
             await self._db.mark_failed(send.id, "no subscriber row")
             return
 
+        # Honor unsubscribes — recipient clicked our footer link or hit
+        # the Gmail one-click button. Skip the send and mark it failed
+        # so it never re-queues. Cheap lookup (UNIQUE index on recipient).
+        if self._events_db is not None:
+            try:
+                if await self._events_db.is_unsubscribed(sub.email):
+                    logger.info(
+                        "Skipped %s day %d to %s: opted out",
+                        send.sequence, send.day, sub.email,
+                    )
+                    await self._db.mark_failed(send.id, "opted_out")
+                    return
+            except Exception:
+                # Don't block sends if the unsub lookup chokes — log and
+                # let the send proceed. Risk of one extra send to an
+                # unsubscribed recipient is lower than risk of stalling
+                # the entire pipeline.
+                logger.exception(
+                    "Opt-out check crashed for %s; sending anyway",
+                    sub.email,
+                )
+
         try:
             email = render(
                 sequence=send.sequence,
@@ -160,6 +185,7 @@ class EmailWorker:
             html=email.html,
             text=email.text,
             from_name=email.from_name,
+            unsub_source=f"{send.sequence}_day{send.day}",
         )
         if result.ok:
             await self._db.mark_sent(send.id, resend_id=result.resend_id)

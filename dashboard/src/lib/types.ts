@@ -116,15 +116,131 @@ export interface QueueRow {
 }
 
 export interface EmailKpis {
+  // Raw counts.
+  sent: number;
+  delivered: number;
+  opened: number;            // total open events (a recipient can fire multiple)
+  clicked: number;           // total click events
+  unique_opened: number;     // distinct recipients who opened at least once
+  unique_clicked: number;    // distinct recipients who clicked at least once
+  bounced: number;
+  hard_bounced: number;
+  soft_bounced: number;
+  complained: number;
+  unsubscribed: number;
+  delivery_delayed: number;
+  failed: number;
+  // Industry-standard rates. All in 0..1.
+  delivery_rate: number;            // delivered / sent
+  open_rate: number;                // unique_opened / delivered  (a.k.a. "unique open rate")
+  click_rate: number;               // unique_clicked / delivered (a.k.a. "unique click rate")
+  ctor: number;                     // unique_clicked / unique_opened (click-to-open)
+  bounce_rate: number;              // bounced / sent
+  hard_bounce_rate: number;         // hard_bounced / sent
+  complaint_rate: number;           // complained / delivered
+  unsubscribe_rate: number;         // unsubscribed / delivered
+}
+
+export interface DeliverabilityBucket {
+  day: string;             // YYYY-MM-DD (UTC)
+  sent: number;
+  delivered: number;
+  bounced: number;
+  complained: number;
+  delivery_delayed: number;
+  failed: number;
+}
+
+export interface DomainRow {
+  domain: string;          // gmail.com / yahoo.com / etc.
+  recipients: number;      // distinct
+  delivered: number;
+  open_rate: number;
+  click_rate: number;
+  bounce_rate: number;
+  complaint_rate: number;
+}
+
+export interface LinkRow {
+  url: string;
+  clicks: number;
+  unique_clickers: number;
+  broadcasts: string[];    // broadcast_ids (empty for transactional)
+}
+
+export interface HourBucket {
+  hour: number;            // 0..23 UTC
+  delivered: number;
+  opened: number;
+  open_rate: number;       // 0..1
+}
+
+export interface DowBucket {
+  dow: number;             // 0=Sunday .. 6=Saturday
+  delivered: number;
+  opened: number;
+  open_rate: number;
+}
+
+export interface SendTimeReport {
+  hours: HourBucket[];
+  dow: DowBucket[];
+}
+
+export type EngagementBand =
+  | "active"        // opened in last 30d
+  | "lapsed"        // opened 30-90d ago
+  | "inactive"      // opened >90d ago
+  | "never_opened"; // ever delivered, no open ever
+
+export interface EngagementSegment {
+  segment: EngagementBand;
+  recipients: number;
+  pct_of_list: number;     // 0..1
+}
+
+export interface SoftBounceRow {
+  recipient: string;
+  count: number;           // soft bounces in last 30 days
+  last_bounced_at: number; // epoch seconds
+  last_message: string | null;
+}
+
+export interface SuppressionLogRow {
+  email: string;
+  suppressed_at: number;   // epoch seconds
+  suppressed_reason: string;
+}
+
+export interface UnsubscribeRow {
+  recipient: string;
+  source: string;
+  unsubscribed_at: number;
+}
+
+export interface UnsubscribeReport {
+  trend: { day: string; count: number }[];
+  recent: UnsubscribeRow[];
+  total_30d: number;
+}
+
+// Per-broadcast row, extended with rates for the upgraded Broadcasts tab.
+// Existing BroadcastRow stays for backward compat; UI prefers BroadcastRowV2
+// when available.
+export interface BroadcastRowV2 {
+  broadcast_id: string;
   sent: number;
   delivered: number;
   opened: number;
   clicked: number;
   bounced: number;
   complained: number;
+  delivery_rate: number;
   open_rate: number;
   click_rate: number;
+  ctor: number;
   bounce_rate: number;
+  complaint_rate: number;
 }
 
 export interface BroadcastRow {

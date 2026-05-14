@@ -309,6 +309,8 @@ async def run(config: Config) -> None:
             email_sender = ResendClient(
                 api_key=config.email_bot.resend_api_key,
                 from_address=config.email_bot.resend_from_address,
+                unsub_secret=config.email_bot.email_unsub_secret,
+                public_base_url=config.email_bot.public_base_url,
             )
             email_worker = EmailWorker(
                 db=email_db,
@@ -316,6 +318,7 @@ async def run(config: Config) -> None:
                 analytics_db_path="data/analytics.db",
                 poll_interval_sec=config.email_bot.worker_poll_sec,
                 max_per_cycle=config.email_bot.worker_max_per_cycle,
+                events_db=email_events_db,
             )
             # AUT-026 Targeted Save Offer Router. Reuses the cancel-survey
             # promo-creation key (same Whop scope: promo_code:create +
@@ -345,6 +348,8 @@ async def run(config: Config) -> None:
                 post_retention_delay_days=(
                     config.automations.post_retention_delay_days
                 ),
+                email_unsub_secret=config.email_bot.email_unsub_secret,
+                public_base_url=config.email_bot.public_base_url,
             )
             webhook_handlers.register(verification.callback_server.app)
             logger.info("Email bot enabled (Resend + Whop webhook + SaveOfferRouter)")

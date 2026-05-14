@@ -313,6 +313,74 @@ async def _read_json(request: web.Request) -> tuple[bytes, dict]:
     return raw, data
 
 
+# ---- unsubscribe helpers --------------------------------------------------
+
+
+def compute_unsub_token(secret: str, email: str) -> str:
+    """Derive a per-recipient unsubscribe token.
+
+    Format: first 16 bytes of HMAC-SHA256(secret, lower(email)),
+    URL-safe base64 without padding (22 chars). 128-bit truncated MAC,
+    cryptographically more than enough to make guessing infeasible.
+    """
+    if not secret or not email:
+        return ""
+    mac = hmac.new(
+        secret.encode("utf-8"),
+        email.lower().encode("utf-8"),
+        hashlib.sha256,
+    ).digest()[:16]
+    return base64.urlsafe_b64encode(mac).rstrip(b"=").decode("ascii")
+
+
+def _verify_unsub_token(secret: str, email: str, token: str) -> bool:
+    if not secret or not email or not token:
+        return False
+    expected = compute_unsub_token(secret, email)
+    if not expected:
+        return False
+    return hmac.compare_digest(expected, token)
+
+
+def _unsub_html_response(message: str, *, status: int = 200) -> web.Response:
+    """Render the small confirmation page returned by /unsubscribe."""
+    safe = (
+        message
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+    body = f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Unsubscribe</title>
+    <style>
+      body {{ background:#0a0a0a; color:#e5e5e5; font:16px -apple-system,
+        BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; margin:0;
+        min-height:100vh; display:flex; align-items:center;
+        justify-content:center; padding:24px; }}
+      .card {{ max-width:440px; background:#171717; border:1px solid #262626;
+        border-radius:12px; padding:32px; text-align:center; }}
+      h1 {{ font-size:18px; margin:0 0 16px; color:#fafafa; font-weight:600; }}
+      p {{ margin:0; line-height:1.5; color:#a3a3a3; }}
+      .brand {{ font-size:13px; color:#525252; margin-top:24px; }}
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Potion</h1>
+      <p>{safe}</p>
+      <div class="brand">potionalpha.com</div>
+    </div>
+  </body>
+</html>"""
+    return web.Response(
+        text=body, status=status, content_type="text/html",
+    )
+
+
 class EmailWebhookHandlers:
     """Bundle of aiohttp handlers that close over the email subsystem."""
 
@@ -329,6 +397,8 @@ class EmailWebhookHandlers:
         post_retention_survey_url: str = "",
         post_retention_delay_days: int = 7,
         post_retention_max_lookback_days: int = 30,
+        email_unsub_secret: str = "",
+        public_base_url: str = "",
     ):
         """``whop_members_db`` is optional. When provided, the new
         payment_failed and payment_succeeded webhook receivers can flip
@@ -341,6 +411,11 @@ class EmailWebhookHandlers:
         mounts but rejects requests (signature verification fails on
         empty secret; events_db missing logs an error and 200s so
         Resend doesn't retry forever).
+
+        ``email_unsub_secret`` enables the GET /unsubscribe endpoint and
+        the per-recipient HMAC tokens used in the email footer +
+        List-Unsubscribe header. When empty, /unsubscribe rejects every
+        request as a bad token.
         """
         self._db = db
         self._whop_secret = whop_webhook_secret
@@ -355,6 +430,8 @@ class EmailWebhookHandlers:
         self._post_retention_lookback_sec = (
             post_retention_max_lookback_days * 86400
         )
+        self._email_unsub_secret = email_unsub_secret
+        self._public_base_url = public_base_url.rstrip("/")
 
     def register(self, app: web.Application) -> None:
         # Unified Whop dispatcher (recommended). Configure ONE webhook in
@@ -374,6 +451,8 @@ class EmailWebhookHandlers:
         )
         app.router.add_post("/webhook/inactivity", self._inactivity)
         app.router.add_post("/webhook/resend", self._resend_webhook)
+        app.router.add_get("/unsubscribe", self._unsubscribe)
+        app.router.add_post("/unsubscribe", self._unsubscribe)
         app.router.add_post("/admin/email/test", self._admin_test)
         app.router.add_get("/admin/email/status", self._admin_status)
 
@@ -825,10 +904,11 @@ class EmailWebhookHandlers:
     async def _maybe_suppress(self, event: _ParsedResendEvent) -> None:
         """Apply the auto-suppression rules described in the plan:
 
-          - complained -> immediate suppression
+          - complained -> immediate suppression (reason='complained')
           - bounced + bounce_type='hard' -> immediate suppression
+            (reason='hard_bounce')
           - bounced + bounce_type='soft' -> suppress when count >= 3
-            in the last 30 days
+            in the last 30 days (reason='3x_soft_bounce')
 
         ``event`` is assumed to have just been newly inserted (caller
         checks the inserted flag), so we only run for first-delivery
@@ -838,7 +918,7 @@ class EmailWebhookHandlers:
         """
         if event.event_type == "complained":
             n = await self._whop_members_db.mark_invalid_by_email(
-                event.recipient,
+                event.recipient, reason="complained",
             )
             if n > 0:
                 logger.info(
@@ -852,7 +932,7 @@ class EmailWebhookHandlers:
 
         if event.bounce_type == "hard":
             n = await self._whop_members_db.mark_invalid_by_email(
-                event.recipient,
+                event.recipient, reason="hard_bounce",
             )
             if n > 0:
                 logger.info(
@@ -868,7 +948,7 @@ class EmailWebhookHandlers:
             )
             if count >= 3:
                 n = await self._whop_members_db.mark_invalid_by_email(
-                    event.recipient,
+                    event.recipient, reason="3x_soft_bounce",
                 )
                 if n > 0:
                     logger.info(
@@ -876,6 +956,85 @@ class EmailWebhookHandlers:
                         "bounces in 30 days for %s",
                         n, count, event.recipient,
                     )
+
+    # ---- unsubscribe -------------------------------------------------
+
+    async def _unsubscribe(self, request: web.Request) -> web.Response:
+        """One-click and link-based unsubscribe handler.
+
+        Accepts both GET (footer link click) and POST (Gmail / Yahoo
+        List-Unsubscribe-Post one-click header). Verifies the per-recipient
+        HMAC token, records the unsubscribe in events_db, flips
+        whop_members.email_opted_in=0 for every matching row, and renders
+        a small confirmation page.
+
+        Idempotent: re-clicks return the same confirmation page with no
+        new DB rows.
+        """
+        # Query string is the source of truth even on POST; Gmail's
+        # one-click POST has an empty body and only the URL params.
+        email = (request.query.get("e") or "").strip().lower()
+        token = (request.query.get("t") or "").strip()
+        source = (request.query.get("s") or "").strip()
+        resend_email_id = (request.query.get("id") or "").strip()
+
+        if not email or not token:
+            return _unsub_html_response(
+                "Invalid unsubscribe link. Please use the link from your most "
+                "recent email.",
+                status=400,
+            )
+
+        if not _verify_unsub_token(self._email_unsub_secret, email, token):
+            logger.warning("Unsubscribe rejected: bad token for %s", email)
+            return _unsub_html_response(
+                "Invalid unsubscribe link. Please use the link from your most "
+                "recent email.",
+                status=400,
+            )
+
+        # Best-effort capture of forensic context. Header order: Cloudflare /
+        # Railway terminate TLS so X-Forwarded-For carries the real client IP.
+        ip = (
+            _header(request.headers, "X-Forwarded-For").split(",")[0].strip()
+            or _header(request.headers, "X-Real-IP")
+            or (request.remote or "")
+        )
+        user_agent = _header(request.headers, "User-Agent")[:500] or None
+
+        if self._events_db is not None:
+            try:
+                await self._events_db.record_unsubscribe(
+                    recipient=email,
+                    source=source,
+                    resend_email_id=resend_email_id,
+                    ip_address=ip or None,
+                    user_agent=user_agent,
+                )
+            except Exception:
+                logger.exception(
+                    "Unsubscribe record failed for %s", email,
+                )
+
+        if self._whop_members_db is not None:
+            try:
+                n = await self._whop_members_db.mark_opted_out_by_email(email)
+                if n > 0:
+                    logger.info(
+                        "Opted out %d whop_members row(s) for %s "
+                        "(source=%s, ip=%s)",
+                        n, email, source or "-", ip or "-",
+                    )
+            except Exception:
+                logger.exception(
+                    "Unsubscribe opt-out flip failed for %s", email,
+                )
+
+        return _unsub_html_response(
+            "You have been unsubscribed. You will no longer receive marketing "
+            "emails from Potion. Your subscription and access remain active.",
+            status=200,
+        )
 
     @staticmethod
     def _extract_whop_user_id(data: dict) -> str:

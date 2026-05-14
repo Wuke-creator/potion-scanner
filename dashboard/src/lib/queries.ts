@@ -16,11 +16,23 @@ import type {
   QueueRow,
   EmailKpis,
   BroadcastRow,
+  BroadcastRowV2,
   BounceRow,
   SequenceCell,
   ExitReasonRow,
   LeadershipMention,
   StaffMember,
+  DeliverabilityBucket,
+  DomainRow,
+  LinkRow,
+  HourBucket,
+  DowBucket,
+  SendTimeReport,
+  EngagementSegment,
+  SoftBounceRow,
+  SuppressionLogRow,
+  UnsubscribeRow,
+  UnsubscribeReport,
 } from "./types";
 import { seniorStaff, staffName } from "./staff";
 import { classifyComplaint, isComplaint } from "./complaints";
@@ -545,15 +557,29 @@ export function getEmailQueue(): QueueRow[] {
     .all() as QueueRow[];
 }
 
-export function getEmailKpis(): EmailKpis {
+function _emptyKpis(): EmailKpis {
+  return {
+    sent: 0, delivered: 0,
+    opened: 0, clicked: 0,
+    unique_opened: 0, unique_clicked: 0,
+    bounced: 0, hard_bounced: 0, soft_bounced: 0,
+    complained: 0, unsubscribed: 0,
+    delivery_delayed: 0, failed: 0,
+    delivery_rate: 0, open_rate: 0, click_rate: 0, ctor: 0,
+    bounce_rate: 0, hard_bounce_rate: 0,
+    complaint_rate: 0, unsubscribe_rate: 0,
+  };
+}
+
+function _safeRate(num: number, den: number): number {
+  return den > 0 ? num / den : 0;
+}
+
+export function getEmailKpis(windowDays = 30): EmailKpis {
   const ev = tryOpenDb("email_events");
-  if (!ev) {
-    return {
-      sent: 0, delivered: 0, opened: 0, clicked: 0, bounced: 0, complained: 0,
-      open_rate: 0, click_rate: 0, bounce_rate: 0,
-    };
-  }
-  const since = nowSec() - 7 * DAY;
+  if (!ev) return _emptyKpis();
+  const since = nowSec() - windowDays * DAY;
+
   const counts = ev
     .prepare(
       "SELECT event_type, COUNT(*) AS c FROM email_events WHERE event_at >= ? GROUP BY event_type"
@@ -561,23 +587,386 @@ export function getEmailKpis(): EmailKpis {
     .all(since) as { event_type: string; c: number }[];
   const map: Record<string, number> = {};
   for (const r of counts) map[r.event_type] = r.c;
+
+  // Hard / soft split inside bounced.
+  const bounceSplit = ev
+    .prepare(
+      "SELECT COALESCE(LOWER(bounce_type), '') AS bt, COUNT(*) AS c " +
+        "FROM email_events WHERE event_type = 'bounced' AND event_at >= ? " +
+        "GROUP BY bt"
+    )
+    .all(since) as { bt: string; c: number }[];
+  const hard_bounced = bounceSplit.find((r) => r.bt === "hard")?.c ?? 0;
+  const soft_bounced = bounceSplit.find((r) => r.bt === "soft")?.c ?? 0;
+
+  // Unique openers / clickers (distinct recipient).
+  const uOpen = ev.prepare(
+    "SELECT COUNT(DISTINCT recipient) AS c FROM email_events " +
+      "WHERE event_type = 'opened' AND event_at >= ?"
+  ).get(since) as { c: number };
+  const uClick = ev.prepare(
+    "SELECT COUNT(DISTINCT recipient) AS c FROM email_events " +
+      "WHERE event_type = 'clicked' AND event_at >= ?"
+  ).get(since) as { c: number };
+
+  // Unsubscribes are in their own table.
+  const unsub = ev.prepare(
+    "SELECT COUNT(*) AS c FROM email_unsubscribes WHERE unsubscribed_at >= ?"
+  ).get(since) as { c: number };
+
   const sent = map.sent ?? 0;
   const delivered = map.delivered ?? 0;
   const opened = map.opened ?? 0;
   const clicked = map.clicked ?? 0;
   const bounced = map.bounced ?? 0;
   const complained = map.complained ?? 0;
+  const delivery_delayed = map.delivery_delayed ?? 0;
+  const failed = map.failed ?? 0;
+  const unique_opened = uOpen?.c ?? 0;
+  const unique_clicked = uClick?.c ?? 0;
+  const unsubscribed = unsub?.c ?? 0;
+
   return {
-    sent,
-    delivered,
-    opened,
-    clicked,
-    bounced,
-    complained,
-    open_rate: delivered ? opened / delivered : 0,
-    click_rate: delivered ? clicked / delivered : 0,
-    bounce_rate: sent ? bounced / sent : 0,
+    sent, delivered,
+    opened, clicked,
+    unique_opened, unique_clicked,
+    bounced, hard_bounced, soft_bounced,
+    complained, unsubscribed,
+    delivery_delayed, failed,
+    delivery_rate: _safeRate(delivered, sent),
+    open_rate: _safeRate(unique_opened, delivered),
+    click_rate: _safeRate(unique_clicked, delivered),
+    ctor: _safeRate(unique_clicked, unique_opened),
+    bounce_rate: _safeRate(bounced, sent),
+    hard_bounce_rate: _safeRate(hard_bounced, sent),
+    complaint_rate: _safeRate(complained, delivered),
+    unsubscribe_rate: _safeRate(unsubscribed, delivered),
   };
+}
+
+export function getDeliverabilityTrend(windowDays = 30): DeliverabilityBucket[] {
+  const ev = tryOpenDb("email_events");
+  if (!ev) return [];
+  const since = nowSec() - windowDays * DAY;
+  return ev
+    .prepare(
+      `SELECT date(event_at, 'unixepoch') AS day,
+              SUM(CASE WHEN event_type='sent' THEN 1 ELSE 0 END) AS sent,
+              SUM(CASE WHEN event_type='delivered' THEN 1 ELSE 0 END) AS delivered,
+              SUM(CASE WHEN event_type='bounced' THEN 1 ELSE 0 END) AS bounced,
+              SUM(CASE WHEN event_type='complained' THEN 1 ELSE 0 END) AS complained,
+              SUM(CASE WHEN event_type='delivery_delayed' THEN 1 ELSE 0 END) AS delivery_delayed,
+              SUM(CASE WHEN event_type='failed' THEN 1 ELSE 0 END) AS failed
+         FROM email_events
+        WHERE event_at >= ?
+        GROUP BY day
+        ORDER BY day ASC`
+    )
+    .all(since) as DeliverabilityBucket[];
+}
+
+export function getByDomain(windowDays = 30): DomainRow[] {
+  const ev = tryOpenDb("email_events");
+  if (!ev) return [];
+  const since = nowSec() - windowDays * DAY;
+
+  // Top 10 domains by delivered volume + everything else collapsed into "other".
+  const rows = ev
+    .prepare(
+      `SELECT recipient_domain AS domain,
+              COUNT(DISTINCT recipient) AS recipients,
+              SUM(CASE WHEN event_type='delivered' THEN 1 ELSE 0 END) AS delivered,
+              SUM(CASE WHEN event_type='sent' THEN 1 ELSE 0 END) AS sent,
+              SUM(CASE WHEN event_type='bounced' THEN 1 ELSE 0 END) AS bounced,
+              SUM(CASE WHEN event_type='complained' THEN 1 ELSE 0 END) AS complained
+         FROM email_events
+        WHERE event_at >= ? AND recipient_domain != ''
+        GROUP BY recipient_domain
+        ORDER BY delivered DESC, recipients DESC
+        LIMIT 50`
+    )
+    .all(since) as Array<{
+      domain: string;
+      recipients: number;
+      delivered: number;
+      sent: number;
+      bounced: number;
+      complained: number;
+    }>;
+
+  // Per-domain unique openers / clickers in a second pass to keep the
+  // SQL above simple. Two short prepared statements scale fine.
+  const uniqOpen = ev.prepare(
+    "SELECT recipient_domain AS d, COUNT(DISTINCT recipient) AS c " +
+      "FROM email_events WHERE event_at >= ? AND event_type='opened' " +
+      "AND recipient_domain != '' GROUP BY recipient_domain"
+  ).all(since) as { d: string; c: number }[];
+  const uniqClick = ev.prepare(
+    "SELECT recipient_domain AS d, COUNT(DISTINCT recipient) AS c " +
+      "FROM email_events WHERE event_at >= ? AND event_type='clicked' " +
+      "AND recipient_domain != '' GROUP BY recipient_domain"
+  ).all(since) as { d: string; c: number }[];
+  const openMap = new Map(uniqOpen.map((r) => [r.d, r.c]));
+  const clickMap = new Map(uniqClick.map((r) => [r.d, r.c]));
+
+  return rows.slice(0, 10).map((r) => ({
+    domain: r.domain,
+    recipients: r.recipients,
+    delivered: r.delivered,
+    open_rate: _safeRate(openMap.get(r.domain) ?? 0, r.delivered),
+    click_rate: _safeRate(clickMap.get(r.domain) ?? 0, r.delivered),
+    bounce_rate: _safeRate(r.bounced, r.sent || r.delivered),
+    complaint_rate: _safeRate(r.complained, r.delivered),
+  }));
+}
+
+export function getTopLinks(windowDays = 30, limit = 50): LinkRow[] {
+  const ev = tryOpenDb("email_events");
+  if (!ev) return [];
+  const since = nowSec() - windowDays * DAY;
+  const rows = ev
+    .prepare(
+      `SELECT click_url AS url,
+              COUNT(*) AS clicks,
+              COUNT(DISTINCT recipient) AS unique_clickers,
+              GROUP_CONCAT(DISTINCT broadcast_id) AS broadcasts
+         FROM email_events
+        WHERE event_type = 'clicked' AND event_at >= ?
+          AND click_url IS NOT NULL AND click_url != ''
+        GROUP BY click_url
+        ORDER BY unique_clickers DESC, clicks DESC
+        LIMIT ?`
+    )
+    .all(since, limit) as Array<{
+      url: string;
+      clicks: number;
+      unique_clickers: number;
+      broadcasts: string | null;
+    }>;
+  return rows.map((r) => ({
+    url: r.url,
+    clicks: r.clicks,
+    unique_clickers: r.unique_clickers,
+    broadcasts: (r.broadcasts ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+  }));
+}
+
+export function getSendTimes(windowDays = 30): SendTimeReport {
+  const ev = tryOpenDb("email_events");
+  if (!ev) return { hours: [], dow: [] };
+  const since = nowSec() - windowDays * DAY;
+
+  // Group by hour-of-day (UTC). Use strftime so the bucket is the
+  // delivery hour, not the open hour — open rate per delivery hour is
+  // what tells you when to send.
+  const hourRows = ev
+    .prepare(
+      `SELECT
+          CAST(strftime('%H', event_at, 'unixepoch') AS INTEGER) AS hour,
+          SUM(CASE WHEN event_type='delivered' THEN 1 ELSE 0 END) AS delivered,
+          SUM(CASE WHEN event_type='opened' THEN 1 ELSE 0 END) AS opened
+        FROM email_events
+       WHERE event_at >= ?
+       GROUP BY hour
+       ORDER BY hour ASC`
+    )
+    .all(since) as { hour: number; delivered: number; opened: number }[];
+  const hours: HourBucket[] = [];
+  for (let h = 0; h < 24; h++) {
+    const row = hourRows.find((r) => r.hour === h);
+    const delivered = row?.delivered ?? 0;
+    const opened = row?.opened ?? 0;
+    hours.push({
+      hour: h,
+      delivered,
+      opened,
+      open_rate: _safeRate(opened, delivered),
+    });
+  }
+
+  const dowRows = ev
+    .prepare(
+      `SELECT
+          CAST(strftime('%w', event_at, 'unixepoch') AS INTEGER) AS dow,
+          SUM(CASE WHEN event_type='delivered' THEN 1 ELSE 0 END) AS delivered,
+          SUM(CASE WHEN event_type='opened' THEN 1 ELSE 0 END) AS opened
+        FROM email_events
+       WHERE event_at >= ?
+       GROUP BY dow
+       ORDER BY dow ASC`
+    )
+    .all(since) as { dow: number; delivered: number; opened: number }[];
+  const dow: DowBucket[] = [];
+  for (let d = 0; d < 7; d++) {
+    const row = dowRows.find((r) => r.dow === d);
+    const delivered = row?.delivered ?? 0;
+    const opened = row?.opened ?? 0;
+    dow.push({
+      dow: d,
+      delivered,
+      opened,
+      open_rate: _safeRate(opened, delivered),
+    });
+  }
+
+  return { hours, dow };
+}
+
+export function getEngagementSegments(): EngagementSegment[] {
+  const ev = tryOpenDb("email_events");
+  if (!ev) return [];
+  const now = nowSec();
+  const d30 = now - 30 * DAY;
+  const d90 = now - 90 * DAY;
+
+  // Distinct recipients we've ever delivered to + their last-open timestamp.
+  const rows = ev
+    .prepare(
+      `SELECT recipient,
+              MAX(CASE WHEN event_type='opened' THEN event_at ELSE NULL END) AS last_open
+         FROM email_events
+        WHERE event_type IN ('delivered', 'opened')
+        GROUP BY recipient`
+    )
+    .all() as { recipient: string; last_open: number | null }[];
+
+  let active = 0, lapsed = 0, inactive = 0, never = 0;
+  for (const r of rows) {
+    if (r.last_open == null) {
+      never++;
+    } else if (r.last_open >= d30) {
+      active++;
+    } else if (r.last_open >= d90) {
+      lapsed++;
+    } else {
+      inactive++;
+    }
+  }
+  const total = rows.length || 1;
+  return [
+    { segment: "active", recipients: active, pct_of_list: active / total },
+    { segment: "lapsed", recipients: lapsed, pct_of_list: lapsed / total },
+    { segment: "inactive", recipients: inactive, pct_of_list: inactive / total },
+    { segment: "never_opened", recipients: never, pct_of_list: never / total },
+  ];
+}
+
+export function getSoftBounces(windowDays = 30, limit = 100): SoftBounceRow[] {
+  const ev = tryOpenDb("email_events");
+  if (!ev) return [];
+  const since = nowSec() - windowDays * DAY;
+  return ev
+    .prepare(
+      `SELECT recipient,
+              COUNT(*) AS count,
+              MAX(event_at) AS last_bounced_at,
+              MAX(bounce_message) AS last_message
+         FROM email_events
+        WHERE event_type = 'bounced'
+          AND LOWER(COALESCE(bounce_type, '')) = 'soft'
+          AND event_at >= ?
+        GROUP BY recipient
+        ORDER BY count DESC, last_bounced_at DESC
+        LIMIT ?`
+    )
+    .all(since, limit) as SoftBounceRow[];
+}
+
+export function getSuppressionLog(limit = 200): SuppressionLogRow[] {
+  const whop = tryOpenDb("whop_members");
+  if (!whop) return [];
+  return whop
+    .prepare(
+      `SELECT email,
+              suppressed_at,
+              suppressed_reason
+         FROM whop_members
+        WHERE valid = 0 AND suppressed_at > 0 AND email != ''
+        ORDER BY suppressed_at DESC
+        LIMIT ?`
+    )
+    .all(limit) as SuppressionLogRow[];
+}
+
+export function getUnsubscribes(windowDays = 30): UnsubscribeReport {
+  const ev = tryOpenDb("email_events");
+  if (!ev) return { trend: [], recent: [], total_30d: 0 };
+  const since = nowSec() - windowDays * DAY;
+
+  const trend = ev
+    .prepare(
+      `SELECT date(unsubscribed_at, 'unixepoch') AS day,
+              COUNT(*) AS count
+         FROM email_unsubscribes
+        WHERE unsubscribed_at >= ?
+        GROUP BY day
+        ORDER BY day ASC`
+    )
+    .all(since) as { day: string; count: number }[];
+
+  const recent = ev
+    .prepare(
+      `SELECT recipient, source, unsubscribed_at
+         FROM email_unsubscribes
+        ORDER BY unsubscribed_at DESC
+        LIMIT 50`
+    )
+    .all() as UnsubscribeRow[];
+
+  const total = ev
+    .prepare(
+      "SELECT COUNT(*) AS c FROM email_unsubscribes WHERE unsubscribed_at >= ?"
+    )
+    .get(since) as { c: number };
+
+  return { trend, recent, total_30d: total?.c ?? 0 };
+}
+
+export function getBroadcastsV2(): BroadcastRowV2[] {
+  const ev = tryOpenDb("email_events");
+  if (!ev) return [];
+  const rows = ev
+    .prepare(
+      `SELECT broadcast_id,
+              SUM(CASE WHEN event_type='sent' THEN 1 ELSE 0 END) AS sent,
+              SUM(CASE WHEN event_type='delivered' THEN 1 ELSE 0 END) AS delivered,
+              SUM(CASE WHEN event_type='opened' THEN 1 ELSE 0 END) AS opened,
+              SUM(CASE WHEN event_type='clicked' THEN 1 ELSE 0 END) AS clicked,
+              SUM(CASE WHEN event_type='bounced' THEN 1 ELSE 0 END) AS bounced,
+              SUM(CASE WHEN event_type='complained' THEN 1 ELSE 0 END) AS complained
+         FROM email_events
+        WHERE broadcast_id IS NOT NULL AND broadcast_id != ''
+        GROUP BY broadcast_id
+        ORDER BY MAX(event_at) DESC
+        LIMIT 50`
+    )
+    .all() as Array<{
+      broadcast_id: string;
+      sent: number;
+      delivered: number;
+      opened: number;
+      clicked: number;
+      bounced: number;
+      complained: number;
+    }>;
+  return rows.map((r) => ({
+    broadcast_id: r.broadcast_id,
+    sent: r.sent,
+    delivered: r.delivered,
+    opened: r.opened,
+    clicked: r.clicked,
+    bounced: r.bounced,
+    complained: r.complained,
+    delivery_rate: _safeRate(r.delivered, r.sent),
+    open_rate: _safeRate(r.opened, r.delivered),
+    click_rate: _safeRate(r.clicked, r.delivered),
+    ctor: _safeRate(r.clicked, r.opened),
+    bounce_rate: _safeRate(r.bounced, r.sent),
+    complaint_rate: _safeRate(r.complained, r.delivered),
+  }));
 }
 
 export function getBroadcasts(): BroadcastRow[] {

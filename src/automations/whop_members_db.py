@@ -63,7 +63,10 @@ CREATE TABLE IF NOT EXISTS whop_members (
   pre_renewal_sent_for_period INTEGER NOT NULL DEFAULT 0,
   pause_ends_at             INTEGER NOT NULL DEFAULT 0,
   pre_pause_return_sent_for_period INTEGER NOT NULL DEFAULT 0,
-  inactive_day10_last_sent_at INTEGER NOT NULL DEFAULT 0
+  inactive_day10_last_sent_at INTEGER NOT NULL DEFAULT 0,
+  suppressed_at        INTEGER NOT NULL DEFAULT 0,
+  suppressed_reason    TEXT NOT NULL DEFAULT '',
+  email_opted_in       INTEGER NOT NULL DEFAULT 1
 );
 """
 
@@ -80,6 +83,9 @@ _LIFECYCLE_MIGRATIONS = (
     "ALTER TABLE whop_members ADD COLUMN pause_ends_at INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE whop_members ADD COLUMN pre_pause_return_sent_for_period INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE whop_members ADD COLUMN inactive_day10_last_sent_at INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE whop_members ADD COLUMN suppressed_at INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE whop_members ADD COLUMN suppressed_reason TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE whop_members ADD COLUMN email_opted_in INTEGER NOT NULL DEFAULT 1",
 )
 
 _INDEX_DISCORD = (
@@ -192,7 +198,9 @@ class WhopMembersDB:
         )
         await self._conn.commit()
 
-    async def mark_invalid_by_email(self, email: str) -> int:
+    async def mark_invalid_by_email(
+        self, email: str, *, reason: str = "", when: int | None = None,
+    ) -> int:
         """Suppress every member row matching this email (case-insensitive
         exact match). Returns the number of rows updated.
 
@@ -202,19 +210,65 @@ class WhopMembersDB:
         entirely. Repeat fires for an already-suppressed address are
         no-ops (rowcount 0) thanks to the `valid = 1` predicate.
 
+        ``reason`` is stored on the row for audit purposes (typical values:
+        'complained', 'hard_bounce', '3x_soft_bounce'). ``when`` lets tests
+        pin the timestamp; defaults to now.
+
         Used by the Resend webhook handler when a hard bounce or spam
         complaint lands; see src/email_bot/webhook.py::_resend_webhook.
         """
         assert self._conn is not None
         if not email:
             return 0
+        ts = when if when is not None else int(time.time())
         cur = await self._conn.execute(
-            "UPDATE whop_members SET valid = 0, last_synced_at = ? "
+            "UPDATE whop_members "
+            "SET valid = 0, "
+            "    last_synced_at = ?, "
+            "    suppressed_at = ?, "
+            "    suppressed_reason = ? "
             "WHERE LOWER(email) = LOWER(?) AND valid = 1",
-            (int(time.time()), email),
+            (ts, ts, reason, email),
         )
         await self._conn.commit()
         return cur.rowcount or 0
+
+    async def mark_opted_out_by_email(
+        self, email: str, *, when: int | None = None,
+    ) -> int:
+        """Flip email_opted_in=0 for every row matching this email.
+
+        Distinct from suppression (valid=0): an opted-out user is still
+        a paying member and should keep receiving access; we just stop
+        sending lifecycle/marketing email. Caller is the /unsubscribe
+        endpoint. Idempotent — re-clicks return rowcount 0.
+        """
+        assert self._conn is not None
+        if not email:
+            return 0
+        ts = when if when is not None else int(time.time())
+        cur = await self._conn.execute(
+            "UPDATE whop_members "
+            "SET email_opted_in = 0, last_synced_at = ? "
+            "WHERE LOWER(email) = LOWER(?) AND email_opted_in = 1",
+            (ts, email),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def is_opted_out(self, email: str) -> bool:
+        """True if any row for this email has email_opted_in=0. Used by
+        worker.py before queuing a send."""
+        assert self._conn is not None
+        if not email:
+            return False
+        async with self._conn.execute(
+            "SELECT 1 FROM whop_members "
+            "WHERE LOWER(email) = LOWER(?) AND email_opted_in = 0 LIMIT 1",
+            (email,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row is not None
 
     async def get_by_discord(self, discord_user_id: str) -> WhopMemberRow | None:
         """Fetch one member by Discord ID. Returns None if not found."""

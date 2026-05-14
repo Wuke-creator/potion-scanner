@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getEmailKpis } from "@/lib/queries";
+import { getDeliverabilityTrend } from "@/lib/queries";
 
 export const dynamic = "force-dynamic";
 
@@ -12,10 +12,10 @@ function readWindow(req: NextRequest): number {
 
 export async function GET(req: NextRequest) {
   try {
-    return NextResponse.json(getEmailKpis(readWindow(req)));
+    return NextResponse.json(getDeliverabilityTrend(readWindow(req)));
   } catch (e) {
     return NextResponse.json(
-      { error: e instanceof Error ? e.message : "kpis failed" },
+      { error: e instanceof Error ? e.message : "deliverability failed" },
       { status: 500 }
     );
   }

@@ -16,16 +16,29 @@ To use:
 
 Sends never raise; they return a ``SendResult`` with success/error so the
 worker can decide what to do (retry vs mark-failed).
+
+When ``unsub_secret`` and ``public_base_url`` are set, every send:
+  1. Substitutes the ``{{{RESEND_UNSUBSCRIBE_URL}}}`` macro in the body
+     with a per-recipient signed URL pointing at our /unsubscribe handler
+  2. Adds the RFC-8058 ``List-Unsubscribe`` and ``List-Unsubscribe-Post``
+     headers so Gmail / Yahoo render the native one-click unsub button
+     (mandatory bulk-sender requirement since Feb 2024).
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from urllib.parse import quote
 
 import aiohttp
 
+from src.email_bot.webhook import compute_unsub_token
+
 logger = logging.getLogger(__name__)
+
+
+_UNSUB_MACRO = "{{{RESEND_UNSUBSCRIBE_URL}}}"
 
 
 @dataclass
@@ -47,12 +60,16 @@ class ResendClient:
         from_address: str,
         session: aiohttp.ClientSession | None = None,
         timeout_sec: float = 15.0,
+        unsub_secret: str = "",
+        public_base_url: str = "",
     ):
         self._api_key = api_key
         self._from = from_address
         self._owns_session = session is None
         self._session = session
         self._timeout = timeout_sec
+        self._unsub_secret = unsub_secret
+        self._public_base_url = public_base_url.rstrip("/") if public_base_url else ""
 
     async def __aenter__(self) -> "ResendClient":
         if self._session is None:
@@ -77,6 +94,7 @@ class ResendClient:
         text: str,
         from_name: str | None = None,
         reply_to: str | None = None,
+        unsub_source: str = "",
     ) -> SendResult:
         """Send one email via Resend. Never raises."""
         if self._session is None:
@@ -87,6 +105,11 @@ class ResendClient:
         if from_name and "<" not in from_field:
             from_field = f"{from_name} <{self._from}>"
 
+        unsub_url = self._unsub_url_for(to, unsub_source)
+        if unsub_url:
+            html = html.replace(_UNSUB_MACRO, unsub_url) if html else html
+            text = text.replace(_UNSUB_MACRO, unsub_url) if text else text
+
         payload: dict = {
             "from": from_field,
             "to": [to],
@@ -96,6 +119,16 @@ class ResendClient:
         }
         if reply_to:
             payload["reply_to"] = reply_to
+        if unsub_url:
+            # RFC 8058 one-click unsubscribe headers — required by Gmail and
+            # Yahoo for any sender doing bulk volume. The mailbox provider
+            # POSTs to the URL with the literal body
+            # 'List-Unsubscribe=One-Click' when the user clicks the native
+            # button next to the sender name.
+            payload["headers"] = {
+                "List-Unsubscribe": f"<{unsub_url}>",
+                "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+            }
 
         try:
             async with self._session.post(
@@ -162,3 +195,24 @@ class ResendClient:
         except Exception:
             logger.exception("Unexpected Resend get_broadcast error")
             return None
+
+    def _unsub_url_for(self, recipient: str, source: str) -> str:
+        """Build the per-recipient unsubscribe URL.
+
+        Returns "" when ``unsub_secret`` or ``public_base_url`` is not
+        configured, so the macro stays unsubstituted (Resend treats it as
+        plain text in transactional sends; harmless).
+        """
+        if not (self._unsub_secret and self._public_base_url and recipient):
+            return ""
+        token = compute_unsub_token(self._unsub_secret, recipient)
+        if not token:
+            return ""
+        url = (
+            f"{self._public_base_url}/unsubscribe"
+            f"?e={quote(recipient.lower(), safe='')}"
+            f"&t={token}"
+        )
+        if source:
+            url += f"&s={quote(source, safe='')}"
+        return url
