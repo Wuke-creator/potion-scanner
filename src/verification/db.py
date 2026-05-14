@@ -252,6 +252,36 @@ class VerificationDB:
             last_reminder_sent_at=int(row[7] or 0),
         )
 
+    async def get_by_discord_user_id(
+        self, discord_user_id: str,
+    ) -> VerifiedUser | None:
+        """Reverse lookup: Discord ID to verified record. Used by the
+        admin test-signal endpoint to target a specific user by their
+        Discord ID rather than Telegram ID.
+        """
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT telegram_user_id, discord_user_id, "
+            "       refresh_token_encrypted, verified_at, last_checked_at, "
+            "       is_active, email, last_reminder_sent_at "
+            "FROM verified_users WHERE discord_user_id = ? "
+            "ORDER BY last_checked_at DESC LIMIT 1",
+            (discord_user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return VerifiedUser(
+            telegram_user_id=row[0],
+            discord_user_id=row[1],
+            refresh_token_encrypted=row[2],
+            verified_at=row[3],
+            last_checked_at=row[4],
+            is_active=bool(row[5]),
+            email=row[6] or "",
+            last_reminder_sent_at=int(row[7] or 0),
+        )
+
     async def list_active(self) -> list[VerifiedUser]:
         assert self._conn is not None
         async with self._conn.execute(

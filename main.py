@@ -161,6 +161,24 @@ async def run(config: Config) -> None:
             config.trading.builder_fee_bps,
         )
 
+    # --- Admin test-signal endpoint (always mounted when admin secret is set) ---
+    # Lets an operator fire a synthetic signal at a single verified user
+    # without spamming the entire subscriber base. Auth via X-Admin-Secret
+    # header matching ADMIN_WEBHOOK_SECRET. Useful for smoke-testing the
+    # 1-Tap Trade flow on a single account.
+    if config.email_bot.admin_webhook_secret:
+        from src.trading.admin_endpoint import AdminTradingEndpoint
+
+        admin_trading_endpoint = AdminTradingEndpoint(
+            config=config,
+            admin_secret=config.email_bot.admin_webhook_secret,
+            verification_db=verification.db,
+            open_signals_db=open_signals_db,
+            telegram_bot=telegram_bot,
+        )
+        admin_trading_endpoint.register(verification.callback_server.app)
+        logger.info("Admin trading endpoint registered at /admin/trading/test-signal")
+
     # --- Router: classify + parse + format, enqueue to dispatcher ---
     router = Router(
         discord_cfg=config.discord,
