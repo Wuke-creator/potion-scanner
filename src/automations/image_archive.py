@@ -33,8 +33,11 @@ Cache:
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import socket
 from io import BytesIO
+from urllib.parse import urlparse
 
 import aiohttp
 from telegram import Bot
@@ -47,6 +50,52 @@ logger = logging.getLogger(__name__)
 
 _DOWNLOAD_TIMEOUT_SEC = 15
 _MAX_IMAGE_BYTES = 20 * 1024 * 1024   # Telegram's upload cap is 50MB; 20MB is plenty for charts
+
+# Host allowlist for image downloads. We only fetch from sources we know
+# serve images we want to forward. This prevents SSRF: an attacker who
+# somehow controls the image_url (admin secret leak, or compromised
+# upstream Discord bot) cannot redirect the bot to internal services,
+# cloud metadata endpoints (169.254.169.254), or arbitrary intranet hosts.
+_ALLOWED_HOST_SUFFIXES: tuple[str, ...] = (
+    "discordapp.com",
+    "discordapp.net",
+    "discord.com",
+    "discord.media",
+    "cdn.discordapp.com",
+)
+
+
+def _is_allowed_image_url(url: str) -> bool:
+    """Return True only when ``url`` is HTTPS and lands on a known image host.
+
+    Rejects:
+      - non-HTTPS schemes (file://, http://, gopher://, etc.)
+      - IP-literal hosts (so attacker can't bypass the suffix check)
+      - hosts that don't match a known Discord CDN suffix
+    """
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme != "https":
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    # Reject IP literals up front (they can't match a suffix anyway,
+    # but this also short-circuits creative "1.2.3.4.nip.io" hostnames
+    # that resolve to a public IP).
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        pass
+    return any(
+        host == suffix or host.endswith("." + suffix)
+        for suffix in _ALLOWED_HOST_SUFFIXES
+    )
 
 
 class ImageArchive:
@@ -98,6 +147,18 @@ class ImageArchive:
         Returns ``None`` if any step fails (caller falls back).
         """
         if not image_url:
+            return None
+
+        # SSRF guard: reject anything that isn't a known Discord CDN URL.
+        # Required before any DB cache lookup OR network fetch so an
+        # attacker who somehow injects a malicious url never reaches our
+        # private network. The cache is keyed by signal id (trusted), but
+        # we still gate on the URL because a future code path could ever
+        # bypass the cache and hit the download directly.
+        if not _is_allowed_image_url(image_url):
+            logger.warning(
+                "image_archive: rejecting non-allowlisted URL %s", image_url,
+            )
             return None
 
         # 1. Cached in DB?

@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+import math
 import time
 from typing import Any
 
@@ -72,6 +73,25 @@ logger = logging.getLogger(__name__)
 
 _SYNTHETIC_CHANNEL_ID = 0
 _CAPTION_LIMIT = 1024
+
+
+def _safe_float(value: Any) -> float:
+    """Coerce ``value`` to a finite float or raise ValueError.
+
+    Python's ``float()`` accepts "nan", "inf", "-inf" as valid inputs,
+    and JSON's null deserialises to None. Both shapes can poison
+    downstream price comparisons and DB rows. Reject them here.
+    """
+    f = float(value)
+    if math.isnan(f) or math.isinf(f):
+        raise ValueError(f"non-finite float: {value!r}")
+    return f
+
+
+def _safe_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    return _safe_float(value)
 
 
 class AdminTradingEndpoint:
@@ -210,11 +230,11 @@ class AdminTradingEndpoint:
             pair = str(body["pair"]).strip()
             side_str = str(body["side"]).strip().upper()
             leverage = int(body["leverage"])
-            entry = float(body["entry"])
-            stop_loss = float(body["stop_loss"])
-            tp1 = float(body["tp1"])
-            tp2 = float(body["tp2"])
-            tp3 = float(body["tp3"])
+            entry = _safe_float(body["entry"])
+            stop_loss = _safe_float(body["stop_loss"])
+            tp1 = _safe_float(body["tp1"])
+            tp2 = _safe_float(body["tp2"])
+            tp3 = _safe_float(body["tp3"])
         except (KeyError, TypeError, ValueError) as e:
             return web.json_response({"error": f"bad_request: {e}"}, status=400)
         if side_str not in ("LONG", "SHORT"):
@@ -266,7 +286,7 @@ class AdminTradingEndpoint:
         try:
             pair = str(body["pair"]).strip().upper()
             side_str = str(body["side"]).strip().upper()
-            entry = float(body["entry"])
+            entry = _safe_float(body["entry"])
         except (KeyError, TypeError, ValueError) as e:
             return web.json_response({"error": f"bad_request: {e}"}, status=400)
         if side_str not in ("LONG", "SHORT"):
@@ -274,12 +294,14 @@ class AdminTradingEndpoint:
                 {"error": "side must be LONG or SHORT"}, status=400,
             )
 
-        stop_loss = body.get("stop_loss")
-        stop_loss = float(stop_loss) if stop_loss is not None else None
-        take_profit = body.get("tp1") or body.get("take_profit")
-        take_profit = float(take_profit) if take_profit is not None else None
-        risk_rr = body.get("risk_rr")
-        risk_rr = float(risk_rr) if risk_rr is not None else None
+        try:
+            stop_loss = _safe_optional_float(body.get("stop_loss"))
+            take_profit = _safe_optional_float(
+                body.get("tp1") if body.get("tp1") is not None else body.get("take_profit")
+            )
+            risk_rr = _safe_optional_float(body.get("risk_rr"))
+        except (TypeError, ValueError) as e:
+            return web.json_response({"error": f"bad_request: {e}"}, status=400)
         stop_loss_is_conditional = bool(body.get("stop_loss_is_conditional", False))
         stop_loss_raw = body.get("stop_loss_raw")
 
