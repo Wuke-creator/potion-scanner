@@ -6,6 +6,25 @@ const PAIR_ID_CACHE = new Map<string, number>();
 let PAIR_CACHE_TS = 0;
 const PAIR_CACHE_TTL_MS = 5 * 60 * 1000;
 
+let READ_CLIENT: OstiumClient | null = null;
+
+async function getReadClient(): Promise<OstiumClient> {
+  if (READ_CLIENT) return READ_CLIENT;
+  const args: Parameters<typeof OstiumClient.createReadOnly>[0] = {};
+  if (process.env.ARB_RPC_URL) args.rpcUrl = process.env.ARB_RPC_URL;
+  READ_CLIENT = await OstiumClient.createReadOnly(args);
+  return READ_CLIENT;
+}
+
+async function refreshPairCache(client: OstiumClient): Promise<void> {
+  const { pairs } = await client.getPairs();
+  PAIR_ID_CACHE.clear();
+  for (const p of pairs) {
+    PAIR_ID_CACHE.set((p.pairFrom || "").toUpperCase(), Number(p.pairId));
+  }
+  PAIR_CACHE_TS = Date.now();
+}
+
 async function resolvePairId(
   client: OstiumClient,
   base: string,
@@ -13,18 +32,36 @@ async function resolvePairId(
   const key = base.toUpperCase();
   const now = Date.now();
   if (PAIR_ID_CACHE.size === 0 || now - PAIR_CACHE_TS > PAIR_CACHE_TTL_MS) {
-    const { pairs } = await client.getPairs();
-    PAIR_ID_CACHE.clear();
-    for (const p of pairs) {
-      PAIR_ID_CACHE.set((p.pairFrom || "").toUpperCase(), Number(p.pairId));
-    }
-    PAIR_CACHE_TS = now;
+    await refreshPairCache(client);
   }
   const id = PAIR_ID_CACHE.get(key);
   if (id === undefined) {
     throw new Error(`unknown pair: ${base}`);
   }
   return id;
+}
+
+/**
+ * Return the list of base symbols Ostium currently lists as tradeable
+ * markets (e.g. ["BTC", "ETH", "SOL", ...]). Uses a read-only client so
+ * no delegate key is needed. Cached for PAIR_CACHE_TTL_MS; on a refresh
+ * failure the last-known list is returned (callers treat an empty list
+ * as "coverage unknown" and fail safe).
+ */
+export async function listSupportedSymbols(): Promise<string[]> {
+  const now = Date.now();
+  if (PAIR_ID_CACHE.size === 0 || now - PAIR_CACHE_TS > PAIR_CACHE_TTL_MS) {
+    try {
+      const client = await getReadClient();
+      await refreshPairCache(client);
+    } catch (err) {
+      console.warn(
+        "[ostium] listSupportedSymbols refresh failed, using cached:",
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+  return [...PAIR_ID_CACHE.keys()];
 }
 
 export async function submitDelegatedTrade(

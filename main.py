@@ -211,6 +211,7 @@ async def run(config: Config) -> None:
         open_signals=open_signals_db,
         quick_trade_enabled=config.trading.enabled,
         image_archive=image_archive,
+        executor_client=trade_executor_client,
     )
 
     # --- Automations: shared activity tracker (feeds Features 2 + 4) ---

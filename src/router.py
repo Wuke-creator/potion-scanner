@@ -124,6 +124,7 @@ class Router:
         open_signals: OpenSignalsDB | None = None,
         quick_trade_enabled: bool = False,
         image_archive: ImageArchive | None = None,
+        executor_client=None,
     ):
         self._discord_cfg = discord_cfg
         self._dispatcher = dispatcher
@@ -143,6 +144,33 @@ class Router:
         # to lifecycle events later. When None, image forwarding falls
         # back to URL passthrough (works for ~24h via Discord CDN signing).
         self._image_archive = image_archive
+        # When present, used to check whether a signal's token is an
+        # actual Ostium market before showing the 1-Tap button / building
+        # an Ostium deeplink. None disables coverage gating (1-Tap shows
+        # whenever quick_trade_enabled, legacy behaviour).
+        self._executor_client = executor_client
+
+    async def _ostium_coverage(self, pair_or_base: str) -> bool | None:
+        """True/False if we know whether the token is an Ostium market,
+        None if coverage is unknown (no executor client, or it has never
+        successfully fetched the pair list). Callers fail safe on None:
+        no 1-Tap button, but the deeplink is left intact.
+        """
+        if self._executor_client is None:
+            return None
+        # Normalise "BTC/USDT" / "BTC/USD 10x" / "btc" -> "BTC".
+        raw = (pair_or_base or "").strip()
+        if not raw:
+            return None
+        head = raw.split("/", 1)[0].strip()
+        base = (head.split()[0] if head else head).upper()
+        if not base:
+            return None
+        try:
+            return await self._executor_client.is_symbol_supported(base)
+        except Exception:
+            logger.exception("Ostium coverage check failed for %s", pair_or_base)
+            return None
         # Debouncer for rapid same-trader same-token same-action buys on
         # the Wallet Tracker channel. Instantiated lazily (needs a stable
         # emit callback bound to this router instance).
@@ -716,12 +744,14 @@ class Router:
                 channel_name=route.name,
                 source_type_label=source_label,
             )
+            ostium_supported = await self._ostium_coverage(signal.pair)
             quick_trade_id = (
                 open_signal_id
                 if (
                     self._quick_trade_enabled
                     and route.source_type == SOURCE_PERPS
                     and open_signal_id
+                    and ostium_supported is True
                 )
                 else None
             )
@@ -729,6 +759,7 @@ class Router:
                 ref_link=route.ref_link,
                 pair=signal.pair,
                 quick_trade_signal_id=quick_trade_id,
+                ostium_supported=ostium_supported,
             )
             return (text, signal.pair, keyboard, open_signal_id)
 
@@ -876,12 +907,14 @@ class Router:
             channel_name=route.name,
             source_type_label=source_label,
         )
+        ostium_supported = await self._ostium_coverage(parsed.pair)
         quick_trade_id = (
             open_signal_id
             if (
                 self._quick_trade_enabled
                 and route.source_type == SOURCE_PERPS
                 and open_signal_id
+                and ostium_supported is True
             )
             else None
         )
@@ -889,6 +922,7 @@ class Router:
             ref_link=route.ref_link,
             pair=parsed.pair,
             quick_trade_signal_id=quick_trade_id,
+            ostium_supported=ostium_supported,
         )
         logger.info(
             "Perp Pinger new call parsed: #%s pair=%s side=%s entry=%s open_signal_id=%s",

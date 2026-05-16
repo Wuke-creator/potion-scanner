@@ -447,6 +447,7 @@ def build_signal_keyboard(
     ref_link: str,
     pair: str,
     quick_trade_signal_id: int | None = None,
+    ostium_supported: bool | None = None,
 ) -> InlineKeyboardMarkup:
     """Build inline buttons for a parsed signal alert.
 
@@ -457,12 +458,17 @@ def build_signal_keyboard(
     Layout otherwise (legacy): single row of [Trade now] + [Chart].
 
     For Ostium ref links the Trade-now URL is rewritten to a per-pair
-    deeplink so the right market opens with one tap (matching the
-    Padre/Terminal per-CA deeplink behaviour on memecoin alerts).
+    deeplink so the right market opens with one tap. When
+    ``ostium_supported`` is explicitly False (the router checked and the
+    token is NOT an Ostium market) the deeplink falls back to the bare
+    Ostium page so we never hand the user a dead ``/trade?from=X`` link.
+    None means "coverage unknown" — we keep the deeplink (the common
+    case is that the token IS listed; an executor blip shouldn't strip
+    every deeplink).
     """
     base_token = pair.split("/")[0].strip() if "/" in pair else pair.strip()
     chart_url = f"https://dexscreener.com/search?q={base_token}"
-    trade_url = _resolve_trade_url(ref_link, pair)
+    trade_url = _resolve_trade_url(ref_link, pair, ostium_supported)
 
     rows: list[list[InlineKeyboardButton]] = []
     if quick_trade_signal_id is not None:
@@ -479,7 +485,9 @@ def build_signal_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
-def _resolve_trade_url(ref_link: str, pair: str) -> str:
+def _resolve_trade_url(
+    ref_link: str, pair: str, ostium_supported: bool | None = None,
+) -> str:
     """Return the right Trade-now URL for a (ref_link, pair) combination.
 
     Per-pair deeplink for Ostium and Blofin (the two perp exchanges we
@@ -487,11 +495,20 @@ def _resolve_trade_url(ref_link: str, pair: str) -> str:
     unchanged. Centralised here so the new-signal keyboard, lifecycle
     Trade-Now link, and any future Trade-now contexts all share one
     consistent URL builder.
+
+    ``ostium_supported`` gates only the Ostium per-pair deeplink:
+    False -> the token is not an Ostium market, return the bare Ostium
+    page (still ref-credited) instead of a dead deeplink. True/None ->
+    build the deeplink as before.
     """
     if not ref_link:
         return ref_link
     lower = ref_link.lower()
     if "app.ostium.com" in lower:
+        if ostium_supported is False:
+            # Known not-on-Ostium: a /trade?from=X deeplink would 404.
+            # Hand back the bare ref link (homepage, ref preserved).
+            return ref_link
         return _build_ostium_trade_url(ref_link, pair)
     if "blofin.com" in lower:
         return _build_blofin_trade_url(ref_link, pair)
