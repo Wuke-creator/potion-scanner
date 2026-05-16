@@ -149,6 +149,14 @@ class Router:
         # an Ostium deeplink. None disables coverage gating (1-Tap shows
         # whenever quick_trade_enabled, legacy behaviour).
         self._executor_client = executor_client
+        # Debouncer for rapid same-trader same-token same-action buys on
+        # the Wallet Tracker channel. Instantiated here (needs a stable
+        # emit callback bound to this router instance).
+        self._wallet_debouncer = WalletTrackerDebouncer(
+            emit_fn=self._emit_wallet_tracker_alert,
+            idle_timeout_sec=10.0,
+            max_hold_sec=120.0,
+        )
 
     async def _ostium_coverage(self, pair_or_base: str) -> bool | None:
         """True/False if we know whether the token is an Ostium market,
@@ -171,14 +179,6 @@ class Router:
         except Exception:
             logger.exception("Ostium coverage check failed for %s", pair_or_base)
             return None
-        # Debouncer for rapid same-trader same-token same-action buys on
-        # the Wallet Tracker channel. Instantiated lazily (needs a stable
-        # emit callback bound to this router instance).
-        self._wallet_debouncer = WalletTrackerDebouncer(
-            emit_fn=self._emit_wallet_tracker_alert,
-            idle_timeout_sec=10.0,
-            max_hold_sec=120.0,
-        )
 
     async def _emit_wallet_tracker_alert(
         self, alert, count: int,
