@@ -72,6 +72,17 @@ discord:
       id_env: WALL_STREET_BETS_CHANNEL_ID
       ref_link_env: REF_LINK_MEMECOIN
 
+    - key: stock_calls
+      name: "Stock Calls"
+      display_name: "Stock Calls"
+      # Human-posted equity calls (not memecoin, not on Padre/Ostium
+      # reliably). mirror = forward verbatim image + caption + buttons,
+      # same pattern as Pingu/Bonds. ref_link_env points at a set var
+      # only to satisfy the loader; mirror ignores it for URL rewriting.
+      source_type: mirror
+      id_env: STOCK_CALLS_CHANNEL_ID
+      ref_link_env: REF_LINK_PERPS
+
 dispatcher:
   # Telegram's global bot limit is ~30 msgs/sec across chats — stay under.
   rate_per_sec: 25
