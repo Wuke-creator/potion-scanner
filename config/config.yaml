@@ -35,7 +35,12 @@ discord:
     - key: pingu_charts
       name: "Pingu Charts"
       display_name: "Pingu Charts"
-      source_type: perps
+      # Human-posted chart calls. Was `perps`, which only forwards
+      # non-structured messages from bot authors -> human posts were
+      # silently dropped. `mirror` forwards verbatim (chart image +
+      # caption + Discord buttons), matching Bonds. No Ostium 1-Tap
+      # here by design: human chart captions don't parse reliably.
+      source_type: mirror
       id_env: PINGU_CHARTS_CHANNEL_ID
       ref_link_env: REF_LINK_PERPS
 
