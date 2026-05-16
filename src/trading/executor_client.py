@@ -60,6 +60,11 @@ class TradeResult:
 class TradeExecutorClient:
     """Async client. One aiohttp session reused for the bot lifetime."""
 
+    # How long the bot trusts a fetched Ostium symbol list before
+    # refreshing. Ostium adds markets rarely, so 10 min is plenty and
+    # keeps load off the executor's read client.
+    _SYMBOLS_TTL_SEC = 600
+
     def __init__(
         self,
         base_url: str,
@@ -70,6 +75,10 @@ class TradeExecutorClient:
         self._shared_secret = shared_secret
         self._timeout = aiohttp.ClientTimeout(total=request_timeout_sec)
         self._session: aiohttp.ClientSession | None = None
+        # Last-known-good Ostium symbol set + when we fetched it. None
+        # means "never successfully fetched" -> callers fail safe.
+        self._symbols: set[str] | None = None
+        self._symbols_fetched_at: float = 0.0
 
     async def open(self) -> None:
         self._session = aiohttp.ClientSession(timeout=self._timeout)
@@ -87,6 +96,66 @@ class TradeExecutorClient:
             headers={"X-Executor-Secret": self._shared_secret},
         ) as resp:
             return await resp.json()
+
+    async def get_supported_symbols(self) -> set[str] | None:
+        """Return the set of Ostium-listed base symbols (uppercased).
+
+        Cached for ``_SYMBOLS_TTL_SEC``. On a refresh failure the last
+        known-good set is returned (resilient to executor blips). Returns
+        ``None`` only when we have never successfully fetched the list —
+        callers MUST treat None as "coverage unknown" and fail safe
+        (do not show the 1-Tap button).
+        """
+        import time
+
+        now = time.monotonic()
+        fresh = (
+            self._symbols is not None
+            and (now - self._symbols_fetched_at) < self._SYMBOLS_TTL_SEC
+        )
+        if fresh:
+            return self._symbols
+
+        if self._session is None:
+            return self._symbols  # not opened yet; whatever we have (maybe None)
+
+        try:
+            async with self._session.get(
+                f"{self._base_url}/pairs",
+                headers={"X-Executor-Secret": self._shared_secret},
+            ) as resp:
+                body = await resp.json()
+            symbols = body.get("symbols") or []
+            if symbols:
+                self._symbols = {str(s).upper() for s in symbols}
+                self._symbols_fetched_at = now
+                logger.info(
+                    "Ostium symbol list refreshed: %d markets",
+                    len(self._symbols),
+                )
+            else:
+                # Executor returned an empty list (its own fetch failed).
+                # Keep whatever we had; don't overwrite a good set with [].
+                logger.warning(
+                    "Ostium /pairs returned empty (err=%s); keeping cached",
+                    body.get("error"),
+                )
+        except Exception as e:
+            logger.warning(
+                "Ostium /pairs fetch failed (%s); keeping cached set", e,
+            )
+        return self._symbols
+
+    async def is_symbol_supported(self, base: str) -> bool | None:
+        """True/False if we know coverage, None if coverage is unknown.
+
+        None happens only when we've never fetched the list. Router
+        treats None as 'do not show 1-Tap' (fail safe).
+        """
+        symbols = await self.get_supported_symbols()
+        if symbols is None:
+            return None
+        return base.strip().upper() in symbols
 
     async def submit_trade(
         self,

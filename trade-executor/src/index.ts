@@ -1,7 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import express, { Request, Response } from "express";
 
-import { submitDelegatedTrade } from "./ostium.js";
+import { listSupportedSymbols, submitDelegatedTrade } from "./ostium.js";
 import { TradeRequestSchema } from "./types.js";
 
 const PORT = Number(process.env.PORT ?? 3001);
@@ -42,6 +42,19 @@ app.use((req, res, next) => {
 
 app.get("/health", (_req: Request, res: Response) => {
   res.json({ ok: true, service: "potion-trade-executor" });
+});
+
+app.get("/pairs", async (_req: Request, res: Response) => {
+  try {
+    const symbols = await listSupportedSymbols();
+    return res.status(200).json({ symbols, count: symbols.length });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("[/pairs] failed:", message);
+    // Empty list signals "coverage unknown" to the bot, which fails
+    // safe (suppresses the 1-Tap button) rather than guessing.
+    return res.status(200).json({ symbols: [], count: 0, error: message });
+  }
 });
 
 app.post("/trade", async (req: Request, res: Response) => {
