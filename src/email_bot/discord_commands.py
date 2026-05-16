@@ -90,7 +90,7 @@ def _render_sequence_stats(
     ]
     if sent_events != sent:
         lines.append(
-            f"    (Resend webhook sent events: {sent_events:,} — "
+            f"    (Resend webhook sent events: {sent_events:,}: "
             f"webhook lag in progress)",
         )
     lines.extend([
@@ -150,7 +150,7 @@ def _render_day0_funnel(stats: dict) -> str:
         f"  Clicked:               {clicked:>9,}    "
         f"({click_rate:.1f}% of opens)",
         f"  Telegram-verified:     {verified:>9,}    "
-        f"({verify_rate:.1f}% of sent — top-of-funnel conversion)",
+        f"({verify_rate:.1f}% of sent, top-of-funnel conversion)",
     ]
     return "\n".join(lines)
 

@@ -71,7 +71,7 @@ class SaveOfferConfig:
 OFFER_VARIANTS: dict[str, SaveOfferConfig] = {
     "too_expensive": SaveOfferConfig(
         reason="too_expensive",
-        label="Offer A — 20% off 3 months",
+        label="Offer A: 20% off 3 months",
         offer_type="discount",
         amount_off=20.0,
         duration_months=3,
@@ -79,19 +79,19 @@ OFFER_VARIANTS: dict[str, SaveOfferConfig] = {
     ),
     "not_using": SaveOfferConfig(
         reason="not_using",
-        label="Offer B — 30 day pause",
+        label="Offer B: 30 day pause",
         offer_type="pause",
         pause_days=30,
     ),
     "market_slow": SaveOfferConfig(
         reason="market_slow",
-        label="Offer C — 30 day pause",
+        label="Offer C: 30 day pause",
         offer_type="pause",
         pause_days=30,
     ),
     "quality_declined": SaveOfferConfig(
         reason="quality_declined",
-        label="Offer D — 7 free days + top calls",
+        label="Offer D: 7 free days + top calls",
         offer_type="trial",
         amount_off=100.0,
         duration_months=1,
@@ -99,7 +99,7 @@ OFFER_VARIANTS: dict[str, SaveOfferConfig] = {
     ),
     "found_alternative": SaveOfferConfig(
         reason="found_alternative",
-        label="Offer E — 7 day free trial + comparison",
+        label="Offer E: 7 day free trial + comparison",
         offer_type="trial",
         amount_off=100.0,
         duration_months=1,
@@ -107,7 +107,7 @@ OFFER_VARIANTS: dict[str, SaveOfferConfig] = {
     ),
     "other": SaveOfferConfig(
         reason="other",
-        label="Offer F — 25% off 2 months",
+        label="Offer F: 25% off 2 months",
         offer_type="discount",
         amount_off=25.0,
         duration_months=2,
@@ -115,7 +115,7 @@ OFFER_VARIANTS: dict[str, SaveOfferConfig] = {
     ),
     "fulfillment": SaveOfferConfig(
         reason="fulfillment",
-        label="Offer F — 25% off 2 months",
+        label="Offer F: 25% off 2 months",
         offer_type="discount",
         amount_off=25.0,
         duration_months=2,
@@ -199,7 +199,7 @@ class SaveOfferRouter:
         config = OFFER_VARIANTS.get(reason)
         if config is None:
             logger.info(
-                "SaveOfferRouter: no variant for reason=%r — skipping (caller "
+                "SaveOfferRouter: no variant for reason=%r, skipping (caller "
                 "should still enrol in standard winback)", reason,
             )
             return RouteResult(routed=False)

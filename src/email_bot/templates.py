@@ -427,7 +427,7 @@ def _winback_day5_legacy(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
             "Stay for less, don\u2019t miss out on the action. I can apply for "
             "it before the cancellation goes through.\n\n"
             "If this is still too much, we also have an annual option at "
-            "$69/mo ($828/year) \u2014 lower monthly cost, one time payment."
+            "$69/mo ($828/year): lower monthly cost, one time payment."
         )
         cta = "Stay at $79/month"
     elif reason == "not_using":
@@ -438,7 +438,7 @@ def _winback_day5_legacy(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
             "How about a 30-day pause instead?\n\n"
             "Your spot stays saved, and when you\u2019re ready to jump back in, "
             "everything\u2019s exactly where you left it. Auto-reactivates "
-            "\u2014 zero effort."
+            "with zero effort."
         )
         cta = "Pause for 30 days"
     elif reason == "market_slow":
@@ -559,7 +559,7 @@ def _winback_day7(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"If you do decide to come back later at full price, you\u2019re "
         f"always welcome. The free Discord link is always open: "
         f"{DISCORD_FREE_INVITE}\n\n"
-        f"Either way \u2014 good luck out there. The markets don\u2019t sleep and "
+        f"Either way, good luck out there. The markets don\u2019t sleep and "
         f"neither does Potion.\n"
     )
     html_body = (
@@ -578,7 +578,7 @@ def _winback_day7(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"Discord link is always open: "
         f"<a href='{escape(DISCORD_FREE_INVITE)}'>{escape(DISCORD_FREE_INVITE)}</a>"
         f"</p>"
-        f"<p style='color:#b0b0b8;font-size:14px;'>Either way \u2014 good luck "
+        f"<p style='color:#b0b0b8;font-size:14px;'>Either way, good luck "
         f"out there. The markets don\u2019t sleep and neither does Potion.</p>"
     )
     _ = stats
@@ -770,9 +770,9 @@ def _reengage_day5_legacy(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"Hey {name},\n\n"
         f"While you were away, we added new features that help users get "
         f"back on track:\n\n"
-        f"\u2022 Potion Digest \u2014 daily activity and information summaries\n"
-        f"\u2022 Updated Guide \u2014 to refresh your memory\n"
-        f"\u2022 Perp Bot alerts \u2014 catch calls immediately\n\n"
+        f"\u2022 Potion Digest: daily activity and information summaries\n"
+        f"\u2022 Updated Guide: to refresh your memory\n"
+        f"\u2022 Perp Bot alerts: catch calls immediately\n\n"
         f"People are actually getting results just by staying plugged in "
         f"consistently. Just didn\u2019t want you missing out if this is still "
         f"something you care about.\n\n"
@@ -783,10 +783,10 @@ def _reengage_day5_legacy(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"<p>While you were away, we added new features that help users "
         f"get back on track:</p>"
         f"<ul>"
-        f"<li><strong>Potion Digest</strong> \u2014 daily activity and "
+        f"<li><strong>Potion Digest</strong>: daily activity and "
         f"information summaries</li>"
-        f"<li><strong>Updated Guide</strong> \u2014 to refresh your memory</li>"
-        f"<li><strong>Perp Bot alerts</strong> \u2014 catch calls immediately</li>"
+        f"<li><strong>Updated Guide</strong>: to refresh your memory</li>"
+        f"<li><strong>Perp Bot alerts</strong>: catch calls immediately</li>"
         f"</ul>"
         f"<p>People are actually getting results just by staying plugged "
         f"in consistently. Just didn\u2019t want you missing out if this is "
@@ -984,7 +984,7 @@ def _onboard_day5(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"who scaled out at TP1 took 30%+ profit and let runners ride.\n\n"
         f"You can see the full play in the calls channel. Every TP hit, "
         f"every breakeven move, every closeout. We don’t hide losers "
-        f"either — the track-record channel shows the full history.\n\n"
+        f"either. The track-record channel shows the full history.\n\n"
         f"Open Discord: {discord}\n"
     )
     html_body = (
@@ -996,7 +996,7 @@ def _onboard_day5(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"who scaled out at TP1 took 30%+ profit and let runners ride.</p>"
         f"<p>You can see the full play in the calls channel. Every TP "
         f"hit, every breakeven move, every closeout. We don’t hide "
-        f"losers either — the track-record channel shows the full "
+        f"losers either. The track-record channel shows the full "
         f"history.</p>"
         f"{_cta_button_html('See it in Discord', discord)}"
     )
@@ -1065,8 +1065,8 @@ def _onboard_day30(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"• {wins_30d} closed at +50%+\n"
         f"• Top call: +{top_pct}% on {top_pair}\n\n"
         f"Members who renew at month 1 stick around 6+ months on average. "
-        f"The hard part of joining a new community — figuring out the "
-        f"format, building habits — is behind you. From here it "
+        f"The hard part of joining a new community, figuring out the "
+        f"format, building habits, is behind you. From here it "
         f"compounds.\n\n"
         f"If you’re thinking about going annual, the math is "
         f"straightforward: 12 months billed annually saves a meaningful "
@@ -1082,8 +1082,8 @@ def _onboard_day30(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"<li>Top call: <strong>+{top_pct}% on {escape(str(top_pair))}</strong></li>"
         f"</ul>"
         f"<p>Members who renew at month 1 stick around 6+ months on "
-        f"average. The hard part of joining a new community — "
-        f"figuring out the format, building habits — is behind "
+        f"average. The hard part of joining a new community, "
+        f"figuring out the format, building habits, is behind "
         f"you. From here it compounds.</p>"
         f"<p>If you’re thinking about going annual, the math is "
         f"straightforward: 12 months billed annually saves a meaningful "
@@ -1226,7 +1226,7 @@ def _dunning_day10(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"have stopped.\n\n"
         f"Reactivating takes one click. Update the payment method on "
         f"your Whop account and your Elite role comes back automatically. "
-        f"No new signup, no friction — your settings, your "
+        f"No new signup, no friction. Your settings, your "
         f"Concierge thread, everything is still there.\n\n"
         f"Reactivate: {rejoin}\n\n"
         f"If you’re leaving for another reason, reply to this email "
@@ -1239,7 +1239,7 @@ def _dunning_day10(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"and Telegram alerts have stopped.</p>"
         f"<p>Reactivating takes one click. Update the payment method on "
         f"your Whop account and your Elite role comes back automatically. "
-        f"No new signup, no friction — your settings, your "
+        f"No new signup, no friction. Your settings, your "
         f"Concierge thread, everything is still there.</p>"
         f"{_cta_button_html('Reactivate', rejoin)}"
         f"<p style='color:#b0b0b8;font-size:14px;'>If you’re leaving "
@@ -1274,7 +1274,7 @@ def _pre_renewal(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"• Top call: +{top_pct}% on {top_pair}\n\n"
         f"Plus the daily VCs, weekly Mac sessions, the Telegram alert "
         f"bot, and the Concierge thread.\n\n"
-        f"Nothing to do here — renewal is automatic. This is just "
+        f"Nothing to do here. Renewal is automatic. This is just "
         f"a heads-up so you know what’s coming and what to expect.\n\n"
         f"Manage your Whop: {rejoin}\n"
     )
@@ -1289,7 +1289,7 @@ def _pre_renewal(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"</ul>"
         f"<p>Plus the daily VCs, weekly Mac sessions, the Telegram alert "
         f"bot, and the Concierge thread.</p>"
-        f"<p>Nothing to do here — renewal is automatic. This is "
+        f"<p>Nothing to do here. Renewal is automatic. This is "
         f"just a heads-up so you know what’s coming and what to "
         f"expect.</p>"
         f"{_cta_button_html('Manage your Whop', rejoin)}"
@@ -1310,11 +1310,11 @@ def _pre_pause_return(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
     top_pair = getattr(stats, "top_pair_30d", None) or "ETH/USDT"
     top_pct = getattr(stats, "top_pnl_pct_30d", None) or 142
 
-    subject = "Welcome back — here’s what you missed"
+    subject = "Welcome back, here’s what you missed"
     text = (
         f"Hey {name},\n\n"
         f"Your Potion pause ends in 3 days. Elite access comes back "
-        f"automatically — no action needed.\n\n"
+        f"automatically. No action needed.\n\n"
         f"While you were away the headline call was +{top_pct}% on "
         f"{top_pair}. Plus a stack of smaller wins and a couple of the "
         f"Mac sessions you usually catch.\n\n"
@@ -1325,7 +1325,7 @@ def _pre_pause_return(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
     html_body = (
         f"<p>Hey {escape(name)},</p>"
         f"<p>Your Potion pause ends in 3 days. Elite access comes back "
-        f"automatically — no action needed.</p>"
+        f"automatically. No action needed.</p>"
         f"<p>While you were away the headline call was "
         f"<strong>+{top_pct}% on {escape(str(top_pair))}</strong>. Plus "
         f"a stack of smaller wins and a couple of the Mac sessions you "
@@ -1350,30 +1350,30 @@ def _inactive_day10(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
     subject = "We noticed you’ve been quiet"
     text = (
         f"Hey {name},\n\n"
-        f"Haven’t seen you in Discord for 10 days. No pressure — "
-        f"life happens. Just dropping in with a quick week-in-review so "
+        f"Haven’t seen you in Discord for 10 days. No pressure. "
+        f"Life happens. Just dropping in with a quick week-in-review so "
         f"you can catch up:\n\n"
         f"• Headline call: +{top_pct}% on {top_pair}\n"
         f"• The Telegram alert bot has been firing through the week\n"
         f"• Daily morning brief and weekly Mac session both ran on "
         f"schedule\n\n"
-        f"If something’s blocking you from engaging — the "
-        f"format, missed setups, anything — reply to this email "
+        f"If something’s blocking you from engaging, the "
+        f"format, missed setups, anything, reply to this email "
         f"and tell us. We read every reply.\n\n"
         f"Open Discord: {discord}\n"
     )
     html_body = (
         f"<p>Hey {escape(name)},</p>"
-        f"<p>Haven’t seen you in Discord for 10 days. No pressure "
-        f"— life happens. Just dropping in with a quick week-in-"
+        f"<p>Haven’t seen you in Discord for 10 days. No pressure. "
+        f"Life happens. Just dropping in with a quick week-in-"
         f"review so you can catch up:</p>"
         f"<ul>"
         f"<li>Headline call: <strong>+{top_pct}% on {escape(str(top_pair))}</strong></li>"
         f"<li>The Telegram alert bot has been firing through the week</li>"
         f"<li>Daily morning brief and weekly Mac session both ran on schedule</li>"
         f"</ul>"
-        f"<p>If something’s blocking you from engaging — the "
-        f"format, missed setups, anything — reply to this email "
+        f"<p>If something’s blocking you from engaging, the "
+        f"format, missed setups, anything, reply to this email "
         f"and tell us. We read every reply.</p>"
         f"{_cta_button_html('Open Discord', discord)}"
     )
@@ -1457,7 +1457,7 @@ def _post_retention_day7(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
     name = _pretty_name(sub)
     survey = sub.rejoin_url or "https://whop.com/potion"
 
-    subject = f"Quick one, {name} — what made you stay?"
+    subject = f"Quick one, {name}: what made you stay?"
     text = (
         f"Hey {name},\n\n"
         f"Glad to have you back. Thanks for giving Potion another shot.\n\n"
@@ -1468,7 +1468,7 @@ def _post_retention_day7(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"directly shape what we offer next time someone’s on the fence:\n\n"
         f"{survey}\n\n"
         f"No pressure. If you’d rather just reply to this email with "
-        f"a one-liner, that works too — we read every response.\n"
+        f"a one-liner, that works too. We read every response.\n"
     )
     html_body = (
         f"<p>Hey {escape(name)},</p>"
@@ -1482,7 +1482,7 @@ def _post_retention_day7(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"{_cta_button_html('Take the 2-minute survey', survey)}"
         f"<p style='color:#b0b0b8;font-size:14px;'>No pressure. If you’d "
         f"rather just reply to this email with a one-liner, that works "
-        f"too — we read every response.</p>"
+        f"too. We read every response.</p>"
     )
     return RenderedEmail(
         subject=subject, text=text, html=_wrap_html(html_body),
@@ -1523,7 +1523,7 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
             f"cancel anytime if it’s still not the right fit.\n\n"
             f"Lock it in here: {rejoin}\n\n"
             f"This personal link expires in 14 days. If you’d rather "
-            f"go annual, we also offer $69/mo billed yearly ($828) — same "
+            f"go annual, we also offer $69/mo billed yearly ($828). Same "
             f"full Elite access for a lower monthly rate."
         )
         body_html = (
@@ -1535,7 +1535,7 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
             f"{_cta_button_html(cta, rejoin)}"
             f"<p style='color:#b0b0b8;font-size:14px;'>This personal link "
             f"expires in 14 days. If you’d rather go annual, we also "
-            f"offer $69/mo billed yearly ($828) — same full Elite access "
+            f"offer $69/mo billed yearly ($828). Same full Elite access "
             f"for a lower monthly rate.</p>"
         )
     elif reason == "not_using":
@@ -1602,29 +1602,29 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         bullets_html = _top_calls_30d_bullets_html(stats)
         text_body = (
             f"Hey {name},\n\n"
-            f"Appreciate you saying so honestly — that kind of feedback is "
+            f"Appreciate you saying so honestly. That kind of feedback is "
             f"how we improve.\n\n"
             f"Quietly behind the scenes we’ve been making changes. "
             f"Here’s the top 5 calls from the last 30 days so you can "
             f"see for yourself:\n\n"
             f"{bullets_text}\n\n"
             f"We’d like to give you 7 free days to see if it feels "
-            f"different now. No pressure either way — if it’s still "
+            f"different now. No pressure either way. If it’s still "
             f"not landing for you after the trial, the cancellation "
             f"goes through as planned.\n\n"
             f"Claim 7 days free: {rejoin}"
         )
         body_html = (
             f"<p>Hey {escape(name)},</p>"
-            f"<p>Appreciate you saying so honestly — that kind of feedback "
+            f"<p>Appreciate you saying so honestly. That kind of feedback "
             f"is how we improve.</p>"
             f"<p>Quietly behind the scenes we’ve been making changes. "
             f"Here’s the top 5 calls from the last 30 days so you can "
             f"see for yourself:</p>"
             f"{bullets_html}"
             f"<p><strong>We’d like to give you 7 free days</strong> "
-            f"to see if it feels different now. No pressure either way — "
-            f"if it’s still not landing for you after the trial, the "
+            f"to see if it feels different now. No pressure either way. "
+            f"If it’s still not landing for you after the trial, the "
             f"cancellation goes through as planned.</p>"
             f"{_cta_button_html(cta, rejoin)}"
         )
@@ -1637,24 +1637,24 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         text_body = (
             f"Hey {name},\n\n"
             f"Respect the honesty. We’re not going to try to outbid "
-            f"anyone — instead, here’s our last 30 days of calls so "
+            f"anyone. Instead, here’s our last 30 days of calls so "
             f"you can compare like for like:\n\n"
             f"{bullets_text}\n\n"
             f"No discount on this one. Just the numbers.\n\n"
             f"If you want to run them side by side, here’s a 7-day "
-            f"free trial — keep both subscriptions, see which one’s "
+            f"free trial. Keep both subscriptions, see which one’s "
             f"actually working for you, then decide.\n\n"
             f"Start the comparison: {rejoin}"
         )
         body_html = (
             f"<p>Hey {escape(name)},</p>"
             f"<p>Respect the honesty. We’re not going to try to outbid "
-            f"anyone — instead, here’s our last 30 days of calls so "
+            f"anyone. Instead, here’s our last 30 days of calls so "
             f"you can compare like for like:</p>"
             f"{bullets_html}"
             f"<p><strong>No discount on this one. Just the numbers.</strong></p>"
             f"<p>If you want to run them side by side, here’s a 7-day "
-            f"free trial — keep both subscriptions, see which one’s "
+            f"free trial. Keep both subscriptions, see which one’s "
             f"actually working for you, then decide.</p>"
             f"{_cta_button_html(cta, rejoin)}"
         )
@@ -1666,24 +1666,24 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
             f"Hey {name},\n\n"
             f"Thanks for the feedback. We’d love to make it up to you "
             f"while we work on the things you flagged.\n\n"
-            f"Here’s 25% off for 2 months — no strings, just our way "
+            f"Here’s 25% off for 2 months. No strings, just our way "
             f"of saying we hear you.\n\n"
             f"Lock in 25% off: {rejoin}\n\n"
             f"This link is personal to you and expires in 14 days. If "
             f"there’s something specific that drove you to cancel, "
-            f"reply to this email — we read every one and we’re "
+            f"reply to this email. We read every one and we’re "
             f"actively reshaping the room based on member feedback."
         )
         body_html = (
             f"<p>Hey {escape(name)},</p>"
             f"<p>Thanks for the feedback. We’d love to make it up to "
             f"you while we work on the things you flagged.</p>"
-            f"<p><strong>Here’s 25% off for 2 months</strong> — no "
+            f"<p><strong>Here’s 25% off for 2 months</strong>. No "
             f"strings, just our way of saying we hear you.</p>"
             f"{_cta_button_html(cta, rejoin)}"
             f"<p style='color:#b0b0b8;font-size:14px;'>This link is personal "
             f"to you and expires in 14 days. If there’s something "
-            f"specific that drove you to cancel, reply to this email — we "
+            f"specific that drove you to cancel, reply to this email. We "
             f"read every one and we’re actively reshaping the room "
             f"based on member feedback.</p>"
         )
