@@ -1385,6 +1385,162 @@ def _inactive_day10(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Bronze -> Elite upsell sequence (new Bronze members, days 1 / 3 / 5)
+# ---------------------------------------------------------------------------
+
+# The Potion Digest channel. Day 3 points new Bronze members here to see
+# a real closed winner they could not act on without Elite.
+_DIGEST_CHANNEL = (
+    "https://discord.com/channels/1260259552763580537/1491168625472835584"
+)
+
+# Canonical Potion support channel (same one the bot's /help and
+# /support commands point at). Used for the "need help" P.S.
+_SUPPORT_TICKET_CHANNEL = (
+    "https://discord.com/channels/1260259552763580537/1285628366162231346"
+)
+
+
+def _bronze_day1(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Day 1: welcome the new Bronze member, show what Elite unlocks.
+    Value-forward, no offer yet."""
+    name = _pretty_name(sub)
+    rejoin = sub.rejoin_url or "https://whop.com/potion"
+
+    subject = "Everything you’re missing without Elite"
+    text = (
+        f"Hey {name},\n\n"
+        f"Welcome to Potion. You’re in as Bronze, which gets you a seat "
+        f"in the room. The plays, the alerts, the edge: those live in "
+        f"Elite.\n\n"
+        f"Here’s what Bronze does not get you:\n"
+        f"• Real-time call alerts the moment a setup fires (Bronze sees "
+        f"them late, if at all)\n"
+        f"• The Telegram alert bot pinging you the second a trade goes "
+        f"live\n"
+        f"• Full access to every calls channel and the track record "
+        f"behind them\n"
+        f"• Your own Concierge thread for direct help\n\n"
+        f"Bronze is the lobby. Elite is the floor, and most of the moves "
+        f"happen on the floor.\n\n"
+        f"See what Elite unlocks: {rejoin}\n\n"
+        f"PS. Create a ticket in the Discord if you need any help: "
+        f"{_SUPPORT_TICKET_CHANNEL}\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Welcome to Potion. You’re in as Bronze, which gets you a "
+        f"seat in the room. The plays, the alerts, the edge: those live in "
+        f"<strong>Elite</strong>.</p>"
+        f"<p><strong>Here’s what Bronze does not get you:</strong></p>"
+        f"<ul>"
+        f"<li>Real-time call alerts the moment a setup fires (Bronze sees "
+        f"them late, if at all)</li>"
+        f"<li>The Telegram alert bot pinging you the second a trade goes "
+        f"live</li>"
+        f"<li>Full access to every calls channel and the track record "
+        f"behind them</li>"
+        f"<li>Your own Concierge thread for direct help</li>"
+        f"</ul>"
+        f"<p>Bronze is the lobby. Elite is the floor, and most of the moves "
+        f"happen on the floor.</p>"
+        f"{_cta_button_html('See what Elite unlocks', rejoin)}"
+        f"<p style='color:#b0b0b8;font-size:14px;'>PS. Create a ticket in "
+        f"the <a href='{_SUPPORT_TICKET_CHANNEL}' "
+        f"style='color:#b0b0b8;'>Discord</a> if you need any help.</p>"
+    )
+    _ = stats
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _bronze_day3(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Day 3: concrete FOMO. A real closed winner from the Potion Digest
+    that Bronze could not act on in time."""
+    name = _pretty_name(sub)
+    rejoin = sub.rejoin_url or "https://whop.com/potion"
+    top_pair = getattr(stats, "top_pair_7d", None) or "ETH/USDT"
+    top_pct = getattr(stats, "top_pct_7d", None) or 89
+
+    subject = "Bronze watched this one go by"
+    text = (
+        f"Hey {name},\n\n"
+        f"Quick one. +{top_pct}% on {top_pair} closed this week. Elite "
+        f"members got the alert in real time and scaled out at TP1. Bronze "
+        f"got to read about it after.\n\n"
+        f"The full play is sitting in the Potion Digest right now: "
+        f"{_DIGEST_CHANNEL}\n\n"
+        f"Every entry, every take-profit, every closeout. We don’t hide "
+        f"the losers either, the track record shows all of it.\n\n"
+        f"That is the real Bronze vs Elite gap. It is not the chat. It is "
+        f"the timing.\n\n"
+        f"Upgrade to Elite: {rejoin}\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Quick one. <strong>+{top_pct}% on {escape(str(top_pair))}</strong> "
+        f"closed this week. Elite members got the alert in real time and "
+        f"scaled out at TP1. Bronze got to read about it after.</p>"
+        f"<p>The full play is sitting in the Potion Digest right now:</p>"
+        f"{_cta_button_html('See the winner in Potion Digest', _DIGEST_CHANNEL)}"
+        f"<p>Every entry, every take-profit, every closeout. We don’t "
+        f"hide the losers either, the track record shows all of it.</p>"
+        f"<p>That is the real Bronze vs Elite gap. It is not the chat. It "
+        f"is the timing.</p>"
+        f"{_cta_button_html('Upgrade to Elite', rejoin)}"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _bronze_day5(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Day 5: the offer. 30% off Elite (router-minted personal link via
+    sub.rejoin_url) plus a plain how-to-join."""
+    name = _pretty_name(sub)
+    rejoin = sub.rejoin_url or "https://whop.com/potion"
+
+    subject = "Your 30% off Elite (how to claim it)"
+    text = (
+        f"Hey {name},\n\n"
+        f"You’ve been Bronze for a few days. Here’s a reason to "
+        f"move up: 30% off your first stretch of Elite, personal to you.\n\n"
+        f"How to claim it:\n"
+        f"• Click the link below (your discount is already attached)\n"
+        f"• Pick your plan on Whop\n"
+        f"• Your Elite role, alert bot, and Concierge thread go live "
+        f"within minutes\n\n"
+        f"No new signup, no friction. Same account, more access.\n\n"
+        f"Claim 30% off Elite: {rejoin}\n\n"
+        f"This link is personal to you. Reply if anything is unclear, we "
+        f"read every email.\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>You’ve been Bronze for a few days. Here’s a reason to "
+        f"move up: <strong>30% off your first stretch of Elite</strong>, "
+        f"personal to you.</p>"
+        f"<p><strong>How to claim it:</strong></p>"
+        f"<ul>"
+        f"<li>Click the button below (your discount is already attached)</li>"
+        f"<li>Pick your plan on Whop</li>"
+        f"<li>Your Elite role, alert bot, and Concierge thread go live "
+        f"within minutes</li>"
+        f"</ul>"
+        f"<p>No new signup, no friction. Same account, more access.</p>"
+        f"{_cta_button_html('Claim 30% off Elite', rejoin)}"
+        f"<p style='color:#b0b0b8;font-size:14px;'>This link is personal to "
+        f"you. Reply if anything is unclear, we read every email.</p>"
+    )
+    _ = stats
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+_BRONZE_RENDERERS = {
+    1: _bronze_day1,
+    3: _bronze_day3,
+    5: _bronze_day5,
+}
+
+
 _WINBACK_RENDERERS = {
     # Luke's 2026-04-18 simplification: 3 emails at days 1, 4, 7.
     # Day 5 legacy renderer stays mapped so in-flight `day=5` sends from
@@ -1699,6 +1855,8 @@ def render(
     """Pick the right template for a (sequence, day) pair and render."""
     if sequence == "winback":
         renderer = _WINBACK_RENDERERS.get(day)
+    elif sequence == "bronze":
+        renderer = _BRONZE_RENDERERS.get(day)
     elif sequence == "reengagement":
         renderer = _REENGAGE_RENDERERS.get(day)
     elif sequence == "onboarding":
