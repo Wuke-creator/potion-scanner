@@ -329,6 +329,7 @@ class EmailWebhookHandlers:
         post_retention_survey_url: str = "",
         post_retention_delay_days: int = 7,
         post_retention_max_lookback_days: int = 30,
+        bronze_access_pass_id: str = "",
     ):
         """``whop_members_db`` is optional. When provided, the new
         payment_failed and payment_succeeded webhook receivers can flip
@@ -355,6 +356,11 @@ class EmailWebhookHandlers:
         self._post_retention_lookback_sec = (
             post_retention_max_lookback_days * 86400
         )
+        # Whop access-pass / product id for the Bronze tier. When set, a
+        # membership.activated for this pass enrols the member in the
+        # Bronze -> Elite upsell sequence. Empty = feature dormant (no
+        # enrolment), so this ships safely until the id is configured.
+        self._bronze_access_pass_id = (bronze_access_pass_id or "").strip()
 
     def register(self, app: web.Application) -> None:
         # Unified Whop dispatcher (recommended). Configure ONE webhook in
@@ -538,9 +544,22 @@ class EmailWebhookHandlers:
         First-time joiners hit step 1 as a no-op (no dunning row) and
         step 2 finds no prior cancellation, so the only effect is the
         log line. Reactivations after a save trigger both.
+
+        Bronze -> Elite upsell enrolment runs FIRST and independently of
+        whop_members_db: a new Bronze member must get the sequence even
+        on deployments without the members-DB wiring. It's a no-op unless
+        the Bronze access-pass id is configured and matches.
         """
+        bronze_enrolled = False
+        try:
+            bronze_enrolled = await self._maybe_enrol_bronze(data)
+        except Exception:
+            logger.exception("Bronze enrol: unexpected error in dispatcher")
+
         if self._whop_members_db is None:
-            return web.json_response({"ok": True, "noted": False})
+            return web.json_response({
+                "ok": True, "noted": False, "bronze_enrolled": bronze_enrolled,
+            })
         whop_user_id = self._extract_whop_user_id(data)
         if whop_user_id:
             try:
@@ -621,6 +640,7 @@ class EmailWebhookHandlers:
             "ok": True,
             "user_id": whop_user_id,
             "post_retention_scheduled": post_retention_scheduled,
+            "bronze_enrolled": bronze_enrolled,
         })
 
     async def _dispatch_payment_failed(self, data: dict) -> web.Response:
@@ -891,6 +911,105 @@ class EmailWebhookHandlers:
             if c:
                 return str(c)
         return ""
+
+    @staticmethod
+    def _extract_access_pass_ids(data: dict) -> set[str]:
+        """Collect every product / plan / access-pass id that appears in a
+        (variable-shape) Whop membership webhook body.
+
+        We don't know which exact field Whop uses for the Bronze pass and
+        the payload shape varies by event/version, so we gather all the
+        id-ish fields and let the caller test membership. A Whop id is a
+        unique opaque string, so a false-positive match against the
+        configured Bronze id is effectively impossible.
+        """
+        m = data.get("membership") or {}
+        candidates = (
+            data.get("product_id"),
+            data.get("plan_id"),
+            data.get("page_id"),
+            data.get("access_pass_id"),
+            (data.get("product") or {}).get("id"),
+            (data.get("plan") or {}).get("id"),
+            (data.get("access_pass") or {}).get("id"),
+            m.get("product_id"),
+            m.get("plan_id"),
+            m.get("access_pass_id"),
+            (m.get("product") or {}).get("id"),
+            (m.get("plan") or {}).get("id"),
+            (m.get("access_pass") or {}).get("id"),
+        )
+        return {str(c) for c in candidates if c}
+
+    @staticmethod
+    def _extract_email(data: dict) -> str:
+        return (
+            data.get("email")
+            or (data.get("user") or {}).get("email")
+            or (data.get("membership") or {}).get("user", {}).get("email", "")
+        ).strip().lower()
+
+    async def _maybe_enrol_bronze(self, data: dict) -> bool:
+        """Enrol a newly-activated Bronze member into the Bronze -> Elite
+        upsell sequence (days 1 / 3 / 5).
+
+        Dormant when ``_bronze_access_pass_id`` is unset (ships safe until
+        the Whop Bronze pass id is configured). Only fires when the
+        activated membership's product/plan/access-pass ids include the
+        configured Bronze id. Deduped on an existing bronze subscriber
+        row so repeated membership.activated webhooks (Whop re-delivers,
+        and the event also fires on reactivation) don't double-enrol.
+
+        Returns True if an enrolment was scheduled.
+        """
+        if not self._bronze_access_pass_id:
+            return False
+        if self._bronze_access_pass_id not in self._extract_access_pass_ids(data):
+            return False
+        email = self._extract_email(data)
+        if not email:
+            logger.warning(
+                "Bronze enrol: matched Bronze pass but no email in payload",
+            )
+            return False
+        try:
+            existing = await self._db.get_subscriber(email)
+        except Exception:
+            existing = None
+            logger.exception("Bronze enrol: get_subscriber crashed for %s", email)
+        if existing is not None and existing.trigger_type == "bronze":
+            logger.info(
+                "Bronze enrol: %s already in bronze sequence — skipping", email,
+            )
+            return False
+        name = (
+            data.get("name")
+            or (data.get("user") or {}).get("name")
+            or (data.get("user") or {}).get("username")
+            or ""
+        ).strip()
+        now = int(time.time())
+        try:
+            await self._db.upsert_subscriber(Subscriber(
+                email=email,
+                name=name,
+                trigger_type="bronze",
+                # Bronze is a new-member upsell, not a churn flow, so it
+                # has no exit reason. "none" is the sentinel the DB
+                # requires for non-churn sequences (same as reengagement).
+                exit_reason="none",
+                rejoin_url=self._default_rejoin,
+                created_at=now,
+            ))
+            ids = await self._db.schedule_sequence(email=email, sequence="bronze")
+        except Exception:
+            logger.exception("Bronze enrol: scheduling crashed for %s", email)
+            return False
+        logger.info(
+            "Bronze enrol: %s scheduled into bronze sequence (sends=%s)",
+            email, ids,
+        )
+        return True
 
     async def _inactivity(self, request: web.Request) -> web.Response:
         if not self._admin_check(request):

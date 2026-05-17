@@ -215,6 +215,10 @@ class EmailDB:
         # after a cancelled member reactivates — the "save was successful,
         # what convinced you to stay?" survey).
         "post_retention",
+        # Bronze -> Elite upsell (new Bronze members, days 1 / 3 / 5).
+        # Day 5 carries a single-use 30%-off Elite promo minted at send
+        # time. Independent lifecycle (not cancel-on-reschedule).
+        "bronze",
     }
 
     # Sequences that are mutually exclusive when scheduling — a fresh
@@ -292,6 +296,8 @@ class EmailDB:
             return (0, 3, 5, 7, 30)
         if sequence == "dunning":
             return (0, 3, 10)
+        if sequence == "bronze":
+            return (1, 3, 5)
         # One-shot sequences (pre_renewal etc.) get one send at the
         # caller-specified due_at via schedule_one — schedule_sequence
         # isn't the right entry point. Default to (0,) defensively.

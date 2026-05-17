@@ -317,6 +317,12 @@ async def run(config: Config) -> None:
                 analytics_db_path="data/analytics.db",
                 poll_interval_sec=config.email_bot.worker_poll_sec,
                 max_per_cycle=config.email_bot.worker_max_per_cycle,
+                # Bronze day-5 mints a single-use 30%-off Elite code at
+                # send time. Reuses the same promo-scoped Whop key as the
+                # save-offer router. Unset -> day 5 still sends, plain link.
+                whop_promo_api_key=config.automations.whop_promo_api_key,
+                whop_company_id=config.automations.whop_company_id,
+                bronze_promo_ttl_days=config.automations.bronze_promo_ttl_days,
             )
             # AUT-026 Targeted Save Offer Router. Reuses the cancel-survey
             # promo-creation key (same Whop scope: promo_code:create +
@@ -345,6 +351,12 @@ async def run(config: Config) -> None:
                 ),
                 post_retention_delay_days=(
                     config.automations.post_retention_delay_days
+                ),
+                # Bronze -> Elite upsell enrolment. Dormant until the
+                # Whop Bronze access-pass id is set; then a Bronze
+                # membership.activated schedules the day 1/3/5 sequence.
+                bronze_access_pass_id=(
+                    config.automations.whop_bronze_access_pass_id
                 ),
             )
             webhook_handlers.register(verification.callback_server.app)

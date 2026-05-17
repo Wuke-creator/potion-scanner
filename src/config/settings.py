@@ -220,6 +220,11 @@ class AutomationsConfig:
     # hardcoded OFFERS table in the frontend.
     whop_promo_api_key: str = ""  # WHOP_PROMO_API_KEY env var
     cancel_survey_promo_ttl_days: int = 30
+    # Whop access-pass / product id for the Bronze tier. When set, a
+    # membership.activated for this pass enrols the member in the
+    # Bronze -> Elite upsell sequence. Empty = dormant (no enrolment).
+    whop_bronze_access_pass_id: str = ""  # WHOP_BRONZE_ACCESS_PASS_ID env var
+    bronze_promo_ttl_days: int = 14       # day-5 code redemption window
 
     # AUT-033 Post-Retention Follow-Up Survey URL. Sent 7 days after a
     # cancelled member reactivates (the "what convinced you to stay?"
@@ -586,6 +591,13 @@ def load_config(
         ).strip(),
         cancel_survey_promo_ttl_days=int(
             automations_yaml.get("cancel_survey_promo_ttl_days", 30),
+        ),
+        whop_bronze_access_pass_id=os.getenv(
+            "WHOP_BRONZE_ACCESS_PASS_ID",
+            automations_yaml.get("whop_bronze_access_pass_id", ""),
+        ).strip(),
+        bronze_promo_ttl_days=int(
+            automations_yaml.get("bronze_promo_ttl_days", 14),
         ),
         post_retention_survey_url=os.getenv(
             "POST_RETENTION_SURVEY_URL",
