@@ -225,6 +225,13 @@ class AutomationsConfig:
     # Bronze -> Elite upsell sequence. Empty = dormant (no enrolment).
     whop_bronze_access_pass_id: str = ""  # WHOP_BRONZE_ACCESS_PASS_ID env var
     bronze_promo_ttl_days: int = 14       # day-5 code redemption window
+    # Sync-driven Bronze upsell (Option 2). The free-tier Whop product id
+    # ("Free Discord" = prod_LVAuYCd2uhi7y). go_live_at is the join-time
+    # cutoff: only members whose free membership was created at/after this
+    # epoch are enrolled, so the existing free backlog is never blasted.
+    # Both unset/0 => dormant.
+    whop_bronze_free_product_id: str = ""  # WHOP_BRONZE_FREE_PRODUCT_ID
+    bronze_enroll_go_live_at_epoch: int = 0  # BRONZE_ENROLL_GO_LIVE_AT_EPOCH
 
     # AUT-033 Post-Retention Follow-Up Survey URL. Sent 7 days after a
     # cancelled member reactivates (the "what convinced you to stay?"
@@ -598,6 +605,14 @@ def load_config(
         ).strip(),
         bronze_promo_ttl_days=int(
             automations_yaml.get("bronze_promo_ttl_days", 14),
+        ),
+        whop_bronze_free_product_id=os.getenv(
+            "WHOP_BRONZE_FREE_PRODUCT_ID",
+            automations_yaml.get("whop_bronze_free_product_id", ""),
+        ).strip(),
+        bronze_enroll_go_live_at_epoch=_env_int(
+            "BRONZE_ENROLL_GO_LIVE_AT_EPOCH",
+            int(automations_yaml.get("bronze_enroll_go_live_at_epoch", 0) or 0),
         ),
         post_retention_survey_url=os.getenv(
             "POST_RETENTION_SURVEY_URL",

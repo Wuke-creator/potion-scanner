@@ -325,6 +325,23 @@ class EmailDB:
         await self._conn.commit()
         return cursor.lastrowid or 0
 
+    async def cancel_pending(self, email: str, sequence: str) -> int:
+        """Cancel every still-pending send for ``email`` in ``sequence``.
+
+        Used by the Bronze upgrade-stop: when a free member converts to a
+        paid plan we cancel their remaining bronze sends so they never
+        get the "30% off Elite" offer after they've already upgraded.
+        Returns the number of sends cancelled (0 = nothing pending).
+        """
+        assert self._conn is not None
+        cur = await self._conn.execute(
+            "UPDATE scheduled_sends SET status='canceled' "
+            "WHERE email = ? AND sequence = ? AND status = 'pending'",
+            (email, sequence),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
     async def due_sends(self, now: int | None = None) -> list[ScheduledSend]:
         """Return all pending sends whose due_at has passed."""
         assert self._conn is not None

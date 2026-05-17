@@ -494,12 +494,34 @@ async def run(config: Config) -> None:
         # Whop -> verified_users.email backfill. Runs once at startup (optional)
         # and on a 24h cron. Also exposed via the /sync-emails slash command.
         if config.automations.whop_api_key and config.automations.whop_company_id:
+            # Bronze -> Elite upsell, piggybacked on the membership walk.
+            # Needs the email DB; dormant unless the free product id +
+            # go-live epoch are both configured (go-live default 0 ->
+            # nobody enrolled, so the existing free backlog is never hit).
+            bronze_upsell = None
+            if email_db is not None:
+                from src.automations.bronze_upsell import BronzeUpsell
+
+                bronze_upsell = BronzeUpsell(
+                    email_db=email_db,
+                    free_product_id=config.automations.whop_bronze_free_product_id,
+                    go_live_at=config.automations.bronze_enroll_go_live_at_epoch,
+                    rejoin_url=config.email_bot.rejoin_url,
+                )
+                logger.info(
+                    "BronzeUpsell wired (enabled=%s, free_product=%s, "
+                    "go_live_at=%s)",
+                    bronze_upsell.is_enabled,
+                    config.automations.whop_bronze_free_product_id or "(unset)",
+                    config.automations.bronze_enroll_go_live_at_epoch,
+                )
             whop_email_sync = WhopEmailSync(
                 verification_db=verification.db,
                 api_key=config.automations.whop_api_key,
                 company_id=config.automations.whop_company_id,
                 api_base=config.automations.whop_api_base,
                 members_db=whop_members_db,
+                bronze_upsell=bronze_upsell,
             )
             whop_email_sync_cron = WhopEmailSyncCron(
                 sync=whop_email_sync,

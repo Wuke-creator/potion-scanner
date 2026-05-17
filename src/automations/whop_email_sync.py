@@ -52,12 +52,17 @@ class WhopEmailSync:
         company_id: str,
         api_base: str = "https://api.whop.com",
         members_db: WhopMembersDB | None = None,
+        bronze_upsell=None,
     ):
         self._db = verification_db
         self._members_db = members_db
         self._api_key = api_key
         self._company_id = company_id
         self._api_base = api_base
+        # Optional Bronze -> Elite upsell. Fed every membership row during
+        # the existing walk (no extra Whop traffic); decides enrol /
+        # upgrade-stop at finalize. Dormant unless configured.
+        self._bronze_upsell = bronze_upsell
 
     @property
     def is_configured(self) -> bool:
@@ -101,6 +106,17 @@ class WhopEmailSync:
                 api_base=self._api_base,
             ) as whop:
                 async for member in whop.iter_memberships():
+                    # 0. Fold this membership into the Bronze upsell
+                    #    accumulator (cheap, side-effect-free). Sees free
+                    #    AND paid rows so it can decide tier + upgrades.
+                    if self._bronze_upsell is not None:
+                        try:
+                            self._bronze_upsell.observe(member)
+                        except Exception:
+                            logger.exception(
+                                "BronzeUpsell.observe crashed (continuing sync)",
+                            )
+
                     # 1. Upsert into whop_members roster (the email audience).
                     #    We include invalid members too so we can later track
                     #    cancellations; downstream list_valid_* methods filter
@@ -143,6 +159,14 @@ class WhopEmailSync:
                     del needs_email[member.discord_user_id]
         except WhopAPIError as e:
             logger.error("Whop sync aborted: %s", e)
+            # Partial walk -> incomplete per-email tier state. Discard it
+            # so a half-seen member isn't mis-enrolled / mis-upgrade-stopped
+            # next cycle. Bronze decisions wait for a clean full walk.
+            if self._bronze_upsell is not None:
+                try:
+                    self._bronze_upsell.reset()
+                except Exception:
+                    logger.exception("BronzeUpsell.reset crashed")
             return {
                 "status": "error",
                 "error": str(e),
@@ -151,6 +175,16 @@ class WhopEmailSync:
                 "roster_seen": roster_seen,
                 "duration_sec": round(time.time() - started_at, 1),
             }
+
+        # Walk completed cleanly: now it's safe to act on the fully
+        # accumulated per-email tier state.
+        bronze_summary = None
+        if self._bronze_upsell is not None:
+            try:
+                bronze_summary = await self._bronze_upsell.finalize()
+            except Exception:
+                logger.exception("BronzeUpsell.finalize crashed")
+                bronze_summary = {"status": "error"}
 
         summary = {
             "status": "ok",
@@ -162,6 +196,7 @@ class WhopEmailSync:
             "roster_seen": roster_seen,
             "roster_with_email": roster_with_email,
             "duration_sec": round(time.time() - started_at, 1),
+            "bronze": bronze_summary,
         }
         logger.info("Whop sync cycle: %s", summary)
         return summary

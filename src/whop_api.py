@@ -174,8 +174,10 @@ class WhopMember:
     user_id: str                 # Whop user id (stable across memberships)
     discord_user_id: str         # linked Discord snowflake, "" if unlinked
     email: str                   # contact email, "" if Whop doesn't surface it
-    valid: bool                  # True = active paying member
+    valid: bool                  # True = active member (free OR paid; not a $ signal)
     membership_id: str           # Whop membership id (one user may have many)
+    product: str = ""            # prod_... id; the tier (free vs paid) lives here
+    created_at: int = 0          # membership creation epoch seconds (join time)
 
 
 @dataclass
@@ -522,12 +524,23 @@ def _parse_member(row: dict) -> WhopMember | None:
     if not user_id and not discord_user_id and not email:
         return None
 
+    # The tier (free vs paid) lives on the membership's product /
+    # access_pass id, NOT on `valid` (free members are valid too).
+    product = str(row.get("product") or row.get("access_pass") or "")
+    created_raw = row.get("created_at")
+    try:
+        created_at = int(created_raw) if created_raw is not None else 0
+    except (TypeError, ValueError):
+        created_at = 0
+
     return WhopMember(
         user_id=user_id,
         discord_user_id=discord_user_id,
         email=email,
         valid=valid,
         membership_id=membership_id,
+        product=product,
+        created_at=created_at,
     )
 
 
