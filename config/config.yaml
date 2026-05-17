@@ -20,7 +20,11 @@ discord:
 
     - key: prediction
       name: "Prediction Calls"
-      display_name: "Elite Scans"
+      # Was "Elite Scans" — diverged from the actual Discord channel
+      # (prediction-calls) and from the signal-alert Source line, so the
+      # same channel showed two different names across TG surfaces.
+      # Unified to match Discord + the name field.
+      display_name: "Prediction Calls"
       source_type: memecoin
       id_env: PREDICTION_CHANNEL_ID
       ref_link_env: REF_LINK_MEMECOIN
