@@ -116,7 +116,10 @@ export interface QueueRow {
 }
 
 export interface EmailKpis {
-  // Raw counts.
+  // Send volume in the last rolling 24h, independent of the window
+  // selector. Deliverability + Resend rate-limit watch.
+  sent_24h: number;
+  // Raw counts (over the selected window).
   sent: number;
   delivered: number;
   opened: number;            // total open events (a recipient can fire multiple)

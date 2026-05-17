@@ -559,6 +559,7 @@ export function getEmailQueue(): QueueRow[] {
 
 function _emptyKpis(): EmailKpis {
   return {
+    sent_24h: 0,
     sent: 0, delivered: 0,
     opened: 0, clicked: 0,
     unique_opened: 0, unique_clicked: 0,
@@ -614,6 +615,13 @@ export function getEmailKpis(windowDays = 30): EmailKpis {
     "SELECT COUNT(*) AS c FROM email_unsubscribes WHERE unsubscribed_at >= ?"
   ).get(since) as { c: number };
 
+  // Rolling 24h send volume — fixed window, ignores the selector. Used
+  // to watch deliverability + stay clear of Resend's daily send cap.
+  const sent24 = ev.prepare(
+    "SELECT COUNT(*) AS c FROM email_events " +
+      "WHERE event_type = 'sent' AND event_at >= ?"
+  ).get(nowSec() - DAY) as { c: number };
+
   const sent = map.sent ?? 0;
   const delivered = map.delivered ?? 0;
   const opened = map.opened ?? 0;
@@ -627,6 +635,7 @@ export function getEmailKpis(windowDays = 30): EmailKpis {
   const unsubscribed = unsub?.c ?? 0;
 
   return {
+    sent_24h: sent24?.c ?? 0,
     sent, delivered,
     opened, clicked,
     unique_opened, unique_clicked,

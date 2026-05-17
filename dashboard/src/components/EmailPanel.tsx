@@ -205,6 +205,22 @@ function KpisTab({ windowDays }: { windowDays: Window }) {
 
   return (
     <div>
+      <Card className="mb-3 border-zinc-700">
+        <CardContent className="p-4 flex items-baseline justify-between flex-wrap gap-2">
+          <div>
+            <div className="text-xs uppercase tracking-wider text-zinc-500">
+              Sent, last 24 hours
+            </div>
+            <div className="text-3xl font-semibold mt-1 text-zinc-100">
+              {k.sent_24h.toLocaleString()}
+            </div>
+          </div>
+          <div className="text-xs text-zinc-500 max-w-[260px] text-right">
+            Rolling 24h send volume, independent of the {windowDays}d window
+            above. Watch this against your Resend plan's daily send cap.
+          </div>
+        </CardContent>
+      </Card>
       <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
         {cards.map((c) => (
           <Card key={c.label}>
