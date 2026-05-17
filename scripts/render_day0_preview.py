@@ -75,7 +75,7 @@ def render_and_save(banner_url: str, out_path: Path) -> None:
         "<div class='chrome'>"
         "<header>"
         "<div class='from'>From: <strong>Potion Alpha Team</strong> "
-        "&lt;seniormod@updates.potionalpha.com&gt;</div>"
+        "&lt;seniormod@mail.potionalpha.com&gt;</div>"
         "<div class='from'>To: member@example.com</div>"
         f"<div class='subject'>{rendered.subject}</div>"
         "</header>"

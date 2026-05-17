@@ -78,7 +78,7 @@ def main() -> None:
     )
 
     payload = {
-        "from": "Potion Alpha Team <seniormod@updates.potionalpha.com>",
+        "from": "Potion Alpha Team <seniormod@mail.potionalpha.com>",
         "to": [to_addr],
         "subject": rendered.subject + " (preview)",
         "html": rendered.html,

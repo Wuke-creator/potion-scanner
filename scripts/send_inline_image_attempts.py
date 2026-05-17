@@ -47,7 +47,7 @@ API_KEY = os.environ["RESEND_API_KEY"]
 # to the canonical Day 0 sender if unset.
 FROM = os.environ.get(
     "RESEND_FROM_ADDRESS",
-    "Potion Alpha Team <seniormod@updates.potionalpha.com>",
+    "Potion Alpha Team <seniormod@mail.potionalpha.com>",
 )
 BANNER_PATH = ROOT / "static" / "ostium-banner.png"
 BANNER_BYTES = BANNER_PATH.read_bytes()
