@@ -27,7 +27,10 @@ discord:
       display_name: "Prediction Calls"
       source_type: memecoin
       id_env: PREDICTION_CHANNEL_ID
-      ref_link_env: REF_LINK_MEMECOIN
+      # Prediction calls are Polymarket, not memecoin. Own ref-link env
+      # so wallet_tracker / degen_calls keep Padre. Plain Polymarket URL,
+      # no referral param (REF_LINK_PREDICTION=https://polymarket.com).
+      ref_link_env: REF_LINK_PREDICTION
 
     - key: macs_calls
       name: "Mac's Calls"
