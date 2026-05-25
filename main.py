@@ -43,10 +43,13 @@ from src.config import Config, load_config
 from src.discord_listener import DiscordListener, IncomingMessage
 from src.dispatcher import Dispatcher
 from src.email_bot import EmailDB
+from src.email_bot.branch_evaluator import EvalContext
 from src.email_bot.discord_commands import EmailSlashCommands
 from src.email_bot.analytics import EmailAnalytics
+from src.email_bot.engagement_scoring import EngagementScoreDB
 from src.email_bot.events_db import EmailEventsDB
 from src.email_bot.sender import ResendClient
+from src.email_bot.suppression_metrics import SuppressionMetrics
 from src.email_bot.webhook import EmailWebhookHandlers
 from src.email_bot.worker import EmailWorker
 from src.router import Router
@@ -67,6 +70,94 @@ async def _consume_queue(
         except asyncio.TimeoutError:
             continue
         await router.handle(message)
+
+
+# ---------------------------------------------------------------------------
+# branch_evaluator adapters
+# ---------------------------------------------------------------------------
+#
+# The evaluator's Protocols (WhopMembersLookup, SubscribersLookup) accept any
+# object exposing the right async methods. These thin wrappers point the
+# protocol methods at the existing production DB handles without inventing a
+# new lookup layer. Tests can pass their own duck-typed stubs unchanged.
+
+
+class _WhopMembersAdapter:
+    """WhopMembersLookup adapter over the production WhopMembersDB.
+
+    is_paid_member: a paid Elite member has a valid=1 row in whop_members.
+    first_seen_at:  the cached enrollment timestamp the DB stores.
+
+    Both methods short-circuit to safe defaults when the underlying DB
+    returns no row -- the branch evaluator already treats None as
+    "fall through to default", so we don't need to invent sentinel
+    values here.
+    """
+
+    def __init__(self, members_db) -> None:
+        self._db = members_db
+
+    async def is_paid_member(self, email: str) -> bool:
+        # WhopMembersDB exposes list_valid_with_email() but not a single
+        # email lookup. The evaluator only fires once per due send, so
+        # the LOWER() scan is acceptable until it becomes a bottleneck.
+        if not email:
+            return False
+        try:
+            rows = await self._db.list_valid_with_email()
+        except Exception:
+            logger.exception(
+                "WhopMembersAdapter.is_paid_member: list crashed for %s",
+                email,
+            )
+            return False
+        target = email.strip().lower()
+        return any((r.email or "").strip().lower() == target for r in rows)
+
+    async def first_seen_at(self, email: str) -> int | None:
+        if not email:
+            return None
+        try:
+            rows = await self._db.list_valid_with_email()
+        except Exception:
+            logger.exception(
+                "WhopMembersAdapter.first_seen_at: list crashed for %s",
+                email,
+            )
+            return None
+        target = email.strip().lower()
+        for r in rows:
+            if (r.email or "").strip().lower() == target:
+                return int(r.first_seen_at) if r.first_seen_at else None
+        return None
+
+
+class _SubscribersAdapter:
+    """SubscribersLookup adapter over the production EmailDB.
+
+    The subscribers table already stores exit_reason at upsert time
+    (set by the Whop cancellation webhook). The winback branch routes
+    on it via a small mapping in branch_evaluator. ``None`` is returned
+    when no row exists, which the evaluator treats as "default".
+    """
+
+    def __init__(self, email_db) -> None:
+        self._db = email_db
+
+    async def exit_reason(self, email: str) -> str | None:
+        if not email:
+            return None
+        try:
+            sub = await self._db.get_subscriber(email.lower().strip())
+        except Exception:
+            logger.exception(
+                "SubscribersAdapter.exit_reason: lookup crashed for %s",
+                email,
+            )
+            return None
+        if sub is None:
+            return None
+        return sub.exit_reason or None
 
 
 async def run(config: Config) -> None:
@@ -318,6 +409,7 @@ async def run(config: Config) -> None:
     email_events_db: EmailEventsDB | None = None
     email_sender: ResendClient | None = None
     email_worker: EmailWorker | None = None
+    engagement_score_db: EngagementScoreDB | None = None
     if config.email_bot.enabled:
         if not config.email_bot.resend_api_key:
             logger.warning(
@@ -334,9 +426,46 @@ async def run(config: Config) -> None:
                 db_path=config.email_bot.email_events_db_path,
             )
             await email_events_db.open()
+            # Engagement scoring shares the events DB file (same path) so
+            # the recompute cron can scan email_events and write
+            # engagement_score in one connection. The branch_evaluator
+            # reads from this DB on every send to pick hot/warm/cold +
+            # high/low variants. A separate handle so the events DB can
+            # close cleanly during shutdown without orphaning the score
+            # connection.
+            engagement_score_db = EngagementScoreDB(
+                db_path=config.email_bot.email_events_db_path,
+            )
+            await engagement_score_db.open()
             email_sender = ResendClient(
                 api_key=config.email_bot.resend_api_key,
                 from_address=config.email_bot.resend_from_address,
+            )
+            # branch_evaluator context. Bundles the three data sources
+            # the routing functions read from. Adapter classes wrap the
+            # production whop_members_db and email_db handles so the
+            # evaluator's Protocols stay structurally typed (anyone can
+            # inject an in-memory stand-in for tests). The context is
+            # only constructed when whop_members_db is available -- the
+            # dunning and onboarding routes can't decide without it
+            # anyway, but holding off on building the ctx keeps the
+            # worker's branching path off entirely in deployments that
+            # skip the Whop sync.
+            branch_evaluator_ctx: EvalContext | None = None
+            if whop_members_db is not None:
+                branch_evaluator_ctx = EvalContext(
+                    score_db=engagement_score_db,
+                    members=_WhopMembersAdapter(whop_members_db),
+                    subscribers=_SubscribersAdapter(email_db),
+                )
+            # Suppression-rate monitor. Records every delivery attempt
+            # and every suppression at the last-mile gate, fires a
+            # WARNING + optional Discord webhook alert when the rolling
+            # one-hour rate breaches 5%. The webhook URL is opt-in via
+            # OPS_ALERT_WEBHOOK_URL; unset means log-only alerting,
+            # which still lands in the Railway log stream.
+            suppression_metrics = SuppressionMetrics(
+                webhook_url=os.getenv("OPS_ALERT_WEBHOOK_URL", ""),
             )
             email_worker = EmailWorker(
                 db=email_db,
@@ -356,6 +485,8 @@ async def run(config: Config) -> None:
                 # the row slipped through cancel_all_pending due to a
                 # race with the bounce webhook.
                 events_db=email_events_db,
+                branch_evaluator_ctx=branch_evaluator_ctx,
+                suppression_metrics=suppression_metrics,
             )
             # AUT-026 Targeted Save Offer Router. Reuses the cancel-survey
             # promo-creation key (same Whop scope: promo_code:create +
@@ -855,6 +986,11 @@ async def run(config: Config) -> None:
                 await email_events_db.close()
             except Exception:
                 logger.exception("Email events DB close error")
+        if engagement_score_db is not None:
+            try:
+                await engagement_score_db.close()
+            except Exception:
+                logger.exception("Engagement score DB close error")
         if image_archive is not None:
             try:
                 await image_archive.close()

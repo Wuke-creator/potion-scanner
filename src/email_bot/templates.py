@@ -2569,30 +2569,71 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
 
 
 def render(
-    sequence: str, day: int, subscriber: Subscriber, stats: StatsBundle,
+    sequence: str,
+    day: int,
+    subscriber: Subscriber,
+    stats: StatsBundle,
+    *,
+    branch: str | None = None,
 ) -> RenderedEmail:
-    """Pick the right template for a (sequence, day) pair and render."""
-    if sequence == "winback":
-        renderer = _WINBACK_RENDERERS.get(day)
-    elif sequence == "bronze":
-        renderer = _BRONZE_RENDERERS.get(day)
-    elif sequence == "reengagement":
-        renderer = _REENGAGE_RENDERERS.get(day)
-    elif sequence == "onboarding":
-        renderer = _ONBOARDING_RENDERERS.get(day)
-        # Day > 60 falls back to the monthly digest so a recurring
-        # cadence beyond what the table explicitly covers still renders.
-        if renderer is None and day >= 60:
-            renderer = _onboard_monthly
-    elif sequence == "dunning":
-        renderer = _DUNNING_RENDERERS.get(day)
-    elif sequence == "paid_at_risk":
-        renderer = _PAID_AT_RISK_RENDERERS.get(day)
-    elif sequence in _ONESHOT_RENDERERS:
-        # One-shot sequences ignore `day` (always one email per trigger).
-        renderer = lambda s, st, _r=_ONESHOT_RENDERERS[sequence]: _r(s, st)  # noqa: E731
-    else:
-        raise ValueError(f"unknown sequence: {sequence!r}")
+    """Pick the right template for a (sequence, day) pair and render.
+
+    Optional ``branch`` parameter wires the branch_evaluator into the
+    delivery path. When set to a non-default value, ``render()`` looks
+    up a branch-specific variant first and falls back to the day-keyed
+    default renderer if no variant exists for that branch. Currently
+    used by:
+
+      - bronze: ``(day, branch)`` tuple in ``_BRONZE_BRANCH_RENDERERS``
+        (e.g. ``(3, "warm")`` -> ``_bronze_day3_warm``)
+      - pre_renewal: ``branch`` string in ``_PRE_RENEWAL_BRANCH_RENDERERS``
+        (``"high"`` -> ``_pre_renewal_high``, ``"low"`` -> ``_pre_renewal_low``)
+
+    Design choice: branch dispatch lives in ``render()`` (not in the
+    worker) so every render path (worker, test fixtures, the future
+    /email-preview command) sees the same routing. The worker keeps a
+    thin shim: it consults ``branch_evaluator.pick_variant`` and passes
+    the resulting label through. A ``None`` / ``"default"`` branch
+    falls through to the existing day-keyed renderer, preserving the
+    pre-branch behaviour byte-for-byte.
+
+    Defense in depth: if the branch label doesn't match any registered
+    variant, we fall through silently to the default renderer rather
+    than raising. No send must ever fail because of a branch typo or
+    a missing variant.
+    """
+    # Resolve branch-aware variant first when a branch was supplied.
+    # Fall through to the default day-keyed renderer if no variant exists
+    # for this (sequence, day, branch) combination.
+    renderer = None
+    if branch and branch != "default":
+        if sequence == "bronze":
+            renderer = _BRONZE_BRANCH_RENDERERS.get((day, branch))
+        elif sequence == "pre_renewal":
+            renderer = _PRE_RENEWAL_BRANCH_RENDERERS.get(branch)
+
+    if renderer is None:
+        if sequence == "winback":
+            renderer = _WINBACK_RENDERERS.get(day)
+        elif sequence == "bronze":
+            renderer = _BRONZE_RENDERERS.get(day)
+        elif sequence == "reengagement":
+            renderer = _REENGAGE_RENDERERS.get(day)
+        elif sequence == "onboarding":
+            renderer = _ONBOARDING_RENDERERS.get(day)
+            # Day > 60 falls back to the monthly digest so a recurring
+            # cadence beyond what the table explicitly covers still renders.
+            if renderer is None and day >= 60:
+                renderer = _onboard_monthly
+        elif sequence == "dunning":
+            renderer = _DUNNING_RENDERERS.get(day)
+        elif sequence == "paid_at_risk":
+            renderer = _PAID_AT_RISK_RENDERERS.get(day)
+        elif sequence in _ONESHOT_RENDERERS:
+            # One-shot sequences ignore `day` (always one email per trigger).
+            renderer = lambda s, st, _r=_ONESHOT_RENDERERS[sequence]: _r(s, st)  # noqa: E731
+        else:
+            raise ValueError(f"unknown sequence: {sequence!r}")
     if renderer is None:
         raise ValueError(f"no template for {sequence!r} day {day}")
     rendered = renderer(subscriber, stats)

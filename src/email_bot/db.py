@@ -51,6 +51,7 @@ class ScheduledSend:
     status: str              # pending | sent | failed | canceled
     error: str | None
     resend_id: str | None = None  # Resend message id, set when worker delivers
+    branch: str | None = None     # branch_evaluator label, stamped on mark_sent
 
 
 # Valid exit reason codes. Keep in sync with template offer variants.
@@ -87,14 +88,22 @@ CREATE TABLE IF NOT EXISTS scheduled_sends (
   sent_at    INTEGER,
   status     TEXT NOT NULL DEFAULT 'pending',
   error      TEXT,
-  resend_id  TEXT
+  resend_id  TEXT,
+  branch     TEXT
 );
 """
 
-# Migrations for DBs that predate the resend_id column. SQLite errors if
-# the column already exists; the open() helper swallows that case.
+# Migrations for DBs that predate later-added columns. SQLite errors if
+# a column already exists; the open() helper swallows that case so each
+# ALTER is idempotent.
+#
+# branch: added 2026-05-25 with the branch_evaluator wire-up. Captures
+# the variant label the evaluator picked at send time (e.g. "hot",
+# "warm", "high", "low"). Stamped on mark_sent so analytics can split
+# open/click/conversion rates by variant without a separate join.
 _SENDS_MIGRATIONS = (
     "ALTER TABLE scheduled_sends ADD COLUMN resend_id TEXT",
+    "ALTER TABLE scheduled_sends ADD COLUMN branch TEXT",
 )
 
 _SENDS_DUE_INDEX = """
@@ -384,7 +393,7 @@ class EmailDB:
         now = now if now is not None else int(time.time())
         async with self._conn.execute(
             "SELECT id, email, sequence, day, due_at, sent_at, status, "
-            "       error, resend_id "
+            "       error, resend_id, branch "
             "FROM scheduled_sends "
             "WHERE status = 'pending' AND due_at <= ? "
             "ORDER BY due_at ASC "
@@ -397,26 +406,40 @@ class EmailDB:
                 id=r[0], email=r[1], sequence=r[2], day=r[3],
                 due_at=r[4], sent_at=r[5], status=r[6], error=r[7],
                 resend_id=r[8],
+                branch=(r[9] if len(r) > 9 else None),
             )
             for r in rows
         ]
 
     async def mark_sent(
-        self, send_id: int, resend_id: str | None = None,
+        self,
+        send_id: int,
+        resend_id: str | None = None,
+        branch: str | None = None,
     ) -> None:
         """Mark a send as delivered. ``resend_id`` is the message id Resend
         returns from POST /emails; we persist it so webhook events
         (opened/clicked/bounced) can be joined back to the (sequence, day)
         tuple by the analytics layer.
+
+        ``branch`` is the variant label the branch_evaluator picked at
+        send time (e.g. "hot", "warm", "high"). Stamped here rather than
+        at scheduling time because branching is a send-time decision: a
+        recipient might transition tiers between scheduling and delivery,
+        and we want the label that drove the actual render to land in
+        the row. COALESCE preserves an already-stamped value if mark_sent
+        is called twice for any reason.
         """
         assert self._conn is not None
         clean_id = (resend_id or "").strip() or None
+        clean_branch = (branch or "").strip() or None
         await self._conn.execute(
             "UPDATE scheduled_sends "
             "SET status='sent', sent_at=?, error=NULL, "
-            "    resend_id=COALESCE(?, resend_id) "
+            "    resend_id=COALESCE(?, resend_id), "
+            "    branch=COALESCE(?, branch) "
             "WHERE id = ?",
-            (int(time.time()), clean_id, send_id),
+            (int(time.time()), clean_id, clean_branch, send_id),
         )
         await self._conn.commit()
 
@@ -509,3 +532,25 @@ class EmailDB:
         ) as cursor:
             rows = await cursor.fetchall()
         return {r[0]: int(r[1]) for r in rows}
+
+    async def last_sent_at(self, email: str) -> int | None:
+        """Most recent ``sent_at`` for any successful send to this address.
+
+        Used by the per-recipient throttle gate (ProtectedSender) to
+        refuse a second message inside the cool-down window. Returns
+        None if we have no prior 'sent' row for this address. Case-
+        insensitive on email.
+        """
+        assert self._conn is not None
+        if not email:
+            return None
+        async with self._conn.execute(
+            "SELECT MAX(sent_at) FROM scheduled_sends "
+            "WHERE LOWER(email) = LOWER(?) AND status = 'sent' "
+            "  AND sent_at IS NOT NULL",
+            (email,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None or row[0] is None:
+            return None
+        return int(row[0])

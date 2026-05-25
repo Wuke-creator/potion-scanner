@@ -16,10 +16,16 @@ import asyncio
 import dataclasses
 import logging
 
+from src.email_bot.branch_evaluator import (
+    BRANCH_DEFAULT,
+    EvalContext,
+    pick_variant,
+)
 from src.email_bot.db import EmailDB, Subscriber
 from src.email_bot.events_db import EmailEventsDB
 from src.email_bot.sender import ResendClient, SendResult
 from src.email_bot.stats import gather_stats
+from src.email_bot.suppression_metrics import SuppressionMetrics
 from src.email_bot.templates import render
 from src.whop_api import create_one_time_promo
 
@@ -32,6 +38,14 @@ logger = logging.getLogger(__name__)
 _BRONZE_PROMO_BASE_CODE = "BRONZE30"
 _BRONZE_PROMO_AMOUNT_OFF = 30.0
 _BRONZE_PROMO_DURATION_MONTHS = 1   # discount applies to the first Elite cycle
+
+# Resend's per-recipient unsubscribe macro. Resend substitutes this at
+# send time with a token-stamped HTTPS URL unique to (audience,
+# recipient). Reusing the same macro the email body already carries
+# means the RFC 8058 one-click header points at the exact same endpoint,
+# which is the only way Gmail / Yahoo show the native one-click button
+# without flagging the message.
+_RESEND_UNSUBSCRIBE_MACRO = "{{{RESEND_UNSUBSCRIBE_URL}}}"
 
 
 class EmailWorker:
@@ -49,6 +63,8 @@ class EmailWorker:
         whop_company_id: str = "",
         bronze_promo_ttl_days: int = 14,
         events_db: EmailEventsDB | None = None,
+        branch_evaluator_ctx: EvalContext | None = None,
+        suppression_metrics: SuppressionMetrics | None = None,
     ):
         """``send_rate_per_sec`` throttles inter-send delays inside a cycle
         so we stay under Resend's per-second cap. Resend's transactional
@@ -77,6 +93,18 @@ class EmailWorker:
         # at startup; unit tests can pass None (or a stub) to skip the
         # check.
         self._events_db = events_db
+        # When set, every send consults branch_evaluator for a variant
+        # label and forwards it to ``render(..., branch=...)``. When None
+        # (the default and current production state until main.py wires a
+        # context), the worker behaves byte-for-byte as it did before:
+        # day-keyed default renderers only, no variant routing.
+        self._branch_ctx = branch_evaluator_ctx
+        # Optional suppression-rate monitor. Records every delivery
+        # attempt + suppression at the last-mile gate so an elevated
+        # rolling 1-hour rate (default >5%) fires a WARNING and an
+        # optional Discord webhook alert. ``None`` skips all
+        # instrumentation; delivery behaviour is unchanged.
+        self._suppression_metrics = suppression_metrics
         self._task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
 
@@ -214,7 +242,34 @@ class EmailWorker:
         # than reusing a spent one.
         return dataclasses.replace(sub, rejoin_url=promo_url)
 
+    def _record_suppression_metric(self, reason: str) -> None:
+        """Best-effort suppression counter increment. Wrapped so the call
+        sites in _deliver_one don't have to repeat the None-check and
+        the exception-swallowing pattern. Metric failures must never
+        propagate -- they're observability, not control flow."""
+        if self._suppression_metrics is None:
+            return
+        try:
+            self._suppression_metrics.record_suppression(reason)
+        except Exception:
+            logger.exception(
+                "Suppression metrics record crashed (non-fatal)",
+            )
+
     async def _deliver_one(self, send, stats) -> None:
+        # Every reach to deliver counts as an attempt for the metrics
+        # window, even if the suppression gate catches it. Recording the
+        # attempt FIRST and the suppression second is how the rate
+        # arithmetic stays correct: a 100%-suppressed window means every
+        # attempt got blocked, not that nothing was attempted.
+        if self._suppression_metrics is not None:
+            try:
+                self._suppression_metrics.record_attempt()
+            except Exception:
+                logger.exception(
+                    "Suppression metrics record_attempt crashed (non-fatal)",
+                )
+
         # Last-mile suppression gate. Defense in depth against the race
         # between a bounce / complaint / unsubscribe event landing and
         # the webhook handler's ``cancel_all_pending`` reaching this
@@ -237,6 +292,7 @@ class EmailWorker:
                 await self._db.mark_canceled(
                     send.id, "suppression check error",
                 )
+                self._record_suppression_metric("suppression check error")
                 return
             if suppressed:
                 logger.info(
@@ -246,6 +302,7 @@ class EmailWorker:
                 await self._db.mark_canceled(
                     send.id, f"suppressed: {reason}",
                 )
+                self._record_suppression_metric(reason or "unknown")
                 return
 
         sub = await self._db.get_subscriber(send.email)
@@ -265,12 +322,36 @@ class EmailWorker:
         if send.sequence == "bronze" and send.day == 5:
             render_sub = await self._bronze_day5_subscriber(sub)
 
+        # Branch evaluator: pick the variant label for this (sequence,
+        # day, recipient). Falls through to "default" on any failure,
+        # unknown sequence, missing data, or when no EvalContext was
+        # wired in -- which the render() dispatcher treats as "use the
+        # day-keyed default renderer". No send must ever fail because
+        # of a branch lookup, hence the broad try/except.
+        branch: str = BRANCH_DEFAULT
+        if self._branch_ctx is not None:
+            try:
+                branch = await pick_variant(
+                    sub.email,
+                    send.sequence,
+                    send.day,
+                    ctx=self._branch_ctx,
+                )
+            except Exception:
+                logger.exception(
+                    "Branch evaluator crashed for send id=%d seq=%s day=%d; "
+                    "falling back to default renderer",
+                    send.id, send.sequence, send.day,
+                )
+                branch = BRANCH_DEFAULT
+
         try:
             email = render(
                 sequence=send.sequence,
                 day=send.day,
                 subscriber=render_sub,
                 stats=stats,
+                branch=branch if branch != BRANCH_DEFAULT else None,
             )
         except Exception as e:
             logger.exception("Template render failed for send id=%d", send.id)
@@ -283,16 +364,34 @@ class EmailWorker:
             html=email.html,
             text=email.text,
             from_name=email.from_name,
+            unsubscribe_url=_RESEND_UNSUBSCRIBE_MACRO,
         )
         if result.ok:
-            await self._db.mark_sent(send.id, resend_id=result.resend_id)
+            await self._db.mark_sent(
+                send.id,
+                resend_id=result.resend_id,
+                branch=branch if branch != BRANCH_DEFAULT else None,
+            )
             logger.info(
-                "Sent %s day %d to %s (resend_id=%s)",
-                send.sequence, send.day, sub.email, result.resend_id,
+                "Sent %s day %d to %s (resend_id=%s branch=%s)",
+                send.sequence, send.day, sub.email, result.resend_id, branch,
             )
         else:
-            await self._db.mark_failed(send.id, result.error or "unknown")
-            logger.warning(
-                "Failed %s day %d to %s: %s",
-                send.sequence, send.day, sub.email, result.error,
-            )
+            err = result.error or "unknown"
+            # Refusals from the ProtectedSender gate (suppressed /
+            # throttled) are deliberate non-sends, not delivery
+            # failures. Mark them canceled so the dashboards don't
+            # treat them as Resend errors.
+            if err == "throttled" or err.startswith("suppressed"):
+                await self._db.mark_canceled(send.id, err)
+                self._record_suppression_metric(err)
+                logger.warning(
+                    "Refused %s day %d to %s: %s",
+                    send.sequence, send.day, sub.email, err,
+                )
+            else:
+                await self._db.mark_failed(send.id, err)
+                logger.warning(
+                    "Failed %s day %d to %s: %s",
+                    send.sequence, send.day, sub.email, err,
+                )
