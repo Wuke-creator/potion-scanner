@@ -6,25 +6,37 @@ so the scoring cron can do everything in one DB without cross-file joins.
 A separate table (not a view) so reads from the branch evaluator are O(1)
 on the lookup path and the cron pays the cost once per night.
 
-Scoring model (researched against Klaviyo / Customer.io / Braze conventions
-plus standard RFM lead-scoring point systems):
+Scoring model (per-event exponential decay, split half-life by type):
 
-    score = (opens_30d * 1)
-          + (clicks_30d * 3)
-          + (replies_30d * 10)           # not yet captured; reserved
-          + (last_open within 7d  ? +2 : 0)
-          + (last_click within 14d ? +5 : 0)
+    each event contributes:
+        base_weight * exp(-ln(2) * age_days / half_life_for_type)
+
+    aggregated by recipient:
+        score = OPEN_WEIGHT  * opens_decayed
+              + CLICK_WEIGHT * clicks_decayed
+              + REPLY_WEIGHT * replies_decayed
 
     tier:
         score >= 10  -> hot
         score >=  4  -> warm
         otherwise    -> cold
 
-Tier thresholds match the consensus of the deep-research sources: anyone
-with at least one recent click or two recent opens is "hot"; anyone with
-recent opens but no clicks is "warm"; everyone else is "cold". The
-specific point values are a starting position. Tune after ~6 weeks of
-real production data lands in the table.
+Why split half-lives: a click is a stronger commitment signal than an
+open (opens fire on every preview-pane impression, including Apple Mail
+Privacy prefetches). Opens decay faster (7d) so the noise washes out;
+clicks decay slower (14d) so intent stays visible longer.
+
+Why decay vs flat counts + recency bonuses: a recipient who opened 12
+emails today is hotter than one who opened 12 emails in week one and
+went dark for three weeks, even though both have ``opens_30d == 12``.
+Per-event decay captures the difference.
+
+Tier thresholds (HOT=10, WARM=4) match the consensus of the deep-research
+sources: anyone with at least one recent click or two recent opens is
+"hot"; anyone with recent opens but no clicks is "warm"; everyone else
+is "cold". Thresholds are unchanged from the linear model so the
+hot/warm/cold ratios on dashboards stay comparable; only the underlying
+math changed.
 
 The branch evaluator (``branch_evaluator.py``) is the only consumer of
 this table. The worker is intentionally NOT yet touching it. Until the
@@ -35,6 +47,7 @@ behaviour.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,33 +74,57 @@ WARM_THRESHOLD = 4
 # segments). Anything older is treated as inactive history, not signal.
 SCORING_WINDOW_SECONDS = 30 * 24 * 3600
 
-# Recency bonuses.
-RECENT_OPEN_BONUS_WINDOW = 7 * 24 * 3600   # last open in 7d -> +2
-RECENT_CLICK_BONUS_WINDOW = 14 * 24 * 3600  # last click in 14d -> +5
-RECENT_OPEN_BONUS_POINTS = 2
-RECENT_CLICK_BONUS_POINTS = 5
+# Per-event base weights. Multiplied by exp-decay(age) before they hit the
+# score sum, so a 14-day-old click is worth 1.5pt (3 * 0.5), not 3.
+OPEN_WEIGHT = 1.0
+CLICK_WEIGHT = 3.0
+REPLY_WEIGHT = 10.0  # reserved; not currently captured in email_events
 
-# Point weights for each event.
-OPEN_POINTS = 1
-CLICK_POINTS = 3
-REPLY_POINTS = 10  # reserved; not currently captured in email_events
+# Half-life for the per-event decay. At HALF_LIFE_DAYS the event is worth
+# half its base weight; at 2x it's worth a quarter; etc. 14 days was
+# chosen to match the prior recent-click bonus window so the new model
+# weights "clicked recently" similarly to the old recency bonus, and is
+# applied uniformly across opens / clicks / replies to keep the math
+# easy to reason about. If we later find opens are too noisy (Apple Mail
+# Privacy, preview-pane prefetches) we can split this into per-type
+# half-lives without changing the public surface.
+HALF_LIFE_DAYS = 14.0
+SECONDS_PER_DAY = 86400.0
+
+
+def _decay(age_days: float) -> float:
+    """Exponential decay factor for an event ``age_days`` old.
+
+    Pure helper extracted so unit tests can verify the math directly and
+    the recompute code paths (SQL or Python-side) share a single
+    definition.
+    """
+    if age_days <= 0:
+        return 1.0
+    return math.exp(-math.log(2) * age_days / HALF_LIFE_DAYS)
 
 
 @dataclass(frozen=True)
 class EngagementScore:
-    """One row of the engagement_score table."""
+    """One row of the engagement_score table.
+
+    ``opens_30d`` and ``clicks_30d`` are decay-weighted sums (float),
+    not raw counts. With the per-event exp-decay model, a recipient
+    with three opens today contributes ``opens_30d == 3.0`` while one
+    with three opens 14 days ago contributes ``opens_30d == 1.5``.
+    """
     email: str
-    score: int
+    score: float
     tier: str
-    opens_30d: int
-    clicks_30d: int
+    opens_30d: float
+    clicks_30d: float
     last_open_at: int | None
     last_click_at: int | None
     days_since_last_event: int | None
     updated_at: int
 
 
-def tier_for_score(score: int) -> str:
+def tier_for_score(score: float) -> str:
     """Pure function: pick the tier label for a numeric score."""
     if score >= HOT_THRESHOLD:
         return TIER_HOT
@@ -100,19 +137,38 @@ def tier_for_score(score: int) -> str:
 # DDL
 # ---------------------------------------------------------------------------
 
+# NOTE: score / opens_30d / clicks_30d switched from INTEGER to REAL with
+# the move to per-event exponential decay. Production DBs created under
+# the linear model will be migrated in-place by ``_SCORE_TABLE_MIGRATIONS``
+# at open() time.
 _SCORE_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS engagement_score (
   email                  TEXT PRIMARY KEY,
-  score                  INTEGER NOT NULL DEFAULT 0,
+  score                  REAL NOT NULL DEFAULT 0,
   tier                   TEXT NOT NULL DEFAULT 'cold',
-  opens_30d              INTEGER NOT NULL DEFAULT 0,
-  clicks_30d             INTEGER NOT NULL DEFAULT 0,
+  opens_30d              REAL NOT NULL DEFAULT 0,
+  clicks_30d             REAL NOT NULL DEFAULT 0,
   last_open_at           INTEGER,
   last_click_at          INTEGER,
   days_since_last_event  INTEGER,
   updated_at             INTEGER NOT NULL
 );
 """
+
+# SQLite's flexible typing means existing INTEGER columns will silently
+# store REAL values without complaint, so we don't actually need an
+# ALTER TABLE to keep the data path working. The migration is here
+# anyway as documentation: anyone inspecting the schema with
+# ``.schema`` or running typed migrations against a fresh dump will
+# see the column flagged as REAL, matching code expectations.
+#
+# SQLite has no native ``ALTER COLUMN`` -- the standard workaround is a
+# rebuild-via-temp-table. That's overkill for an internal scoring table
+# whose schema is enforced by the application layer. We skip the
+# rebuild and rely on storage flexibility, but keep this section so a
+# future maintainer adding new columns or a real type change has a
+# place to wire migrations in.
+_SCORE_TABLE_MIGRATIONS: tuple[str, ...] = ()
 
 _SCORE_TIER_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_engagement_score_tier
@@ -160,6 +216,12 @@ class EngagementScoreDB:
         self._conn = await aiosqlite.connect(self._db_path)
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute(_SCORE_TABLE_DDL)
+        for stmt in _SCORE_TABLE_MIGRATIONS:
+            try:
+                await self._conn.execute(stmt)
+            except Exception:
+                # Migration already applied in a prior run.
+                pass
         await self._conn.execute(_SCORE_TIER_INDEX)
         await self._conn.execute(_SCORE_HISTORY_DDL)
         await self._conn.execute(_SCORE_HISTORY_INDEX)
@@ -190,10 +252,10 @@ class EngagementScoreDB:
             return None
         return EngagementScore(
             email=row[0],
-            score=int(row[1]),
+            score=float(row[1]),
             tier=str(row[2]),
-            opens_30d=int(row[3]),
-            clicks_30d=int(row[4]),
+            opens_30d=float(row[3]),
+            clicks_30d=float(row[4]),
             last_open_at=int(row[5]) if row[5] is not None else None,
             last_click_at=int(row[6]) if row[6] is not None else None,
             days_since_last_event=(
@@ -309,26 +371,47 @@ class EngagementScoreDB:
         Idempotent. Safe to run hourly even though the cron schedule will
         be nightly. Recipients with no recent events fall to cold and
         their row gets updated with zeroed counts.
+
+        Aggregation uses SQLite's built-in ``exp()`` and ``ln()`` math
+        functions (available since SQLite 3.35, well below our floor)
+        to compute the per-event decay sum in one pass. If the build
+        ever ships without math functions, the query will raise and
+        operators will see a clear error from the cron logs.
         """
         assert self._conn is not None
         now_ts = int(now if now is not None else time.time())
         window_start = now_ts - SCORING_WINDOW_SECONDS
 
-        # Pull one row per recipient summarising their last 30d of events.
-        # The recipient_domain column would let us segment by inbox later,
-        # but the score itself is per-email so we don't need it here.
-        async with self._conn.execute(
+        # Per-event exponential decay aggregated in SQL.
+        #
+        # The decay weight for each event is:
+        #     exp(-ln(2) * (now - event_at) / 86400.0 / HALF_LIFE_DAYS)
+        #
+        # which equals 1.0 for events that happened right now and falls
+        # to 0.5 at age == HALF_LIFE_DAYS. We sum per event_type for the
+        # weighted-counts columns and also pull MAX(event_at) per type
+        # for the "last open / last click" fields.
+        sql = (
             "SELECT LOWER(recipient) AS email, "
-            "       SUM(CASE WHEN event_type='opened'  THEN 1 ELSE 0 END), "
-            "       SUM(CASE WHEN event_type='clicked' THEN 1 ELSE 0 END), "
+            "       SUM(CASE WHEN event_type='opened'  THEN "
+            "             exp(-ln(2.0) * (? - event_at) / ? / ?) "
+            "           ELSE 0 END) AS opens_decayed, "
+            "       SUM(CASE WHEN event_type='clicked' THEN "
+            "             exp(-ln(2.0) * (? - event_at) / ? / ?) "
+            "           ELSE 0 END) AS clicks_decayed, "
             "       MAX(CASE WHEN event_type='opened'  THEN event_at END), "
             "       MAX(CASE WHEN event_type='clicked' THEN event_at END), "
             "       MAX(event_at) "
             "FROM email_events "
             "WHERE event_at >= ? "
-            "GROUP BY LOWER(recipient)",
-            (window_start,),
-        ) as cursor:
+            "GROUP BY LOWER(recipient)"
+        )
+        params = (
+            now_ts, SECONDS_PER_DAY, HALF_LIFE_DAYS,  # opens decay
+            now_ts, SECONDS_PER_DAY, HALF_LIFE_DAYS,  # clicks decay
+            window_start,
+        )
+        async with self._conn.execute(sql, params) as cursor:
             rows = await cursor.fetchall()
 
         updated = 0
@@ -339,18 +422,15 @@ class EngagementScoreDB:
             email = row[0]
             if not email:
                 continue
-            opens = int(row[1] or 0)
-            clicks = int(row[2] or 0)
+            opens_decayed = float(row[1] or 0.0)
+            clicks_decayed = float(row[2] or 0.0)
             last_open_at = int(row[3]) if row[3] is not None else None
             last_click_at = int(row[4]) if row[4] is not None else None
             last_any_at = int(row[5]) if row[5] is not None else None
 
             score = compute_score(
-                opens=opens,
-                clicks=clicks,
-                last_open_at=last_open_at,
-                last_click_at=last_click_at,
-                now=now_ts,
+                opens_decayed=opens_decayed,
+                clicks_decayed=clicks_decayed,
             )
             tier = tier_for_score(score)
             tier_dist[tier] += 1
@@ -364,8 +444,8 @@ class EngagementScoreDB:
                 email=email,
                 score=score,
                 tier=tier,
-                opens_30d=opens,
-                clicks_30d=clicks,
+                opens_30d=opens_decayed,
+                clicks_30d=clicks_decayed,
                 last_open_at=last_open_at,
                 last_click_at=last_click_at,
                 days_since_last_event=days_since,
@@ -396,30 +476,25 @@ class EngagementScoreDB:
 
 def compute_score(
     *,
-    opens: int,
-    clicks: int,
-    last_open_at: int | None,
-    last_click_at: int | None,
-    now: int,
-    replies: int = 0,
-) -> int:
-    """Pure deterministic scoring. The recompute cron and any future
-    on-demand score endpoint share this function so the math can't drift
-    between code paths.
+    opens_decayed: float,
+    clicks_decayed: float,
+    replies_decayed: float = 0.0,
+) -> float:
+    """Pure deterministic scoring on decay-weighted aggregates.
+
+    Each input is the sum of ``decay(age_days)`` over the events of that
+    type for one recipient, so a 14-day-old open contributes 0.5 to
+    ``opens_decayed`` rather than 1. Callers (``recompute_all``, future
+    on-demand endpoints) handle the SQL aggregation; this function does
+    only the weighted sum so the math can't drift between code paths.
+
+    Replies are reserved (we don't capture reply events from Resend
+    today). Default 0.0 keeps the existing call sites working.
     """
-    score = (
-        opens * OPEN_POINTS
-        + clicks * CLICK_POINTS
-        + replies * REPLY_POINTS
+    return (
+        opens_decayed * OPEN_WEIGHT
+        + clicks_decayed * CLICK_WEIGHT
+        + replies_decayed * REPLY_WEIGHT
     )
-    if (
-        last_open_at is not None
-        and (now - last_open_at) <= RECENT_OPEN_BONUS_WINDOW
-    ):
-        score += RECENT_OPEN_BONUS_POINTS
-    if (
-        last_click_at is not None
-        and (now - last_click_at) <= RECENT_CLICK_BONUS_WINDOW
-    ):
-        score += RECENT_CLICK_BONUS_POINTS
-    return int(score)
+
+

@@ -76,6 +76,13 @@ CREATE INDEX IF NOT EXISTS idx_events_recipient
     ON email_events(recipient, event_type);
 """
 
+# Suppression-policy knobs for soft bounces. Industry standard is to retry
+# soft bounces (transient: full mailbox, temporary DNS, greylisting) a few
+# times before giving up. Hard bounces and complaints stay first-strike;
+# only soft bounces get the rolling-window grace.
+SOFT_BOUNCE_THRESHOLD_COUNT = 3
+SOFT_BOUNCE_WINDOW_SECONDS = 14 * 24 * 3600
+
 # Unsubscribe ledger. Created here so the suppression gate
 # (``is_suppressed_recipient``) can query it without crashing on a
 # fresh DB. Production already has this table; ``IF NOT EXISTS`` makes
@@ -434,12 +441,20 @@ class EmailEventsDB:
         recipient right now?
 
         Returns ``(True, reason)`` if any of:
-          - the recipient has any prior ``bounced`` event recorded
-            (hard OR soft -- per the 2026-05-19 policy, one bounce is
-            enough forever)
           - the recipient has any prior ``complained`` event recorded
+            (first strike, permanent)
+          - the recipient has any prior hard ``bounced`` event recorded
+            (first strike, permanent)
+          - the recipient has a bounce with an unknown ``bounce_type``
+            (treated as hard for safety; we'd rather skip one borderline
+            recipient than send into a black hole)
+          - the recipient has at least
+            ``SOFT_BOUNCE_THRESHOLD_COUNT`` (3) soft bounces in the
+            trailing ``SOFT_BOUNCE_WINDOW_SECONDS`` (14 days) window.
+            Single transient bounces (greylisting, temporary mailbox
+            full, intermittent DNS) are tolerated and retried.
           - the recipient is in ``email_unsubscribes`` (List-Unsubscribe
-            click or manual operator action)
+            click or manual operator action; first strike, permanent)
 
         Returns ``(False, None)`` otherwise.
 
@@ -449,7 +464,7 @@ class EmailEventsDB:
         and ``cancel_all_pending`` reaching the in-flight row. The check
         is case-insensitive on email.
 
-        Cheap: both queries are O(log n) on the recipient index already
+        Cheap: queries are O(log n) on the recipient index already
         present on ``email_events`` and the UNIQUE constraint on
         ``email_unsubscribes.recipient``.
         """
@@ -460,21 +475,41 @@ class EmailEventsDB:
         if not e:
             return False, None
 
-        # Bounce / complaint events.
+        # First-strike checks: complaints and hard / unknown bounces.
+        # We scan recent suppressive events ordered by time and stop at
+        # the first first-strike hit. Soft bounces require an extra
+        # count check, so we just track whether any soft bounce exists
+        # and fall through to the count query if none of the harder
+        # signals triggered.
         async with self._conn.execute(
             "SELECT event_type, bounce_type FROM email_events "
             "WHERE LOWER(recipient) = LOWER(?) "
             "  AND event_type IN ('bounced', 'complained') "
-            "ORDER BY event_at ASC LIMIT 1",
+            "ORDER BY event_at ASC",
             (e,),
         ) as cursor:
-            row = await cursor.fetchone()
-        if row is not None:
-            event_type = str(row[0])
-            if event_type == "complained":
-                return True, "complaint"
-            bounce_type = (row[1] or "unknown").lower()
-            return True, f"{bounce_type} bounce"
+            async for row in cursor:
+                event_type = str(row[0])
+                if event_type == "complained":
+                    return True, "complaint"
+                # event_type == 'bounced'
+                bounce_type = (row[1] or "").lower()
+                if bounce_type == "hard":
+                    return True, "hard bounce"
+                if bounce_type == "soft":
+                    # Don't decide here; soft bounces only suppress at
+                    # >= threshold within the rolling window. The
+                    # dedicated count query below handles the rule.
+                    continue
+                # Anything else (None / "" / unrecognized): be
+                # conservative and treat as hard. Documented behaviour.
+                return True, "unknown bounce"
+
+        # Soft bounces: rolling-window N-strikes rule.
+        since = int(time.time()) - SOFT_BOUNCE_WINDOW_SECONDS
+        soft_count = await self.soft_bounce_count(e, since_epoch=since)
+        if soft_count >= SOFT_BOUNCE_THRESHOLD_COUNT:
+            return True, "soft bounce"
 
         # List-Unsubscribe / manual unsub.
         async with self._conn.execute(
@@ -487,6 +522,48 @@ class EmailEventsDB:
             return True, "unsubscribed"
 
         return False, None
+
+    async def events_in_window(
+        self, *, since: int, until: int,
+    ) -> dict[str, int]:
+        """Event counters scoped to a trailing time window. Used by the
+        /engagement-snapshot ops command. Returns opens, clicks, bounces
+        split by soft / hard, and complaints, all matched by event_at.
+        """
+        assert self._conn is not None
+        out = {
+            "opened": 0,
+            "clicked": 0,
+            "bounced": 0,
+            "complained": 0,
+            "hard_bounced": 0,
+            "soft_bounced": 0,
+        }
+        async with self._conn.execute(
+            "SELECT event_type, COUNT(*) FROM email_events "
+            "WHERE event_at >= ? AND event_at <= ? "
+            "GROUP BY event_type",
+            (int(since), int(until)),
+        ) as cursor:
+            async for row in cursor:
+                if row[0] in out:
+                    out[row[0]] = int(row[1])
+        async with self._conn.execute(
+            "SELECT COALESCE(LOWER(bounce_type), ''), COUNT(*) "
+            "FROM email_events "
+            "WHERE event_type = 'bounced' "
+            "  AND event_at >= ? AND event_at <= ? "
+            "GROUP BY COALESCE(LOWER(bounce_type), '')",
+            (int(since), int(until)),
+        ) as cursor:
+            async for row in cursor:
+                bt = row[0]
+                n = int(row[1])
+                if bt == "hard":
+                    out["hard_bounced"] = n
+                elif bt == "soft":
+                    out["soft_bounced"] = n
+        return out
 
     async def cleanup_older_than(self, seconds: int) -> int:
         """Drop event rows older than `seconds` ago. Returns rowcount.

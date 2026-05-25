@@ -19,7 +19,11 @@ import pytest
 import pytest_asyncio
 
 from src.email_bot.db import EmailDB, ScheduledSend, Subscriber
-from src.email_bot.events_db import EmailEventsDB
+from src.email_bot.events_db import (
+    SOFT_BOUNCE_THRESHOLD_COUNT,
+    SOFT_BOUNCE_WINDOW_SECONDS,
+    EmailEventsDB,
+)
 from src.email_bot.worker import EmailWorker
 
 
@@ -104,23 +108,89 @@ class TestIsSuppressedRecipient:
         assert ok is True
         assert "hard bounce" in reason
 
-    async def test_soft_bounce_suppresses(self, events_db):
+    async def test_single_soft_bounce_does_not_suppress(self, events_db):
+        # Policy: soft bounces are transient (greylisting, temporary
+        # mailbox full). Only suppress after >= 3 in 14 days.
         await _record(
             events_db, recipient="soft@x.com",
             event_type="bounced", bounce_type="soft",
         )
         ok, reason = await events_db.is_suppressed_recipient("soft@x.com")
+        assert ok is False
+        assert reason is None
+
+    async def test_two_soft_bounces_in_13_days_does_not_suppress(self, events_db):
+        now = int(time.time())
+        # Two soft bounces inside the 14-day window but below threshold.
+        await _record(
+            events_db, recipient="soft@x.com",
+            event_type="bounced", bounce_type="soft",
+            event_at=now - 13 * 86400, resend_id="re_soft_1",
+        )
+        await _record(
+            events_db, recipient="soft@x.com",
+            event_type="bounced", bounce_type="soft",
+            event_at=now - 1 * 86400, resend_id="re_soft_2",
+        )
+        ok, _ = await events_db.is_suppressed_recipient("soft@x.com")
+        assert ok is False
+
+    async def test_three_soft_bounces_in_14_days_suppresses(self, events_db):
+        now = int(time.time())
+        for i in range(SOFT_BOUNCE_THRESHOLD_COUNT):
+            await _record(
+                events_db, recipient="soft@x.com",
+                event_type="bounced", bounce_type="soft",
+                event_at=now - (i + 1) * 86400,
+                resend_id=f"re_soft_{i}",
+            )
+        ok, reason = await events_db.is_suppressed_recipient("soft@x.com")
         assert ok is True
         assert "soft bounce" in reason
 
+    async def test_old_soft_bounces_outside_window_do_not_suppress(
+        self, events_db,
+    ):
+        now = int(time.time())
+        # Five soft bounces, all just outside the 14-day window.
+        for i in range(5):
+            await _record(
+                events_db, recipient="ancient@x.com",
+                event_type="bounced", bounce_type="soft",
+                event_at=now - SOFT_BOUNCE_WINDOW_SECONDS - (i + 1) * 86400,
+                resend_id=f"re_old_soft_{i}",
+            )
+        ok, reason = await events_db.is_suppressed_recipient("ancient@x.com")
+        assert ok is False
+        assert reason is None
+
     async def test_unknown_bounce_type_suppresses(self, events_db):
+        # Treated as hard (conservative). One unknown bounce = suppress.
         await _record(
             events_db, recipient="weird@x.com",
             event_type="bounced", bounce_type=None,
         )
         ok, reason = await events_db.is_suppressed_recipient("weird@x.com")
         assert ok is True
-        assert "bounce" in reason
+        assert "unknown bounce" in reason
+
+    async def test_one_soft_and_one_hard_suppresses(self, events_db):
+        # Mixed: hard bounce is first-strike, so the gate fires
+        # regardless of how many soft bounces sit alongside it.
+        now = int(time.time())
+        await _record(
+            events_db, recipient="mixed@x.com",
+            event_type="bounced", bounce_type="soft",
+            event_at=now - 1 * 86400, resend_id="re_mixed_soft",
+        )
+        await _record(
+            events_db, recipient="mixed@x.com",
+            event_type="bounced", bounce_type="hard",
+            event_at=now, resend_id="re_mixed_hard",
+        )
+        ok, reason = await events_db.is_suppressed_recipient("mixed@x.com")
+        assert ok is True
+        assert "hard bounce" in reason
 
     async def test_complaint_suppresses(self, events_db):
         await _record(
