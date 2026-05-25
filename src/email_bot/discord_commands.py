@@ -33,6 +33,7 @@ from src.automations.feature_launch import FeatureLaunchBroadcaster
 from src.automations.whop_email_sync import WhopEmailSync
 from src.email_bot.analytics import EmailAnalytics
 from src.email_bot.db import EmailDB, Subscriber
+from src.email_bot.engagement_scoring import EngagementScoreDB
 from src.email_bot.events_db import EmailEventsDB
 from src.email_bot.sender import ResendClient
 from src.email_bot.webhook import normalize_reason
@@ -214,6 +215,64 @@ def _render_broadcast_stats(
     return "\n".join(lines)
 
 
+def _render_engagement_snapshot(
+    counts: dict, top: list[dict], transitions: list[dict],
+) -> str:
+    """Format the /engagement-snapshot response.
+
+    Pulled out of the command so tests can assert on the rendered
+    string without spinning up a Discord interaction. Counts come
+    in as {hot, warm, cold}; top / transitions are lists of
+    {email, score, tier, recorded_at/updated_at} dicts.
+    """
+    hot = int(counts.get("hot", 0))
+    warm = int(counts.get("warm", 0))
+    cold = int(counts.get("cold", 0))
+    total = hot + warm + cold
+
+    def _pct(n: int) -> str:
+        return f"{(n / total * 100):.1f}%" if total else "n/a"
+
+    lines = [
+        "**Engagement snapshot**",
+        f"Total scored recipients: {total:,}",
+        f"  Hot:  {hot:>6,}    ({_pct(hot)})",
+        f"  Warm: {warm:>6,}    ({_pct(warm)})",
+        f"  Cold: {cold:>6,}    ({_pct(cold)})",
+    ]
+
+    if top:
+        lines.append("")
+        lines.append("**Top 5 most-engaged recipients:**")
+        for i, row in enumerate(top[:5], start=1):
+            lines.append(
+                f"  {i}. {row['email']}  "
+                f"(score {row['score']:.1f}, {row['tier']})"
+            )
+    else:
+        lines.append("")
+        lines.append("**Top 5 most-engaged recipients:** (none)")
+
+    if transitions:
+        lines.append("")
+        lines.append("**Last 5 tier transitions:**")
+        for row in transitions[:5]:
+            ts = int(row.get("recorded_at", 0))
+            when = (
+                time.strftime("%Y-%m-%d %H:%M", time.gmtime(ts))
+                if ts else "n/a"
+            )
+            lines.append(
+                f"  - {row['email']}  -> {row['tier']}  "
+                f"(score {row['score']:.1f}, {when} UTC)"
+            )
+    else:
+        lines.append("")
+        lines.append("**Last 5 tier transitions:** (none)")
+
+    return "\n".join(lines)
+
+
 class EmailSlashCommands:
     """Admin-only email + automations operations as Discord slash commands."""
 
@@ -228,6 +287,7 @@ class EmailSlashCommands:
         events_db: EmailEventsDB | None = None,
         resend_client: ResendClient | None = None,
         analytics: EmailAnalytics | None = None,
+        engagement_score_db: EngagementScoreDB | None = None,
     ):
         self._db = db
         self._guild_id = guild_id
@@ -238,6 +298,7 @@ class EmailSlashCommands:
         self._events_db = events_db
         self._resend_client = resend_client
         self._analytics = analytics
+        self._engagement_score_db = engagement_score_db
 
     def register(self, client: discord.Client) -> None:
         """Attach a CommandTree to the discord.Client and wire our commands."""
@@ -695,6 +756,51 @@ class EmailSlashCommands:
                 )
                 return
             body = _render_day0_funnel(stats)
+            await interaction.followup.send(body, ephemeral=True)
+
+        @tree.command(
+            name="engagement-snapshot",
+            description=(
+                "Email bot: hot/warm/cold tier distribution + top 5 + "
+                "recent transitions."
+            ),
+            guild=guild,
+        )
+        async def engagement_snapshot(
+            interaction: discord.Interaction,
+        ) -> None:
+            # Admin-only, matching the gating used by every other
+            # /email-* command. The engagement table can contain PII
+            # and the rolling transitions surface recipient-level
+            # activity, so we keep it ephemeral and gated.
+            if not self._is_admin(interaction):
+                await interaction.response.send_message(
+                    "Admin only.", ephemeral=True,
+                )
+                return
+            if self._engagement_score_db is None:
+                await interaction.response.send_message(
+                    "Engagement scoring not wired. Set RESEND_WEBHOOK_SECRET "
+                    "and restart the bot so the events + scoring DB are "
+                    "available.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                counts = await self._engagement_score_db.tier_counts()
+                top = await self._engagement_score_db.top_engaged(limit=5)
+                transitions = await self._engagement_score_db.recent_transitions(
+                    limit=5,
+                )
+            except Exception:
+                logger.exception("engagement-snapshot query crashed")
+                await interaction.followup.send(
+                    "Snapshot query crashed. Check logs.",
+                    ephemeral=True,
+                )
+                return
+            body = _render_engagement_snapshot(counts, top, transitions)
             await interaction.followup.send(body, ephemeral=True)
 
         # Sync guild commands once the client is ready. discord.Client (base

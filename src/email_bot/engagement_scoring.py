@@ -248,6 +248,57 @@ class EngagementScoreDB:
                     out[row[0]] = int(row[1])
         return out
 
+    async def top_engaged(self, limit: int = 5) -> list[dict]:
+        """Return the most-engaged recipients by score (highest first).
+
+        Each row is a dict {email, score, tier, updated_at}. Used by
+        the /engagement-snapshot Discord command to spotlight the
+        recipients driving the bulk of the engagement.
+        """
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT email, score, tier, updated_at "
+            "FROM engagement_score "
+            "ORDER BY score DESC, updated_at DESC LIMIT ?",
+            (int(limit),),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            {
+                "email": r[0],
+                "score": float(r[1]),
+                "tier": str(r[2]),
+                "updated_at": int(r[3]),
+            }
+            for r in rows
+        ]
+
+    async def recent_transitions(self, limit: int = 5) -> list[dict]:
+        """Return the most-recent tier transitions across all recipients.
+
+        Each row is a dict {email, score, tier, recorded_at}. The
+        ``engagement_score_history`` table only gets a row when the
+        tier actually changed, so this is the right place to watch
+        the trajectory of the audience.
+        """
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT email, score, tier, recorded_at "
+            "FROM engagement_score_history "
+            "ORDER BY recorded_at DESC LIMIT ?",
+            (int(limit),),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            {
+                "email": r[0],
+                "score": float(r[1]),
+                "tier": str(r[2]),
+                "recorded_at": int(r[3]),
+            }
+            for r in rows
+        ]
+
     # ---- writes -------------------------------------------------------
 
     async def upsert(self, score_row: EngagementScore) -> bool:

@@ -68,13 +68,38 @@ class TestOfferVariants:
         assert "" not in OFFER_VARIANTS
         assert OFFER_VARIANTS.get("totally_made_up_reason") is None
 
-    def test_pause_offers_have_zero_promo_amount(self):
+    def test_pause_offers_have_zero_promo_amount(self, monkeypatch):
+        # OFFER_VARIANTS is built at module import. The pause-feature flag
+        # gates whether B/C resolve to pause or discount-fallback. Reload
+        # the module with the flag on to assert the pause variants exist
+        # in the shipped table (this is what production looks like once
+        # the Whop pause flow goes live).
+        import importlib
+        monkeypatch.setenv("PAUSE_FEATURE_ENABLED", "true")
+        import src.automations.save_offer_router as router_mod
+        importlib.reload(router_mod)
+        try:
+            for reason in ("not_using", "market_slow"):
+                cfg = router_mod.OFFER_VARIANTS[reason]
+                assert cfg.offer_type == "pause"
+                assert cfg.amount_off == 0.0
+                assert cfg.base_code == ""
+                assert cfg.pause_days == 30
+        finally:
+            # Reload with the flag off again so other tests see the
+            # default (discount-fallback) shape.
+            monkeypatch.delenv("PAUSE_FEATURE_ENABLED", raising=False)
+            importlib.reload(router_mod)
+
+    def test_pause_offers_fall_back_to_discount_when_flag_off(self):
+        # Default state in the test process: PAUSE_FEATURE_ENABLED is
+        # not set, so B/C should fall back to discount $79/3mo.
         for reason in ("not_using", "market_slow"):
             cfg = OFFER_VARIANTS[reason]
-            assert cfg.offer_type == "pause"
-            assert cfg.amount_off == 0.0
-            assert cfg.base_code == ""
-            assert cfg.pause_days == 30
+            assert cfg.offer_type == "discount"
+            assert cfg.amount_off == 20.0
+            assert cfg.duration_months == 3
+            assert cfg.base_code == "STAY79"
 
     def test_discount_offers_have_promo_params(self):
         for reason in ("too_expensive", "other", "fulfillment"):
@@ -118,29 +143,42 @@ class TestSaveOfferRouter:
         assert await db.get_subscriber("user@example.com") is None
         await db.close()
 
-    async def test_pause_offer_skips_promo_mint(self, tmp_path):
-        db = await self._make_db(tmp_path)
-        router = SaveOfferRouter(
-            email_db=db,
-            promo_api_key="fake-key",
-            whop_company_id="biz_test",
-            pause_url="https://whop.com/orders",
-        )
-        with patch(
-            "src.automations.save_offer_router.create_one_time_promo",
-            new=AsyncMock(),
-        ) as mock_mint:
-            result = await router.route_offer(
-                email="pause@example.com", name="Pause", reason="not_using",
+    async def test_pause_offer_skips_promo_mint(self, tmp_path, monkeypatch):
+        # Pause flow is gated on PAUSE_FEATURE_ENABLED. Flip it on for
+        # this test so the OFFER_VARIANTS table contains the pause
+        # variants we're asserting on. importlib.reload picks up the
+        # env change because the flag is read at module import.
+        import importlib
+        monkeypatch.setenv("PAUSE_FEATURE_ENABLED", "true")
+        import src.automations.save_offer_router as router_mod
+        importlib.reload(router_mod)
+        try:
+            db = await self._make_db(tmp_path)
+            router = router_mod.SaveOfferRouter(
+                email_db=db,
+                promo_api_key="fake-key",
+                whop_company_id="biz_test",
+                pause_url="https://whop.com/orders",
             )
-        assert result.routed is True
-        assert result.offer_type == "pause"
-        assert result.promo_code is None
-        # Pause offers must NOT call the promo API
-        mock_mint.assert_not_called()
-        # Rejoin URL is the pause URL
-        assert result.rejoin_url == "https://whop.com/orders"
-        await db.close()
+            with patch(
+                "src.automations.save_offer_router.create_one_time_promo",
+                new=AsyncMock(),
+            ) as mock_mint:
+                result = await router.route_offer(
+                    email="pause@example.com", name="Pause",
+                    reason="not_using",
+                )
+            assert result.routed is True
+            assert result.offer_type == "pause"
+            assert result.promo_code is None
+            # Pause offers must NOT call the promo API
+            mock_mint.assert_not_called()
+            # Rejoin URL is the pause URL
+            assert result.rejoin_url == "https://whop.com/orders"
+            await db.close()
+        finally:
+            monkeypatch.delenv("PAUSE_FEATURE_ENABLED", raising=False)
+            importlib.reload(router_mod)
 
     async def test_discount_offer_mints_promo_and_embeds_in_url(self, tmp_path):
         db = await self._make_db(tmp_path)

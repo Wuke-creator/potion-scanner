@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -51,6 +52,22 @@ from src.email_bot.db import EmailDB, Subscriber
 from src.whop_api import create_one_time_promo
 
 logger = logging.getLogger(__name__)
+
+
+# Pause-feature feature flag. The membership pause flow is on the Potion
+# roadmap but not shipped yet -- there is no real Whop pause URL to send
+# users to. While the flag is OFF, variants B (``not_using``) and C
+# (``market_slow``) MUST behave like the templates do: render a
+# discount-based fallback ($79/mo for 3 months, same as Offer A) and
+# point the rejoin URL at the promo'd Whop checkout, NOT a pause URL.
+# Flip to ``"1"`` / ``"true"`` once the Whop pause flow is live and the
+# pause_url constructor arg points at the real self-serve page.
+#
+# Read at module load time so callers can flip it via env. Tests that
+# need to toggle it can importlib.reload(save_offer_router).
+_PAUSE_FEATURE_ENABLED = os.environ.get(
+    "PAUSE_FEATURE_ENABLED", "false",
+).strip().lower() in ("1", "true", "yes", "on")
 
 
 @dataclass(frozen=True)
@@ -68,62 +85,101 @@ class SaveOfferConfig:
 # Offer table — mirrors REV-6 Task 24 verbatim. Update copy via the
 # template (_save_offer_day0); update offer params (discount %, base
 # code, etc.) here.
-OFFER_VARIANTS: dict[str, SaveOfferConfig] = {
-    "too_expensive": SaveOfferConfig(
-        reason="too_expensive",
-        label="Offer A — 20% off 3 months",
-        offer_type="discount",
-        amount_off=20.0,
-        duration_months=3,
-        base_code="STAY79",
-    ),
-    "not_using": SaveOfferConfig(
-        reason="not_using",
-        label="Offer B — 30 day pause",
-        offer_type="pause",
-        pause_days=30,
-    ),
-    "market_slow": SaveOfferConfig(
-        reason="market_slow",
-        label="Offer C — 30 day pause",
-        offer_type="pause",
-        pause_days=30,
-    ),
-    "quality_declined": SaveOfferConfig(
-        reason="quality_declined",
-        label="Offer D — 7 free days + top calls",
-        offer_type="trial",
-        amount_off=100.0,
-        duration_months=1,
-        base_code="QUALITY7",
-    ),
-    "found_alternative": SaveOfferConfig(
-        reason="found_alternative",
-        label="Offer E — 7 day free trial + comparison",
-        offer_type="trial",
-        amount_off=100.0,
-        duration_months=1,
-        base_code="COMPARE7",
-    ),
-    "other": SaveOfferConfig(
-        reason="other",
-        label="Offer F — 25% off 2 months",
-        offer_type="discount",
-        amount_off=25.0,
-        duration_months=2,
-        base_code="STAY25",
-    ),
-    "fulfillment": SaveOfferConfig(
-        reason="fulfillment",
-        label="Offer F — 25% off 2 months",
-        offer_type="discount",
-        amount_off=25.0,
-        duration_months=2,
-        base_code="STAY25",
-    ),
-    # 'none' deliberately absent: unknown reason -> no targeted save offer,
-    # fall through to standard winback only.
-}
+#
+# Pause-feature gating: when ``PAUSE_FEATURE_ENABLED`` is FALSE (the
+# default until the Whop pause flow ships), variants B (``not_using``)
+# and C (``market_slow``) fall back to a discount-based offer at the
+# same $79/3-month price point as Offer A. This matches the templates,
+# which already render discount copy for those reasons when the flag
+# is off (see ``_save_offer_day0`` in templates.py). Keeping the two
+# code paths aligned is what stops the router from minting a pause
+# rejoin URL that the email body then contradicts.
+def _build_offer_variants() -> dict[str, SaveOfferConfig]:
+    if _PAUSE_FEATURE_ENABLED:
+        # Pause flow is live -> use the real pause variants.
+        not_using_offer = SaveOfferConfig(
+            reason="not_using",
+            label="Offer B — 30 day pause",
+            offer_type="pause",
+            pause_days=30,
+        )
+        market_slow_offer = SaveOfferConfig(
+            reason="market_slow",
+            label="Offer C — 30 day pause",
+            offer_type="pause",
+            pause_days=30,
+        )
+    else:
+        # Pause flow not shipped -> render the discount fallback so the
+        # rejoin URL we mint points at a working checkout instead of
+        # a non-existent pause page. Mirrors the template's flag-off
+        # copy for these exit reasons.
+        not_using_offer = SaveOfferConfig(
+            reason="not_using",
+            label="Offer B — 20% off 3 months (pause flag off)",
+            offer_type="discount",
+            amount_off=20.0,
+            duration_months=3,
+            base_code="STAY79",
+        )
+        market_slow_offer = SaveOfferConfig(
+            reason="market_slow",
+            label="Offer C — 20% off 3 months (pause flag off)",
+            offer_type="discount",
+            amount_off=20.0,
+            duration_months=3,
+            base_code="STAY79",
+        )
+    return {
+        "too_expensive": SaveOfferConfig(
+            reason="too_expensive",
+            label="Offer A — 20% off 3 months",
+            offer_type="discount",
+            amount_off=20.0,
+            duration_months=3,
+            base_code="STAY79",
+        ),
+        "not_using": not_using_offer,
+        "market_slow": market_slow_offer,
+        "quality_declined": SaveOfferConfig(
+            reason="quality_declined",
+            label="Offer D — 7 free days + top calls",
+            offer_type="trial",
+            amount_off=100.0,
+            duration_months=1,
+            base_code="QUALITY7",
+        ),
+        "found_alternative": SaveOfferConfig(
+            reason="found_alternative",
+            label="Offer E — 7 day free trial + comparison",
+            offer_type="trial",
+            amount_off=100.0,
+            duration_months=1,
+            base_code="COMPARE7",
+        ),
+        "other": SaveOfferConfig(
+            reason="other",
+            label="Offer F — 25% off 2 months",
+            offer_type="discount",
+            amount_off=25.0,
+            duration_months=2,
+            base_code="STAY25",
+        ),
+        "fulfillment": SaveOfferConfig(
+            reason="fulfillment",
+            label="Offer F — 25% off 2 months",
+            offer_type="discount",
+            amount_off=25.0,
+            duration_months=2,
+            base_code="STAY25",
+        ),
+        # 'none' deliberately absent: unknown reason -> no targeted save
+        # offer, fall through to standard winback only.
+    }
+
+
+OFFER_VARIANTS: dict[str, SaveOfferConfig] = _build_offer_variants()
+
 
 
 @dataclass
@@ -235,7 +291,26 @@ class SaveOfferRouter:
                     config.label, email,
                 )
         elif config.offer_type == "pause":
-            rejoin_url = self._pause_url
+            # Defense in depth: even if the OFFER_VARIANTS table somehow
+            # still has a pause variant when the flag is off (manual
+            # patch, stale import, test fixture), we refuse to mint a
+            # rejoin URL pointing at a non-existent pause page. The
+            # router falls back to the bare rejoin URL so the email
+            # body still renders cleanly via the discount-fallback
+            # copy in the template. Keep this in sync with
+            # ``_PAUSE_FEATURE_ENABLED`` in templates.py.
+            if not _PAUSE_FEATURE_ENABLED:
+                logger.warning(
+                    "SaveOfferRouter: pause offer reached route_offer for "
+                    "reason=%r while PAUSE_FEATURE_ENABLED is OFF -- "
+                    "falling back to bare rejoin URL. The OFFER_VARIANTS "
+                    "table should have rebuilt to the discount fallback; "
+                    "investigate stale module state.",
+                    reason,
+                )
+                rejoin_url = self._rejoin_url_base
+            else:
+                rejoin_url = self._pause_url
 
         # Upsert subscriber with the offer-specific rejoin URL so the
         # template can read it directly. Use the existing subscriber row

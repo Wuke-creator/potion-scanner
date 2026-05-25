@@ -798,6 +798,7 @@ async def run(config: Config) -> None:
             events_db=email_events_db,
             resend_client=email_sender,
             analytics=email_analytics,
+            engagement_score_db=engagement_score_db,
         )
         slash.register(listener.client)
         logger.info("Discord slash commands registered")
