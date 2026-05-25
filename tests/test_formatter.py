@@ -155,7 +155,11 @@ class TestOstiumPlugInOnboardingDay0:
 
     def test_html_omits_banner_when_url_unset(self):
         rendered = self._render_day0(banner_url="")
-        assert "<img" not in rendered.html
+        # The Potion header logo always renders (separate from the Ostium
+        # banner). Check specifically that no Ostium banner anchor + image
+        # exists, not that no <img> tag exists anywhere.
+        assert 'alt="Ostium"' not in rendered.html
+        assert "ostium-banner" not in rendered.html.lower()
 
     def test_html_includes_banner_when_url_set(self):
         rendered = self._render_day0(

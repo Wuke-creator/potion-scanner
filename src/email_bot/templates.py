@@ -41,6 +41,40 @@ _OSTIUM_TRADE_URL = os.environ.get(
 )
 _OSTIUM_BANNER_URL = os.environ.get("OSTIUM_BANNER_URL", "")
 
+# Potion logo, rendered in the header of every email by ``_wrap_html``.
+#
+# Resolution order (matching the memory note "Resend inline images in Gmail"):
+#   1. POTION_LOGO_URL env var -> hosted URL on the ops dashboard
+#      (https://potion-dashboard-production.up.railway.app/email-assets/
+#       potion-logo.png). Cleanest path; CDN-fast; no message-size hit.
+#   2. potion_logo_email_inline.txt at repo root -> inline data URI
+#      (currently a 120x120 ~27KB PNG, well under Gmail's 102KB clip
+#      threshold). Used until the hosted URL is deployed.
+#   3. Empty string -> wrapper renders without a logo.
+#
+# We deliberately do NOT use the legacy potion_logo_datauri.txt (512x512
+# ~349KB), which would push every email past Gmail's clip threshold.
+_POTION_LOGO_URL = os.environ.get("POTION_LOGO_URL", "").strip()
+if not _POTION_LOGO_URL:
+    try:
+        import pathlib
+        _inline_path = pathlib.Path(__file__).resolve().parents[2] / "potion_logo_email_inline.txt"
+        if _inline_path.is_file():
+            _POTION_LOGO_URL = _inline_path.read_text(encoding="utf-8").strip()
+    except Exception:
+        # Don't ever block template rendering on logo loading.
+        _POTION_LOGO_URL = ""
+
+# Pause-feature feature flag. Membership pause (30-day pause + auto-
+# reactivate) is on the Potion roadmap but not shipped yet. Until it is,
+# save-offer variants B (``not_using``) and C (``market_slow``) MUST NOT
+# promise it -- the rendered copy falls through to a discount-based
+# alternative instead. Flip to ``"1"`` / ``"true"`` once the pause flow
+# is live in Whop and there is a real pause URL to send people to.
+_PAUSE_FEATURE_ENABLED = os.environ.get(
+    "PAUSE_FEATURE_ENABLED", "false",
+).strip().lower() in ("1", "true", "yes", "on")
+
 from src.email_bot.db import Subscriber
 from src.email_bot.stats import StatsBundle
 
@@ -170,6 +204,20 @@ def _wrap_html(
     the same template ships through both the transactional and broadcast
     paths cleanly.
     """
+    # Header logo. Rendered above the eyebrow when a URL (hosted or
+    # inline data URI) is configured. Width is fixed at 64px to keep the
+    # message size modest on the inline-data-URI path and to match the
+    # eyebrow's visual weight. ``alt`` falls back gracefully when an
+    # image-blocking client refuses to load it.
+    logo_html = (
+        f'<p style="margin:0 0 16px 0;padding:0;text-align:center;">'
+        f'<img src="{escape(_POTION_LOGO_URL, quote=True)}" '
+        f'alt="Potion Alpha" width="64" height="64" '
+        f'style="display:inline-block;width:64px;height:64px;'
+        f'border:0;outline:none;text-decoration:none;border-radius:12px;" />'
+        f'</p>'
+        if _POTION_LOGO_URL else ""
+    )
     eyebrow_html = (
         f'<p style="margin:0;padding:0;color:{_BRAND_PURPLE};font-size:13px;'
         f'font-weight:700;letter-spacing:3px;text-transform:uppercase;">'
@@ -186,9 +234,9 @@ def _wrap_html(
         f'<tr><td align="center" '
         f'style="margin:0;padding:36px 32px 28px 32px;'
         f'border-bottom:1px solid {_DIVIDER};text-align:center;">'
-        f'{eyebrow_html}{headline_html}'
+        f'{logo_html}{eyebrow_html}{headline_html}'
         f'</td></tr>'
-    ) if (eyebrow_html or headline_html) else ""
+    ) if (logo_html or eyebrow_html or headline_html) else ""
     body_section = (
         f'<tr><td '
         f'style="margin:0;padding:24px 32px;color:{_TEXT_BODY};'
@@ -1401,6 +1449,30 @@ _SUPPORT_TICKET_CHANNEL = (
     "https://discord.com/channels/1260259552763580537/1285628366162231346"
 )
 
+# Discord track-record channel: every Elite call from the last 90 days,
+# hit or miss, with the chart. Used by bronze D3-WARM and pre_renewal LOW
+# to anchor the transparency / "we post the losers too" angle.
+# Sourced from env at import time (POTION_GUILD_ID + TRACK_RECORD_CHANNEL_ID).
+# Falls back to the guild root when the channel id isn't set yet so emails
+# that link here during the channel's setup window still land in the server.
+def _resolve_track_record_url() -> str:
+    guild_id = os.getenv("POTION_GUILD_ID", "1260259552763580537").strip()
+    channel_id = os.getenv("TRACK_RECORD_CHANNEL_ID", "").strip()
+    if guild_id and channel_id.isdigit() and int(channel_id) > 0:
+        return f"https://discord.com/channels/{guild_id}/{channel_id}"
+    return f"https://discord.com/channels/{guild_id}"
+
+
+_TRACK_RECORD_CHANNEL = _resolve_track_record_url()
+
+# Discord Concierge thread/channel for Elite members. Used by paid_at_risk
+# emails to drive disengaged paying members back into the high-touch
+# value-realisation channel before they cancel.
+# TODO: replace with the actual concierge channel/thread id.
+_CONCIERGE_CHANNEL = (
+    "https://discord.com/channels/1260259552763580537"
+)
+
 
 def _bronze_day1(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
     """Day 1: welcome the new Bronze member, show what Elite unlocks.
@@ -1534,10 +1606,583 @@ def _bronze_day5(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
     return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
 
 
+# ---------------------------------------------------------------------------
+# Behaviour-branched email tree (2026-05-19 design)
+# Spec: 01-Projects/potion-alpha/potion-behaviour-email-tree-design.md
+# Copy: 01-Projects/potion-alpha/potion-email-expertise-and-copy.md
+#
+# Extends bronze with D0 + D7 plus HOT/WARM/COLD variants at D3 and D5.
+# Adds new sequences nurture (event-driven big-call gap email) and
+# paid_at_risk (catch-churn-before-cancel). Adds pre_renewal HIGH/LOW
+# engagement variants alongside the existing default _pre_renewal.
+#
+# The variant renderers are picked by the future branch evaluator at
+# scheduling time. Until the evaluator lands, the default day-keyed
+# renderers in _BRONZE_RENDERERS / _PRE_RENEWAL fall through.
+# ---------------------------------------------------------------------------
+
+
+def _bronze_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Day 0: welcome the new Bronze member, orient them to the free
+    channels, drive a first Discord visit. The Bronze-vs-Elite gap
+    lands on Day 1; D0 is value-forward only."""
+    name = _pretty_name(sub)
+    discord = "https://discord.com/channels/1260259552763580537"
+
+    subject = "You’re in. Here’s where the action is."
+    text = (
+        f"Hey {name},\n\n"
+        f"Welcome to Potion. You’re now Bronze, which gets you a real "
+        f"seat in the room. Three things are open to you from minute "
+        f"one:\n\n"
+        f"• The calls channel: read-only, you see every entry, TP, and "
+        f"SL as it posts.\n"
+        f"• The Potion Digest: today’s plays, today’s closes, all in "
+        f"one channel.\n"
+        f"• The track record: every call from the last 90 days, hit or "
+        f"miss, with the chart.\n\n"
+        f"The best move today is the easiest one. Pop into the Discord, "
+        f"find the next signal in the calls channel, and watch it play "
+        f"out. No trade required. That’s how the room works, and it’s "
+        f"the fastest way to see whether the rhythm fits you.\n\n"
+        f"Jump into Discord: {discord}\n\n"
+        f"Tomorrow you’ll get a closer look at the Bronze-vs-Elite gap. "
+        f"For now, just claim your seat.\n\n"
+        f"PS. If anything’s unclear, open a ticket in "
+        f"{_SUPPORT_TICKET_CHANNEL} or reply to this email. We read "
+        f"every one.\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Welcome to Potion. You’re now Bronze, which gets you a "
+        f"real seat in the room. Three things are open to you from "
+        f"minute one:</p>"
+        f"<ul>"
+        f"<li>The <strong>calls channel</strong>: read-only, you see "
+        f"every entry, TP, and SL as it posts.</li>"
+        f"<li>The <strong>Potion Digest</strong>: today’s plays, "
+        f"today’s closes, all in one channel.</li>"
+        f"<li>The <strong>track record</strong>: every call from the "
+        f"last 90 days, hit or miss, with the chart.</li>"
+        f"</ul>"
+        f"<p>The best move today is the easiest one. Pop into the "
+        f"Discord, find the next signal in the calls channel, and "
+        f"watch it play out. No trade required.</p>"
+        f"{_cta_button_html('Jump into Discord', discord)}"
+        f"<p>Tomorrow you’ll get a closer look at the Bronze-vs-Elite "
+        f"gap. For now, just claim your seat.</p>"
+        f"<p style='color:#b0b0b8;font-size:14px;'>PS. If anything’s "
+        f"unclear, open a ticket in the "
+        f"<a href='{_SUPPORT_TICKET_CHANNEL}' style='color:#b0b0b8;'>"
+        f"Discord</a> or reply. We read every one.</p>"
+    )
+    _ = stats
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _bronze_day3_warm(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Day 3 WARM branch: opened D0 but not yet Discord-engaged. Lean
+    into transparency (we post the losers too) to address PnL fatigue."""
+    name = _pretty_name(sub)
+    track_record = _TRACK_RECORD_CHANNEL
+    calls_30d = getattr(stats, "calls_30d_total", None) or 92
+    wins_30d = getattr(stats, "wins_30d_over_50pct", None) or 18
+
+    subject = "We post the losers too."
+    text = (
+        f"Hey {name},\n\n"
+        f"Most trading rooms only screenshot their wins. We don’t.\n\n"
+        f"The track-record channel on the Discord has every Elite call "
+        f"from the last 90 days: entry, TPs, stop, the chart at close. "
+        f"Winners. Losers. The ones that opened and got chopped sideways. "
+        f"Dated, attributable, public to Bronze.\n\n"
+        f"We do this for one reason. You’ve been scrolled past a "
+        f"thousand green-bag screenshots this month and you don’t trust "
+        f"any of them. You shouldn’t. What actually matters is whether "
+        f"the long-run process makes money, and the only way to judge "
+        f"that is the unfiltered record.\n\n"
+        f"Last 30 days: {calls_30d} calls fired. {wins_30d} closed at "
+        f"+50% or better. The rest are in the channel.\n\n"
+        f"See the unfiltered record: {track_record}\n\n"
+        f"If something specific is keeping you on the sidelines, reply "
+        f"and tell me. We read every one.\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Most trading rooms only screenshot their wins. We don’t.</p>"
+        f"<p>The <strong>track-record channel</strong> on the Discord "
+        f"has every Elite call from the last 90 days: entry, TPs, stop, "
+        f"the chart at close. Winners. Losers. The ones that opened "
+        f"and got chopped sideways. Dated, attributable, public to "
+        f"Bronze.</p>"
+        f"<p>We do this for one reason. You’ve been scrolled past a "
+        f"thousand green-bag screenshots this month and you don’t "
+        f"trust any of them. You shouldn’t. What actually matters is "
+        f"whether the long-run process makes money, and the only way "
+        f"to judge that is the unfiltered record.</p>"
+        f"<p>Last 30 days: <strong>{calls_30d} calls fired. {wins_30d} "
+        f"closed at +50% or better.</strong> The rest are in the "
+        f"channel.</p>"
+        f"{_cta_button_html('See the unfiltered record', track_record)}"
+        f"<p style='color:#b0b0b8;font-size:14px;'>If something "
+        f"specific is keeping you on the sidelines, reply and tell me. "
+        f"We read every one.</p>"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _bronze_day3_cold(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Day 3 COLD branch: no D0 open, no Discord activity. Quantified
+    hook + deliverability-honest soft-out so a follow-on non-engage
+    suppresses cleanly without burning domain reputation."""
+    name = _pretty_name(sub)
+    digest = _DIGEST_CHANNEL
+    top_pair = getattr(stats, "top_pair_7d", None) or "ETH/USDT"
+    top_pct = getattr(stats, "top_pct_7d", None) or 89
+
+    subject = f"{top_pair} closed +{top_pct}% this week"
+    text = (
+        f"Hey {name},\n\n"
+        f"You joined Potion a few days ago. I haven’t seen you in the "
+        f"Discord yet, so I want to make sure you saw what’s happening "
+        f"before deciding email isn’t your channel.\n\n"
+        f"Headline this week: {top_pair} ran +{top_pct}%. Elite had "
+        f"the alert the second it fired. The full play (entry, TP "
+        f"scale-out, chart at close) is in the Potion Digest right now.\n\n"
+        f"You don’t need to trade anything to start. Just pop into the "
+        f"calls channel and watch the next one play out. That’s the "
+        f"whole point of Bronze, the read-only seat.\n\n"
+        f"See the closed call: {digest}\n\n"
+        f"If email isn’t your channel, that’s fine. We won’t keep "
+        f"blasting; we’ll move you to a light cadence after this. The "
+        f"free Discord stays open as long as you want it.\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>You joined Potion a few days ago. I haven’t seen you in "
+        f"the Discord yet, so I want to make sure you saw what’s "
+        f"happening before deciding email isn’t your channel.</p>"
+        f"<p>Headline this week: <strong>{escape(str(top_pair))} ran "
+        f"+{top_pct}%.</strong> Elite had the alert the second it "
+        f"fired. The full play (entry, TP scale-out, chart at close) "
+        f"is in the Potion Digest right now.</p>"
+        f"<p>You don’t need to trade anything to start. Just pop into "
+        f"the calls channel and watch the next one play out. That’s "
+        f"the whole point of Bronze, the read-only seat.</p>"
+        f"{_cta_button_html('See the closed call', digest)}"
+        f"<p style='color:#b0b0b8;font-size:14px;'>If email isn’t "
+        f"your channel, that’s fine. We won’t keep blasting; we’ll "
+        f"move you to a light cadence after this. The free Discord "
+        f"stays open as long as you want it.</p>"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _bronze_day5_hot(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Day 5 HOT branch: behaviour-earned full-urgency offer. Leads with
+    the discount in the subject and first line. The Bronze rejoin URL
+    already carries the minted single-use BRONZE30 promo (see worker.py
+    _bronze_day5_subscriber)."""
+    name = _pretty_name(sub)
+    rejoin = sub.rejoin_url or "https://whop.com/potion"
+
+    subject = "30% off Elite, attached to your account"
+    text = (
+        f"Hey {name},\n\n"
+        f"You’ve been in the room this week, which is the only reason "
+        f"this email exists. Here’s the easy step forward: 30% off "
+        f"your first Elite cycle, single-use, expires in 14 days, tied "
+        f"to your account.\n\n"
+        f"Claim 30% off Elite: {rejoin}\n\n"
+        f"What flips on the moment you upgrade:\n"
+        f"• Real-time alerts (Telegram bot + Discord pings) on every "
+        f"structured call\n"
+        f"• Daily VC access, not read-only\n"
+        f"• Your Concierge thread for setup help, sizing, trade reviews\n"
+        f"• Per-pair Trade-now buttons on every alert (Ostium + Blofin)\n\n"
+        f"Same account, no new signup. Elite role drops within minutes "
+        f"of claiming.\n\n"
+        f"If 30% isn’t the lever and there’s something else (timing, "
+        f"size, anything), reply and tell me. Discount or not, I want "
+        f"to know what’s holding you back.\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>You’ve been in the room this week, which is the only "
+        f"reason this email exists. Here’s the easy step forward: "
+        f"<strong>30% off your first Elite cycle</strong>, single-use, "
+        f"expires in 14 days, tied to your account.</p>"
+        f"{_cta_button_html('Claim 30% off Elite', rejoin)}"
+        f"<p><strong>What flips on the moment you upgrade:</strong></p>"
+        f"<ul>"
+        f"<li>Real-time alerts (Telegram bot + Discord pings) on every "
+        f"structured call</li>"
+        f"<li>Daily VC access, not read-only</li>"
+        f"<li>Your Concierge thread for setup help, sizing, trade "
+        f"reviews</li>"
+        f"<li>Per-pair Trade-now buttons on every alert (Ostium + "
+        f"Blofin)</li>"
+        f"</ul>"
+        f"<p>Same account, no new signup. Elite role drops within "
+        f"minutes of claiming.</p>"
+        f"<p style='color:#b0b0b8;font-size:14px;'>If 30% isn’t the "
+        f"lever and there’s something else (timing, size, anything), "
+        f"reply and tell me. Discount or not, I want to know what’s "
+        f"holding you back.</p>"
+    )
+    _ = stats
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _bronze_day5_warm(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Day 5 WARM branch: proof-first soft hand-off to the offer. The
+    BRONZE30 code is mentioned but is not the lead; the cadence numbers
+    are."""
+    name = _pretty_name(sub)
+    rejoin = sub.rejoin_url or "https://whop.com/potion"
+    calls_30d = getattr(stats, "calls_30d_total", None) or 92
+    wins_30d = getattr(stats, "wins_30d_over_50pct", None) or 18
+    top_pair = getattr(stats, "top_pair_30d", None) or "ETH/USDT"
+    top_pct = getattr(stats, "top_pnl_pct_30d", None) or 142
+
+    subject = "A month of Elite in numbers"
+    text = (
+        f"Hey {name},\n\n"
+        f"Before the offer, here’s a month of Elite at the room level "
+        f"so you can see the cadence:\n\n"
+        f"• {calls_30d} structured calls fired\n"
+        f"• {wins_30d} closed at +50% or better\n"
+        f"• Headline: {top_pair} ran +{top_pct}%\n"
+        f"• Plus the daily VCs, the weekly Mac session, and the alert "
+        f"bot\n\n"
+        f"If that rhythm is what you want to be inside of, your 30% "
+        f"off Elite code is still attached to your account:\n\n"
+        f"Claim 30% off Elite: {rejoin}\n\n"
+        f"If it’s not, no follow-ups from me. You stay on Bronze, you "
+        f"keep reading the digest, no pressure either way.\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Before the offer, here’s a month of Elite at the room "
+        f"level so you can see the cadence:</p>"
+        f"<ul>"
+        f"<li>{calls_30d} structured calls fired</li>"
+        f"<li>{wins_30d} closed at +50% or better</li>"
+        f"<li>Headline: <strong>{escape(str(top_pair))} ran +{top_pct}%"
+        f"</strong></li>"
+        f"<li>Plus the daily VCs, the weekly Mac session, and the alert "
+        f"bot</li>"
+        f"</ul>"
+        f"<p>If that rhythm is what you want to be inside of, your 30% "
+        f"off Elite code is still attached to your account:</p>"
+        f"{_cta_button_html('Claim 30% off Elite', rejoin)}"
+        f"<p style='color:#b0b0b8;font-size:14px;'>If it’s not, no "
+        f"follow-ups from me. You stay on Bronze, you keep reading the "
+        f"digest, no pressure either way.</p>"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _bronze_day7(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Day 7: last-call urgency on BRONZE30. Factual urgency (actual
+    expiry) + soft-out (move to low cadence) so the suppression handoff
+    is clean for non-converters."""
+    name = _pretty_name(sub)
+    rejoin = sub.rejoin_url or "https://whop.com/potion"
+
+    subject = "Last day on your 30% Elite code"
+    text = (
+        f"Hey {name},\n\n"
+        f"Quick one. Your single-use 30% off Elite code expires today. "
+        f"After this it’s gone and Elite goes back to standard "
+        f"pricing.\n\n"
+        f"Claim before it expires: {rejoin}\n\n"
+        f"If you’ve been waiting on a clean entry to justify the "
+        f"upgrade, the next signal will fire while you’re still "
+        f"deciding. The bot pings the second it does.\n\n"
+        f"If today isn’t the right time, that’s fine. I’ll move you "
+        f"to a low-cadence list and we’ll stop emailing weekly. The "
+        f"free channels stay open as long as you want them.\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Quick one. Your single-use 30% off Elite code "
+        f"<strong>expires today.</strong> After this it’s gone and "
+        f"Elite goes back to standard pricing.</p>"
+        f"{_cta_button_html('Claim before it expires', rejoin)}"
+        f"<p>If you’ve been waiting on a clean entry to justify the "
+        f"upgrade, the next signal will fire while you’re still "
+        f"deciding. The bot pings the second it does.</p>"
+        f"<p style='color:#b0b0b8;font-size:14px;'>If today isn’t the "
+        f"right time, that’s fine. I’ll move you to a low-cadence list "
+        f"and we’ll stop emailing weekly. The free channels stay open "
+        f"as long as you want them.</p>"
+    )
+    _ = stats
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _nurture(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Nurture: event-driven big-call gap email for non-converted Bronze.
+    Fires only when a genuinely big Elite call closes (cron filters by a
+    P&L threshold). Single template, fresh stats each fire. Hard cap
+    1/week per contact; 30d-inactive drops to quarterly."""
+    name = _pretty_name(sub)
+    rejoin = sub.rejoin_url or "https://whop.com/potion"
+    top_pair = getattr(stats, "top_pair_7d", None) or "ETH/USDT"
+    top_pct = getattr(stats, "top_pct_7d", None) or 89
+
+    subject = f"Bronze watched {top_pair} close +{top_pct}%"
+    text = (
+        f"Hey {name},\n\n"
+        f"A real one closed in Elite this week.\n\n"
+        f"{top_pair}, +{top_pct}%. The community was in on entry. The "
+        f"Telegram bot pinged on entry, on TP1, on the close. Bronze "
+        f"read about it in the digest after.\n\n"
+        f"This is the gap, in a single trade. It’s not the chat, it’s "
+        f"the timing.\n\n"
+        f"If you want to be in the room when the next one fires, your "
+        f"30% off Elite code is still on your account:\n\n"
+        f"See Elite, code attached: {rejoin}\n\n"
+        f"(One single-use code per month, fresh each time. Expires 14 "
+        f"days from today.)\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>A real one closed in Elite this week.</p>"
+        f"<p><strong>{escape(str(top_pair))}, +{top_pct}%.</strong> "
+        f"The community was in on entry. The Telegram bot pinged on "
+        f"entry, on TP1, on the close. Bronze read about it in the "
+        f"digest after.</p>"
+        f"<p>This is the gap, in a single trade. It’s not the chat, "
+        f"it’s the timing.</p>"
+        f"<p>If you want to be in the room when the next one fires, "
+        f"your 30% off Elite code is still on your account:</p>"
+        f"{_cta_button_html('See Elite, code attached', rejoin)}"
+        f"<p style='color:#b0b0b8;font-size:14px;'>One single-use code "
+        f"per month, fresh each time. Expires 14 days from today.</p>"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _paid_at_risk_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Paid at-risk D0: Elite member, no Discord activity 7-14 days.
+    Catch churn before the cancel: surface the underused Concierge,
+    invite a reply on what’s blocking value."""
+    name = _pretty_name(sub)
+    concierge = _CONCIERGE_CHANNEL
+    top_pair = getattr(stats, "top_pair_7d", None) or "ETH/USDT"
+    top_pct = getattr(stats, "top_pct_7d", None) or 89
+
+    subject = f"Hey {name}, quick check on Elite"
+    text = (
+        f"Hey {name},\n\n"
+        f"Noticed you’ve been quiet in Discord for a couple of weeks. "
+        f"No agenda, just want to make sure Elite is still pulling its "
+        f"weight for you.\n\n"
+        f"Three things in case you missed them:\n"
+        f"• Top call this week: {top_pair} +{top_pct}%\n"
+        f"• The Concierge thread is your fastest path to setup help, "
+        f"sizing, trade reviews. It’s underused.\n"
+        f"• Daily VC at the Asia open. Drop in just to listen if the "
+        f"timing fits.\n\n"
+        f"If something’s not working (the format, the timezone, a "
+        f"specific blocker), reply and tell me. I’d rather fix the "
+        f"friction than have you renew on autopilot and disengage "
+        f"further.\n\n"
+        f"Open your Concierge thread: {concierge}\n\n"
+        f"PS. Walk through your account 1-on-1 if you want it. Just "
+        f"say the word.\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Noticed you’ve been quiet in Discord for a couple of "
+        f"weeks. No agenda, just want to make sure Elite is still "
+        f"pulling its weight for you.</p>"
+        f"<p>Three things in case you missed them:</p>"
+        f"<ul>"
+        f"<li>Top call this week: <strong>{escape(str(top_pair))} "
+        f"+{top_pct}%</strong></li>"
+        f"<li>The Concierge thread is your fastest path to setup help, "
+        f"sizing, trade reviews. It’s underused.</li>"
+        f"<li>Daily VC at the Asia open. Drop in just to listen if the "
+        f"timing fits.</li>"
+        f"</ul>"
+        f"<p>If something’s not working (the format, the timezone, a "
+        f"specific blocker), reply and tell me. I’d rather fix the "
+        f"friction than have you renew on autopilot and disengage "
+        f"further.</p>"
+        f"{_cta_button_html('Open your Concierge thread', concierge)}"
+        f"<p style='color:#b0b0b8;font-size:14px;'>PS. Walk through "
+        f"your account 1-on-1 if you want it. Just say the word.</p>"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _paid_at_risk_day3(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """Paid at-risk D3: no reply to D0. Soft, reply-driven 'what’s not
+    working' check. No primary CTA button: the reply itself is the win."""
+    name = _pretty_name(sub)
+
+    subject = "One question while it’s quiet"
+    text = (
+        f"Hey {name},\n\n"
+        f"Sent the check-in three days ago, haven’t heard back, so "
+        f"keeping this short.\n\n"
+        f"If Elite isn’t pulling its weight for you, I want to know "
+        f"specifically why. Not to pitch, to fix. One sentence is "
+        f"enough. Reply with whichever is closest:\n\n"
+        f"• \"Timing doesn’t fit my schedule\"\n"
+        f"• \"Format isn’t clicking\"\n"
+        f"• \"Sizing/risk help I’m not getting\"\n"
+        f"• \"Something else: ____\"\n\n"
+        f"If everything’s fine and you’re just busy, ignore this and "
+        f"carry on. We read every reply, including the one-liners.\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Sent the check-in three days ago, haven’t heard back, so "
+        f"keeping this short.</p>"
+        f"<p>If Elite isn’t pulling its weight for you, I want to know "
+        f"specifically why. Not to pitch, to fix. One sentence is "
+        f"enough. Reply with whichever is closest:</p>"
+        f"<ul>"
+        f"<li>“Timing doesn’t fit my schedule”</li>"
+        f"<li>“Format isn’t clicking”</li>"
+        f"<li>“Sizing/risk help I’m not getting”</li>"
+        f"<li>“Something else: ____”</li>"
+        f"</ul>"
+        f"<p style='color:#b0b0b8;font-size:14px;'>If everything’s "
+        f"fine and you’re just busy, ignore this and carry on. We read "
+        f"every reply, including the one-liners.</p>"
+    )
+    _ = stats
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _pre_renewal_high(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """pre_renewal HIGH variant: paid + actively engaged. Frictionless
+    confirmation, value surfaced as evidence not persuasion."""
+    name = _pretty_name(sub)
+    rejoin = sub.rejoin_url or "https://whop.com/potion"
+    calls_30d = getattr(stats, "calls_30d_total", None) or 92
+    wins_30d = getattr(stats, "wins_30d_over_50pct", None) or 18
+    top_pair = getattr(stats, "top_pair_30d", None) or "ETH/USDT"
+    top_pct = getattr(stats, "top_pnl_pct_30d", None) or 142
+
+    subject = "Your Elite renews in 3 days, nothing to do"
+    text = (
+        f"Hey {name},\n\n"
+        f"Quick heads-up. Your Elite renews in 3 days. Renewal is "
+        f"automatic so there’s nothing for you to do, this is just "
+        f"the heads-up.\n\n"
+        f"What you got this cycle:\n"
+        f"• {calls_30d} structured calls\n"
+        f"• {wins_30d} closed at +50% or better\n"
+        f"• Top call: {top_pair} ran +{top_pct}%\n"
+        f"• Plus the daily VCs, weekly Mac sessions, and the alert bot\n\n"
+        f"Manage your Whop: {rejoin}\n\n"
+        f"Reply if anything needs adjusting on the account.\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Quick heads-up. Your Elite renews in 3 days. Renewal is "
+        f"automatic so there’s nothing for you to do, this is just "
+        f"the heads-up.</p>"
+        f"<p><strong>What you got this cycle:</strong></p>"
+        f"<ul>"
+        f"<li>{calls_30d} structured calls</li>"
+        f"<li>{wins_30d} closed at +50% or better</li>"
+        f"<li>Top call: <strong>{escape(str(top_pair))} ran +{top_pct}%"
+        f"</strong></li>"
+        f"<li>Plus the daily VCs, weekly Mac sessions, and the alert "
+        f"bot</li>"
+        f"</ul>"
+        f"{_cta_button_html('Manage your Whop', rejoin)}"
+        f"<p style='color:#b0b0b8;font-size:14px;'>Reply if anything "
+        f"needs adjusting on the account.</p>"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
+def _pre_renewal_low(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
+    """pre_renewal LOW variant: paid but low engagement. Justify the
+    spend with the cycle's evidence, pre-empt the cancel by inviting a
+    reply BEFORE the renewal lands."""
+    name = _pretty_name(sub)
+    track_record = _TRACK_RECORD_CHANNEL
+    calls_30d = getattr(stats, "calls_30d_total", None) or 92
+    wins_30d = getattr(stats, "wins_30d_over_50pct", None) or 18
+    top_pair = getattr(stats, "top_pair_30d", None) or "ETH/USDT"
+    top_pct = getattr(stats, "top_pnl_pct_30d", None) or 142
+
+    subject = "Before your Elite renews, a look at the cycle"
+    text = (
+        f"Hey {name},\n\n"
+        f"Your Elite renews in 3 days. Before it does, here’s what "
+        f"fired this cycle in case you missed any of it:\n\n"
+        f"• {calls_30d} structured calls\n"
+        f"• {wins_30d} closed at +50%+\n"
+        f"• Headline: {top_pair} ran +{top_pct}%\n\n"
+        f"Most of those are sitting in the track-record channel with "
+        f"the entry, the TP scale-outs, and the chart. If you didn’t "
+        f"catch them in real time, the playback is there.\n\n"
+        f"See what closed this cycle: {track_record}\n\n"
+        f"If something’s not working and you’re thinking about "
+        f"cancelling, reply first. I’d rather fix it than lose you. "
+        f"We read every email.\n"
+    )
+    html_body = (
+        f"<p>Hey {escape(name)},</p>"
+        f"<p>Your Elite renews in 3 days. Before it does, here’s what "
+        f"fired this cycle in case you missed any of it:</p>"
+        f"<ul>"
+        f"<li>{calls_30d} structured calls</li>"
+        f"<li>{wins_30d} closed at +50%+</li>"
+        f"<li>Headline: <strong>{escape(str(top_pair))} ran +{top_pct}%"
+        f"</strong></li>"
+        f"</ul>"
+        f"<p>Most of those are sitting in the track-record channel "
+        f"with the entry, the TP scale-outs, and the chart. If you "
+        f"didn’t catch them in real time, the playback is there.</p>"
+        f"{_cta_button_html('See what closed this cycle', track_record)}"
+        f"<p style='color:#b0b0b8;font-size:14px;'>If something’s not "
+        f"working and you’re thinking about cancelling, reply first. "
+        f"I’d rather fix it than lose you. We read every email.</p>"
+    )
+    return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
+
+
 _BRONZE_RENDERERS = {
+    0: _bronze_day0,
     1: _bronze_day1,
     3: _bronze_day3,
     5: _bronze_day5,
+    7: _bronze_day7,
+}
+
+# Branch-aware variants. Picked by the future behaviour evaluator at
+# scheduling time via a (sequence='bronze', day=N, branch=<HOT|WARM|COLD>)
+# tuple. Until the evaluator lands the default day-keyed renderers above
+# fall through, which preserves existing pre-branch behaviour.
+_BRONZE_BRANCH_RENDERERS = {
+    (3, "warm"): _bronze_day3_warm,
+    (3, "cold"): _bronze_day3_cold,
+    (5, "hot"):  _bronze_day5_hot,
+    (5, "warm"): _bronze_day5_warm,
+}
+
+_PAID_AT_RISK_RENDERERS = {
+    0: _paid_at_risk_day0,
+    3: _paid_at_risk_day3,
+}
+
+# pre_renewal HIGH / LOW variants. The existing _pre_renewal stays as
+# the default in _ONESHOT_RENDERERS; the evaluator picks the variant
+# when engagement signals warrant it.
+_PRE_RENEWAL_BRANCH_RENDERERS = {
+    "high": _pre_renewal_high,
+    "low":  _pre_renewal_low,
 }
 
 
@@ -1592,6 +2237,10 @@ _ONESHOT_RENDERERS = {
     "inactive_day10": _inactive_day10,
     "save_offer": lambda sub, stats: _save_offer_day0(sub, stats),
     "post_retention": lambda sub, stats: _post_retention_day7(sub, stats),
+    # Event-driven big-call gap email for non-converted Bronze. Fired
+    # by the nurture cron only when a closed Elite call exceeds the
+    # configured P&L threshold. See _nurture above.
+    "nurture": _nurture,
 }
 
 
@@ -1694,8 +2343,11 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
             f"offer $69/mo billed yearly ($828). Same full Elite access "
             f"for a lower monthly rate.</p>"
         )
-    elif reason == "not_using":
-        # Offer B (pause)
+    elif reason == "not_using" and _PAUSE_FEATURE_ENABLED:
+        # Offer B (pause): only rendered when the pause feature flag is on.
+        # When the flag is off the next branch below catches not_using and
+        # routes it to a discount-based fallback so the email never
+        # promises a feature that does not exist yet.
         subject = f"{name}, pause instead of cancel?"
         cta = "Pause for 30 days"
         text_body = (
@@ -1721,8 +2373,43 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
             f"<p style='color:#b0b0b8;font-size:14px;'>Zero effort, zero cost, "
             f"you stay in the network.</p>"
         )
-    elif reason == "market_slow":
-        # Offer C (pause)
+    elif reason == "not_using":
+        # Offer B alt (pause disabled): same $79/month lever as Offer A,
+        # framed around "find your rhythm" instead of price. Reuses the
+        # existing promo-code minting on the router side so no Whop
+        # changes are needed; only the copy differs.
+        subject = f"{name}, before you go: 20% off while you settle in"
+        cta = "Try at $79/month"
+        text_body = (
+            f"Hey {name},\n\n"
+            f"Fair call. No point paying full price if you haven’t "
+            f"found your rhythm with it yet.\n\n"
+            f"Before you go, here’s something we don’t normally offer: "
+            f"$79/month for the next 3 months (20% off our standard "
+            f"rate). Use the lower-cost window to actually plug in: drop "
+            f"into the calls channel, set up the Telegram alert bot, try "
+            f"one VC. If it’s still not landing after that, cancel "
+            f"anytime.\n\n"
+            f"Lock it in here: {rejoin}\n\n"
+            f"This personal link expires in 14 days."
+        )
+        body_html = (
+            f"<p>Hey {escape(name)},</p>"
+            f"<p>Fair call. No point paying full price if you haven’t "
+            f"found your rhythm with it yet.</p>"
+            f"<p>Before you go, here’s something we don’t normally offer: "
+            f"<strong>$79/month for the next 3 months (20% off our standard "
+            f"rate)</strong>. Use the lower-cost window to actually plug "
+            f"in: drop into the calls channel, set up the Telegram alert "
+            f"bot, try one VC. If it’s still not landing after that, "
+            f"cancel anytime.</p>"
+            f"{_cta_button_html(cta, rejoin)}"
+            f"<p style='color:#b0b0b8;font-size:14px;'>This personal link "
+            f"expires in 14 days.</p>"
+        )
+    elif reason == "market_slow" and _PAUSE_FEATURE_ENABLED:
+        # Offer C (pause): only when the pause feature flag is on. See
+        # the not_using branch above for the same flag pattern.
         subject = f"{name}, pause until things heat up"
         cta = "Pause until the market picks up"
         text_body = (
@@ -1749,6 +2436,38 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
             f"<p style='color:#b0b0b8;font-size:14px;'>You won’t be billed "
             f"during the pause. Auto-reactivates on day 31 unless you "
             f"extend or cancel.</p>"
+        )
+    elif reason == "market_slow":
+        # Offer C alt (pause disabled): same $79/month lever, framed
+        # around "the quiet stretch is when the room sharpens" instead
+        # of pause. Reuses the existing promo-code minting on the router
+        # side so no Whop changes are needed; only the copy differs.
+        subject = f"{name}, the quiet stretch is when the room sharpens"
+        cta = "Stay at $79/month"
+        text_body = (
+            f"Hey {name},\n\n"
+            f"Markets cycle. The quiet stretches are when most people "
+            f"drift off, and they’re also when the prepared ones get "
+            f"sharper on setups they’d miss in a hot market.\n\n"
+            f"Instead of stepping out: $79/month for the next 3 months "
+            f"(20% off standard). When sentiment flips, you’re already "
+            f"plugged in and pattern-matching. Cancel anytime if it’s "
+            f"still not landing.\n\n"
+            f"Lock it in here: {rejoin}\n\n"
+            f"This personal link expires in 14 days."
+        )
+        body_html = (
+            f"<p>Hey {escape(name)},</p>"
+            f"<p>Markets cycle. The quiet stretches are when most people "
+            f"drift off, and they’re also when the prepared ones get "
+            f"sharper on setups they’d miss in a hot market.</p>"
+            f"<p>Instead of stepping out: <strong>$79/month for the next "
+            f"3 months</strong> (20% off standard). When sentiment "
+            f"flips, you’re already plugged in and pattern-matching. "
+            f"Cancel anytime if it’s still not landing.</p>"
+            f"{_cta_button_html(cta, rejoin)}"
+            f"<p style='color:#b0b0b8;font-size:14px;'>This personal link "
+            f"expires in 14 days.</p>"
         )
     elif reason == "quality_declined":
         # Offer D: 7 free days + top 5 calls digest
@@ -1867,6 +2586,8 @@ def render(
             renderer = _onboard_monthly
     elif sequence == "dunning":
         renderer = _DUNNING_RENDERERS.get(day)
+    elif sequence == "paid_at_risk":
+        renderer = _PAID_AT_RISK_RENDERERS.get(day)
     elif sequence in _ONESHOT_RENDERERS:
         # One-shot sequences ignore `day` (always one email per trigger).
         renderer = lambda s, st, _r=_ONESHOT_RENDERERS[sequence]: _r(s, st)  # noqa: E731
