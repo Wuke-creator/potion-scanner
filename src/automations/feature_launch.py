@@ -21,6 +21,7 @@ from telegram import Bot
 from telegram.error import Forbidden, RetryAfter, TelegramError
 
 from src.automations.whop_members_db import WhopMembersDB
+from src.email_bot.events_db import EmailEventsDB
 from src.email_bot.sender import ResendClient
 from src.verification.db import VerificationDB
 
@@ -36,6 +37,7 @@ class LaunchStats:
     email_attempted: int = 0
     email_sent: int = 0
     email_failed: int = 0
+    email_suppressed: int = 0
     duration_sec: float = 0.0
 
 
@@ -101,15 +103,22 @@ class FeatureLaunchBroadcaster:
         telegram_rate_per_sec: float = 20.0,
         email_rate_per_sec: float = 5.0,
         whop_members_db: WhopMembersDB | None = None,
+        events_db: EmailEventsDB | None = None,
     ):
         """DMs use verification_db (Telegram-verified subset). Emails prefer
         whop_members_db (full Elite roster) so we reach non-Telegram members
         too, falling back to verification_db.list_active() + email filter if
-        whop_members isn't populated yet."""
+        whop_members isn't populated yet.
+
+        ``events_db`` is the optional last-mile suppression gate. When set,
+        any recipient with a prior bounce / complaint / unsubscribe event
+        is skipped before we call Resend.
+        """
         self._bot = telegram_bot
         self._db = verification_db
         self._whop_members_db = whop_members_db
         self._resend = resend_client
+        self._events_db = events_db
         self._cta_url = cta_url
         self._tg_interval = 1.0 / telegram_rate_per_sec
         self._email_interval = 1.0 / email_rate_per_sec
@@ -210,6 +219,29 @@ class FeatureLaunchBroadcaster:
             subject = f"Something new just dropped in Potion: {title}"
             for email in emails:
                 stats.email_attempted += 1
+                # Last-mile suppression gate. Audience filters (valid=1)
+                # block most bounced recipients upstream, but the events
+                # store has finer-grained signal (soft bounces, recent
+                # complaints, list-unsubscribe clicks) and acts as the
+                # authoritative last word. Skip on hit; count separately
+                # so the broadcast report shows suppression volume.
+                if self._events_db is not None:
+                    try:
+                        suppressed, reason = await self._events_db.is_suppressed_recipient(email)
+                    except Exception:
+                        logger.exception(
+                            "Suppression check crashed for %s; skipping send",
+                            email,
+                        )
+                        stats.email_suppressed += 1
+                        continue
+                    if suppressed:
+                        stats.email_suppressed += 1
+                        logger.info(
+                            "Broadcast skipping %s (suppressed: %s)",
+                            email, reason,
+                        )
+                        continue
                 try:
                     html = _build_email_html(title, description, self._cta_url)
                     text = _build_email_text(title, description, self._cta_url)

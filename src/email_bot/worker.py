@@ -17,6 +17,7 @@ import dataclasses
 import logging
 
 from src.email_bot.db import EmailDB, Subscriber
+from src.email_bot.events_db import EmailEventsDB
 from src.email_bot.sender import ResendClient, SendResult
 from src.email_bot.stats import gather_stats
 from src.email_bot.templates import render
@@ -47,6 +48,7 @@ class EmailWorker:
         whop_promo_api_key: str = "",
         whop_company_id: str = "",
         bronze_promo_ttl_days: int = 14,
+        events_db: EmailEventsDB | None = None,
     ):
         """``send_rate_per_sec`` throttles inter-send delays inside a cycle
         so we stay under Resend's per-second cap. Resend's transactional
@@ -69,6 +71,12 @@ class EmailWorker:
         self._whop_promo_api_key = whop_promo_api_key
         self._whop_company_id = whop_company_id
         self._bronze_promo_ttl_days = bronze_promo_ttl_days
+        # Optional last-mile suppression gate. When set, every send is
+        # blocked if the recipient has any prior bounce / complaint /
+        # unsubscribe event recorded in email_events.db. Wired in main.py
+        # at startup; unit tests can pass None (or a stub) to skip the
+        # check.
+        self._events_db = events_db
         self._task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
 
@@ -207,6 +215,39 @@ class EmailWorker:
         return dataclasses.replace(sub, rejoin_url=promo_url)
 
     async def _deliver_one(self, send, stats) -> None:
+        # Last-mile suppression gate. Defense in depth against the race
+        # between a bounce / complaint / unsubscribe event landing and
+        # the webhook handler's ``cancel_all_pending`` reaching this
+        # row. If the events DB says we should not send, we don't --
+        # the row is marked canceled with the reason on the error
+        # column and the loop moves on.
+        if self._events_db is not None:
+            try:
+                suppressed, reason = await self._events_db.is_suppressed_recipient(
+                    send.email,
+                )
+            except Exception:
+                logger.exception(
+                    "Suppression check crashed for send id=%d email=%s; "
+                    "failing closed (skipping send)",
+                    send.id, send.email,
+                )
+                # Fail closed: if the check itself crashes we'd rather
+                # skip the send than fire to a possibly-bounced recipient.
+                await self._db.mark_canceled(
+                    send.id, "suppression check error",
+                )
+                return
+            if suppressed:
+                logger.info(
+                    "Skipping send id=%d to %s (suppressed: %s)",
+                    send.id, send.email, reason,
+                )
+                await self._db.mark_canceled(
+                    send.id, f"suppressed: {reason}",
+                )
+                return
+
         sub = await self._db.get_subscriber(send.email)
         if sub is None:
             logger.warning(

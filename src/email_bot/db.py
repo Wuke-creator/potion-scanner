@@ -215,10 +215,20 @@ class EmailDB:
         # after a cancelled member reactivates — the "save was successful,
         # what convinced you to stay?" survey).
         "post_retention",
-        # Bronze -> Elite upsell (new Bronze members, days 1 / 3 / 5).
-        # Day 5 carries a single-use 30%-off Elite promo minted at send
-        # time. Independent lifecycle (not cancel-on-reschedule).
+        # Bronze -> Elite upsell. Originally days 1/3/5, extended to
+        # 0/1/3/5/7 by the 2026-05-19 behaviour-tree work. Day 5 carries
+        # the single-use 30%-off Elite promo minted at send time.
+        # Independent lifecycle (not cancel-on-reschedule).
         "bronze",
+        # Behaviour-tree additions (2026-05-19):
+        #   nurture       = event-driven big-call gap email for
+        #                   non-converted Bronze (one-shot per fire,
+        #                   cron filters by P&L threshold).
+        #   paid_at_risk  = 2-email D0/D3 catch-churn-before-cancel
+        #                   sequence for paid Elite members who go
+        #                   quiet in Discord 7-14d before renewal.
+        "nurture",
+        "paid_at_risk",
     }
 
     # Sequences that are mutually exclusive when scheduling — a fresh
@@ -297,7 +307,14 @@ class EmailDB:
         if sequence == "dunning":
             return (0, 3, 10)
         if sequence == "bronze":
-            return (1, 3, 5)
+            # Extended 2026-05-19 from (1, 3, 5) to (0, 1, 3, 5, 7):
+            # D0 welcomes + drives first Discord visit before the
+            # upsell starts; D7 is the last-call urgency on the
+            # BRONZE30 code (still minted at D5). The branch evaluator
+            # picks HOT/WARM variants at D3/D5 at send time.
+            return (0, 1, 3, 5, 7)
+        if sequence == "paid_at_risk":
+            return (0, 3)
         # One-shot sequences (pre_renewal etc.) get one send at the
         # caller-specified due_at via schedule_one — schedule_sequence
         # isn't the right entry point. Default to (0,) defensively.
@@ -338,6 +355,25 @@ class EmailDB:
             "UPDATE scheduled_sends SET status='canceled' "
             "WHERE email = ? AND sequence = ? AND status = 'pending'",
             (email, sequence),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def cancel_all_pending(self, email: str) -> int:
+        """Cancel every still-pending send for ``email`` across ALL sequences.
+
+        Used by the Resend bounce/complaint suppression path
+        (``_maybe_suppress`` in webhook.py): when a recipient bounces
+        or complains, we mark whop_members.valid=0 (blocks future
+        enrollment) AND cancel any in-flight scheduled rows so the
+        worker does not deliver another email to that recipient.
+        Returns the number of sends cancelled (0 = nothing pending).
+        """
+        assert self._conn is not None
+        cur = await self._conn.execute(
+            "UPDATE scheduled_sends SET status='canceled' "
+            "WHERE email = ? AND status = 'pending'",
+            (email,),
         )
         await self._conn.commit()
         return cur.rowcount or 0
@@ -439,6 +475,22 @@ class EmailDB:
             }
             for r in rows
         ]
+
+    async def mark_canceled(self, send_id: int, reason: str) -> None:
+        """Cancel a single in-flight send by id with a reason. Used by the
+        worker's last-mile suppression check: even after a send row was
+        claimed from ``due_sends()``, the recipient may have bounced /
+        complained / unsubscribed in the window between claim and
+        delivery. We cancel rather than mark_failed because this is not
+        a delivery failure -- it is a deliberate refusal to send.
+        """
+        assert self._conn is not None
+        await self._conn.execute(
+            "UPDATE scheduled_sends "
+            "SET status='canceled', sent_at=?, error=? WHERE id = ?",
+            (int(time.time()), reason[:500], send_id),
+        )
+        await self._conn.commit()
 
     async def mark_failed(self, send_id: int, error: str) -> None:
         assert self._conn is not None

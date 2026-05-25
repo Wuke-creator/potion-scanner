@@ -203,17 +203,6 @@ async def run(config: Config) -> None:
             "Signal images will fall back to Discord-URL passthrough."
         )
 
-    # --- Router: classify + parse + format, enqueue to dispatcher ---
-    router = Router(
-        discord_cfg=config.discord,
-        dispatcher=dispatcher,
-        analytics=analytics,
-        open_signals=open_signals_db,
-        quick_trade_enabled=config.trading.enabled,
-        image_archive=image_archive,
-        executor_client=trade_executor_client,
-    )
-
     # --- Automations: shared activity tracker (feeds Features 2 + 4) ---
     activity_db: ActivityDB | None = None
     whop_members_db: WhopMembersDB | None = None
@@ -286,6 +275,44 @@ async def run(config: Config) -> None:
         ops_thread_parent_ids=ops_thread_parents,
     )
 
+    # --- Track-record poster: public Discord channel of closed perps calls ---
+    # Disabled gracefully when TRACK_RECORD_CHANNEL_ID is unset (channel_id=0).
+    # Constructed after the listener so it can borrow the same Discord client.
+    track_record_poster = None
+    if config.track_record.enabled:
+        from src.automations.track_record_poster import TrackRecordPoster
+
+        track_record_poster = TrackRecordPoster(
+            discord_client=listener.client,
+            channel_id=config.track_record.channel_id,
+            db_path=config.track_record.db_path,
+            open_signals_db=open_signals_db,
+            telegram_bot=telegram_bot,
+            footer_url=config.track_record.footer_url,
+        )
+        await track_record_poster.open()
+        logger.info(
+            "Track-record poster enabled: channel_id=%d backfill_on_startup=%s",
+            config.track_record.channel_id,
+            config.track_record.backfill_on_startup,
+        )
+    else:
+        logger.info(
+            "Track-record poster disabled (set TRACK_RECORD_CHANNEL_ID to enable)",
+        )
+
+    # --- Router: classify + parse + format, enqueue to dispatcher ---
+    router = Router(
+        discord_cfg=config.discord,
+        dispatcher=dispatcher,
+        analytics=analytics,
+        open_signals=open_signals_db,
+        quick_trade_enabled=config.trading.enabled,
+        image_archive=image_archive,
+        executor_client=trade_executor_client,
+        track_record_poster=track_record_poster,
+    )
+
     # --- Email bot DB + sender (construction only; registration later) ---
     email_db: EmailDB | None = None
     email_events_db: EmailEventsDB | None = None
@@ -323,6 +350,12 @@ async def run(config: Config) -> None:
                 whop_promo_api_key=config.automations.whop_promo_api_key,
                 whop_company_id=config.automations.whop_company_id,
                 bronze_promo_ttl_days=config.automations.bronze_promo_ttl_days,
+                # Last-mile suppression gate. With this wired, any send
+                # whose recipient has previously bounced / complained /
+                # unsubscribed gets canceled at delivery time -- even if
+                # the row slipped through cancel_all_pending due to a
+                # race with the bounce webhook.
+                events_db=email_events_db,
             )
             # AUT-026 Targeted Save Offer Router. Reuses the cancel-survey
             # promo-creation key (same Whop scope: promo_code:create +
@@ -384,6 +417,9 @@ async def run(config: Config) -> None:
             resend_client=email_sender,
             cta_url=config.automations.launch_cta_url,
             whop_members_db=whop_members_db,
+            # Last-mile suppression gate: broadcast skips any recipient
+            # with a prior bounce / complaint / unsubscribe.
+            events_db=email_events_db,
         )
 
         if email_db is not None:
@@ -693,6 +729,42 @@ async def run(config: Config) -> None:
         _consume_queue(queue, router, shutdown), name="queue_consumer",
     )
 
+    # --- Track-record backfill: one-off walk of recent closes at startup ---
+    # Waits for the Discord client to be ready (so fetch_channel works) and
+    # then posts anything not already in the idempotency table. Runs as a
+    # background task so we don't block the shutdown signal handler.
+    if (
+        track_record_poster is not None
+        and config.track_record.backfill_on_startup
+    ):
+        async def _track_record_backfill_startup() -> None:
+            try:
+                await listener.client.wait_until_ready()
+                # Every forwarded channel contributes to the track-record;
+                # mirror channels never have lifecycle events recorded in
+                # open_signals so they're harmlessly absent here too.
+                eligible = config.discord.channel_ids()
+                names = {
+                    ch.channel_id: f"#{ch.name}"
+                    for ch in config.discord.channels
+                }
+                count = await track_record_poster.backfill(
+                    days=config.track_record.backfill_days,
+                    eligible_channel_ids=eligible,
+                    channel_display_names=names,
+                    pace_sec=config.track_record.backfill_pace_sec,
+                )
+                logger.info(
+                    "Track-record startup backfill posted %d call(s)", count,
+                )
+            except Exception:
+                logger.exception("Track-record startup backfill crashed")
+
+        asyncio.create_task(
+            _track_record_backfill_startup(),
+            name="track_record_backfill_startup",
+        )
+
     active_user_count = await verification.db.count_active()
     logger.info(
         "Bot started — monitoring %d channel(s), %d verified user(s), "
@@ -788,6 +860,11 @@ async def run(config: Config) -> None:
                 await image_archive.close()
             except Exception:
                 logger.exception("Image archive close error")
+        if track_record_poster is not None:
+            try:
+                await track_record_poster.close()
+            except Exception:
+                logger.exception("Track-record poster close error")
         if trade_executor_client is not None:
             try:
                 await trade_executor_client.close()

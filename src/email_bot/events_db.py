@@ -76,6 +76,24 @@ CREATE INDEX IF NOT EXISTS idx_events_recipient
     ON email_events(recipient, event_type);
 """
 
+# Unsubscribe ledger. Created here so the suppression gate
+# (``is_suppressed_recipient``) can query it without crashing on a
+# fresh DB. Production already has this table; ``IF NOT EXISTS`` makes
+# the statement a no-op there.
+_UNSUBS_DDL = """
+CREATE TABLE IF NOT EXISTS email_unsubscribes (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  recipient        TEXT NOT NULL,
+  recipient_domain TEXT NOT NULL DEFAULT '',
+  source           TEXT NOT NULL DEFAULT '',
+  resend_email_id  TEXT NOT NULL DEFAULT '',
+  unsubscribed_at  INTEGER NOT NULL,
+  ip_address       TEXT,
+  user_agent       TEXT,
+  UNIQUE(recipient)
+);
+"""
+
 
 class EmailEventsDB:
     """Async SQLite wrapper for the Resend webhook event store."""
@@ -91,6 +109,7 @@ class EmailEventsDB:
         await self._conn.execute(_EVENTS_DDL)
         await self._conn.execute(_EVENTS_BROADCAST_INDEX)
         await self._conn.execute(_EVENTS_RECIPIENT_INDEX)
+        await self._conn.execute(_UNSUBS_DDL)
         await self._conn.commit()
         logger.info("Email events DB opened at %s", self._db_path)
 
@@ -407,6 +426,67 @@ class EmailEventsDB:
         ) as cursor:
             row = await cursor.fetchone()
         return int(row[0]) if row else 0
+
+    async def is_suppressed_recipient(
+        self, email: str,
+    ) -> tuple[bool, str | None]:
+        """Last-mile suppression gate: should we refuse to send to this
+        recipient right now?
+
+        Returns ``(True, reason)`` if any of:
+          - the recipient has any prior ``bounced`` event recorded
+            (hard OR soft -- per the 2026-05-19 policy, one bounce is
+            enough forever)
+          - the recipient has any prior ``complained`` event recorded
+          - the recipient is in ``email_unsubscribes`` (List-Unsubscribe
+            click or manual operator action)
+
+        Returns ``(False, None)`` otherwise.
+
+        Designed for callers in the actual send path
+        (``EmailWorker._deliver_one``, broadcast loops) as a defense in
+        depth against the race window between a bounce webhook arriving
+        and ``cancel_all_pending`` reaching the in-flight row. The check
+        is case-insensitive on email.
+
+        Cheap: both queries are O(log n) on the recipient index already
+        present on ``email_events`` and the UNIQUE constraint on
+        ``email_unsubscribes.recipient``.
+        """
+        assert self._conn is not None
+        if not email:
+            return False, None
+        e = email.strip()
+        if not e:
+            return False, None
+
+        # Bounce / complaint events.
+        async with self._conn.execute(
+            "SELECT event_type, bounce_type FROM email_events "
+            "WHERE LOWER(recipient) = LOWER(?) "
+            "  AND event_type IN ('bounced', 'complained') "
+            "ORDER BY event_at ASC LIMIT 1",
+            (e,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is not None:
+            event_type = str(row[0])
+            if event_type == "complained":
+                return True, "complaint"
+            bounce_type = (row[1] or "unknown").lower()
+            return True, f"{bounce_type} bounce"
+
+        # List-Unsubscribe / manual unsub.
+        async with self._conn.execute(
+            "SELECT 1 FROM email_unsubscribes "
+            "WHERE LOWER(recipient) = LOWER(?) LIMIT 1",
+            (e,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is not None:
+            return True, "unsubscribed"
+
+        return False, None
 
     async def cleanup_older_than(self, seconds: int) -> int:
         """Drop event rows older than `seconds` ago. Returns rowcount.
