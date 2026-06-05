@@ -443,6 +443,21 @@ def _build_blofin_trade_url(ref_link: str, pair: str) -> str:
 QUICK_TRADE_CALLBACK_PREFIX = "qt:open:"
 
 
+def _community_button() -> InlineKeyboardButton | None:
+    """Optional 'Join the Discord' button appended to signal keyboards.
+
+    The community link is a single global value (the same for every
+    signal), so it is read from the ``POTION_DISCORD_URL`` env var here
+    rather than threaded through all ~9 ``build_signal_keyboard`` call
+    sites. Returns None when unset, so signal keyboards are unchanged
+    until the URL is configured.
+    """
+    url = (os.getenv("POTION_DISCORD_URL") or "").strip()
+    if not url:
+        return None
+    return InlineKeyboardButton(text="\U0001f4ac Join the Discord", url=url)
+
+
 def build_signal_keyboard(
     ref_link: str,
     pair: str,
@@ -482,6 +497,9 @@ def build_signal_keyboard(
         InlineKeyboardButton(text="\U0001f7e2 Trade now", url=trade_url),
         InlineKeyboardButton(text="\U0001f4ca Chart", url=chart_url),
     ])
+    community = _community_button()
+    if community is not None:
+        rows.append([community])
     return InlineKeyboardMarkup(rows)
 
 

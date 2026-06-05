@@ -44,9 +44,9 @@ CONNECT_HOWTO = (
     "exceed).\n"
     "5. Register the delegate on-chain (one transaction).\n\n"
     "When that is done, paste the values back here in this exact format "
-    "(one message):\n\n"
-    "<code>trader: 0xYourWalletAddress\n"
-    "delegate: 0xDelegatePrivateKeyHere</code>\n\n"
+    "(one message). Tap the block to copy it, then replace both values:\n\n"
+    "<pre>trader: 0xYourWalletAddress\n"
+    "delegate: 0xDelegatePrivateKeyHere</pre>\n\n"
     "I will encrypt the key on our server and never log it. Use "
     "/disconnect anytime to wipe it."
 )

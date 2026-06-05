@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from telegram import (
@@ -71,6 +72,16 @@ _STATE_DISCLOSURE = "disclosure_shown"
 _STATE_AWAITING = "awaiting_paste"
 
 _CB_CONTINUE = "tc:continue"
+
+# Onboarding screenshot shown at the paste-back step: the Ostium
+# "Generate delegate key" screen with the Copy button and smart-account
+# address highlighted. Drop the PNG at repo-root static/connect-guide.png
+# and it is sent as a photo with the how-to as the caption. If the file
+# is absent the step falls back to text only, so this is safe to ship
+# before the image is committed.
+_CONNECT_GUIDE_IMAGE = (
+    Path(__file__).resolve().parents[2] / "static" / "connect-guide.png"
+)
 _CB_CANCEL = "tc:cancel"
 
 
@@ -199,11 +210,36 @@ class TradingCommands:
 
         if ctx.user_data is not None:
             ctx.user_data[_STATE_KEY] = _STATE_AWAITING
-        await query.edit_message_text(
-            CONNECT_HOWTO,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+
+        # Show the Ostium "Generate delegate key" screenshot with the
+        # how-to as the caption so the user can see exactly where to copy
+        # the key and smart-account address. Falls back to text-only if
+        # the image is not bundled or Telegram rejects the photo.
+        sent_photo = False
+        if _CONNECT_GUIDE_IMAGE.exists():
+            try:
+                with _CONNECT_GUIDE_IMAGE.open("rb") as fh:
+                    await ctx.bot.send_photo(
+                        chat_id=user_id,
+                        photo=fh,
+                        caption=CONNECT_HOWTO,
+                        parse_mode="HTML",
+                    )
+                sent_photo = True
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+            except Exception:
+                logger.exception(
+                    "connect guide photo send failed; using text fallback",
+                )
+        if not sent_photo:
+            await query.edit_message_text(
+                CONNECT_HOWTO,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
 
     async def _cb_cancel(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE,
