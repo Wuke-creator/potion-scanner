@@ -20,6 +20,7 @@ import pytest
 import pytest_asyncio
 
 from src.automations.whop_members_db import WhopMembersDB
+from src.email_bot.db import EmailDB, Subscriber
 from src.email_bot.discord_commands import _render_broadcast_stats
 from src.email_bot.events_db import EmailEventsDB
 from src.email_bot.webhook import (
@@ -605,11 +606,19 @@ def _signed_request(payload: dict, secret: str = _TEST_SECRET_FULL):
 
 
 async def _make_handlers(
-    events_db: EmailEventsDB, members_db: WhopMembersDB,
+    events_db: EmailEventsDB,
+    members_db: WhopMembersDB,
+    email_db=None,
 ) -> EmailWebhookHandlers:
-    # email_db is unused by _resend_webhook; pass a sentinel.
+    # email_db is now used by _resend_webhook -> _maybe_suppress to
+    # cancel pending sends on bounce/complaint. Default to an AsyncMock
+    # for tests that don't care about the cancellation effect; pass a
+    # real EmailDB for tests that assert against it.
+    if email_db is None:
+        email_db = AsyncMock()
+        email_db.cancel_all_pending = AsyncMock(return_value=0)
     return EmailWebhookHandlers(
-        db=object(),
+        db=email_db,
         whop_webhook_secret="ignored",
         admin_secret="ignored",
         rejoin_url_default="https://whop.com/potion",
@@ -656,6 +665,10 @@ class TestResendWebhookSuppression:
     async def test_first_soft_bounce_does_not_suppress(
         self, events_db: EmailEventsDB, members_db: WhopMembersDB,
     ):
+        # 2026-05-25 policy: a lone soft bounce is treated as transient
+        # (full mailbox, brief server issue, momentary DNS hiccup).
+        # Suppression only fires once SOFT_BOUNCE_THRESHOLD_COUNT
+        # strikes accumulate inside SOFT_BOUNCE_WINDOW_SECONDS.
         await members_db.upsert_member(
             "wuid-1", discord_user_id="d1", email="user@example.com",
             valid=True, membership_id="m1",
@@ -667,9 +680,9 @@ class TestResendWebhookSuppression:
 
         await handlers._resend_webhook(request)
         rows = await members_db.list_valid_with_email()
-        assert len(rows) == 1  # still valid
+        assert len(rows) == 1  # one soft bounce alone is not enough
 
-    async def test_third_soft_bounce_in_30d_suppresses(
+    async def test_third_soft_bounce_in_window_suppresses(
         self, events_db: EmailEventsDB, members_db: WhopMembersDB,
     ):
         await members_db.upsert_member(
@@ -678,27 +691,56 @@ class TestResendWebhookSuppression:
         )
         handlers = await _make_handlers(events_db, members_db)
 
+        # Three soft bounces inside the 14-day window trips the rule.
+        # Each event needs a distinct (resend_email_id, event_type,
+        # event_at) tuple so the UNIQUE constraint records each one.
+        base_ts = int(time.time())
         for i in range(3):
             request, _ = _signed_request(_resend_payload(
                 event_type="bounced", bounce_type="soft",
                 email_id=f"soft-{i}",
+                created_at=time.strftime(
+                    "%Y-%m-%dT%H:%M:%S.000Z",
+                    time.gmtime(base_ts + i),
+                ),
             ))
             await handlers._resend_webhook(request)
 
         rows = await members_db.list_valid_with_email()
         assert len(rows) == 0
 
-    async def test_old_soft_bounces_do_not_count(
+    async def test_two_soft_bounces_in_window_do_not_suppress(
         self, events_db: EmailEventsDB, members_db: WhopMembersDB,
     ):
+        # Below the threshold inside the window. Stays sendable.
         await members_db.upsert_member(
             "wuid-1", discord_user_id="d1", email="user@example.com",
             valid=True, membership_id="m1",
         )
-        # Pre-seed two soft bounces older than 30 days directly into
-        # the events DB. The webhook then fires a fresh soft bounce;
-        # it should NOT trip suppression because the old ones are out
-        # of the window.
+        handlers = await _make_handlers(events_db, members_db)
+        base_ts = int(time.time())
+        for i in range(2):
+            request, _ = _signed_request(_resend_payload(
+                event_type="bounced", bounce_type="soft",
+                email_id=f"soft-{i}",
+                created_at=time.strftime(
+                    "%Y-%m-%dT%H:%M:%S.000Z",
+                    time.gmtime(base_ts + i),
+                ),
+            ))
+            await handlers._resend_webhook(request)
+        rows = await members_db.list_valid_with_email()
+        assert len(rows) == 1
+
+    async def test_old_soft_bounces_outside_window_do_not_count(
+        self, events_db: EmailEventsDB, members_db: WhopMembersDB,
+    ):
+        # Two soft bounces from 60 days ago plus one fresh one is below
+        # the threshold inside the 14-day window. Stays sendable.
+        await members_db.upsert_member(
+            "wuid-1", discord_user_id="d1", email="user@example.com",
+            valid=True, membership_id="m1",
+        )
         old_ts = int(time.time()) - 60 * 86400
         for i in range(2):
             await events_db.record_event(**_record_kwargs(
@@ -716,7 +758,7 @@ class TestResendWebhookSuppression:
         await handlers._resend_webhook(request)
 
         rows = await members_db.list_valid_with_email()
-        assert len(rows) == 1  # still valid
+        assert len(rows) == 1  # historical bounces don't count
 
     async def test_retried_event_does_not_resuppress(
         self, events_db: EmailEventsDB, members_db: WhopMembersDB,
@@ -743,6 +785,60 @@ class TestResendWebhookSuppression:
         # First insert flips the row; second is a UNIQUE collision so
         # mark_invalid_by_email must NOT be called the second time.
         assert members_db.mark_invalid_by_email.call_count == 1
+
+    async def test_bounce_cancels_pending_scheduled_sends(
+        self, events_db: EmailEventsDB, members_db: WhopMembersDB,
+        tmp_path: Path,
+    ):
+        # 2026-05-19 policy: when a bounce arrives we must not only
+        # block FUTURE enrollment (whop_members.valid=0) but also
+        # cancel any IN-FLIGHT scheduled rows so the worker does not
+        # deliver another email to the bounced recipient.
+        recipient = "bouncer@example.com"
+        await members_db.upsert_member(
+            "wuid-1", discord_user_id="d1", email=recipient,
+            valid=True, membership_id="m1",
+        )
+        # Real on-disk EmailDB with a bronze sequence enqueued.
+        email_db = EmailDB(db_path=str(tmp_path / "bounce_test_email.db"))
+        await email_db.open()
+        try:
+            await email_db.upsert_subscriber(Subscriber(
+                email=recipient, name="B", trigger_type="bronze",
+                exit_reason="none", rejoin_url="u",
+                created_at=int(time.time()),
+            ))
+            await email_db.schedule_sequence(
+                email=recipient, sequence="bronze",
+            )
+            # All 5 bronze rows should be pending before the bounce.
+            horizon = int(time.time()) + 30 * 86400
+            pending_before = [
+                s for s in await email_db.due_sends(now=horizon)
+                if s.email == recipient and s.status == "pending"
+            ]
+            assert len(pending_before) == 5
+
+            handlers = await _make_handlers(
+                events_db, members_db, email_db=email_db,
+            )
+            request, _ = _signed_request(_resend_payload(
+                event_type="bounced", bounce_type="hard",
+                recipient=recipient,
+            ))
+            resp = await handlers._resend_webhook(request)
+            assert resp.status == 200
+
+            # whop_members invalidated AND every pending bronze row canceled.
+            rows_valid = await members_db.list_valid_with_email()
+            assert all(r.email != recipient for r in rows_valid)
+            pending_after = [
+                s for s in await email_db.due_sends(now=horizon)
+                if s.email == recipient and s.status == "pending"
+            ]
+            assert pending_after == []
+        finally:
+            await email_db.close()
 
     async def test_unknown_recipient_no_crash(
         self, events_db: EmailEventsDB, members_db: WhopMembersDB,

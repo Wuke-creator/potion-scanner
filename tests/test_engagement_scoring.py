@@ -10,15 +10,22 @@ import pytest
 import pytest_asyncio
 
 from src.email_bot.engagement_scoring import (
+    CLICK_HALF_LIFE_DAYS,
+    CLICK_WEIGHT,
     EngagementScore,
     EngagementScoreDB,
     HOT_THRESHOLD,
+    OPEN_HALF_LIFE_DAYS,
+    OPEN_WEIGHT,
+    REPLY_WEIGHT,
     SCORING_WINDOW_SECONDS,
     TIER_COLD,
     TIER_HOT,
     TIER_WARM,
     WARM_THRESHOLD,
     compute_score,
+    decayed_value,
+    score_from_event_ages,
     tier_for_score,
 )
 
@@ -29,96 +36,84 @@ from src.email_bot.engagement_scoring import (
 
 
 class TestComputeScore:
-    """No DB involved. Just the math."""
+    """No DB involved. Just the decay math."""
 
     def test_zero_when_no_events(self):
+        assert compute_score() == 0.0
+
+    def test_open_at_age_zero_weights_full(self):
+        # Single open landed just now -> full OPEN_WEIGHT.
         assert compute_score(
-            opens=0, clicks=0,
-            last_open_at=None, last_click_at=None,
-            now=1_700_000_000,
-        ) == 0
+            open_decayed_sum=decayed_value(
+                age_days=0, half_life_days=OPEN_HALF_LIFE_DAYS,
+            ),
+        ) == pytest.approx(OPEN_WEIGHT)
 
-    def test_opens_only(self):
-        # 5 opens * 1pt = 5
-        assert compute_score(
-            opens=5, clicks=0,
-            last_open_at=None, last_click_at=None,
-            now=1_700_000_000,
-        ) == 5
-
-    def test_clicks_outweigh_opens(self):
-        # 1 click (3) > 2 opens (2)
-        assert compute_score(
-            opens=0, clicks=1,
-            last_open_at=None, last_click_at=None,
-            now=1_700_000_000,
-        ) > compute_score(
-            opens=2, clicks=0,
-            last_open_at=None, last_click_at=None,
-            now=1_700_000_000,
-        )
-
-    def test_recent_open_bonus_applies(self):
-        now = 1_700_000_000
-        # Open 1 day ago -> +2 bonus on top of the 1pt open value.
-        with_bonus = compute_score(
-            opens=1, clicks=0,
-            last_open_at=now - 86400, last_click_at=None,
-            now=now,
-        )
-        assert with_bonus == 1 + 2
-
-    def test_recent_open_bonus_does_not_apply_past_window(self):
-        now = 1_700_000_000
-        # Open 10 days ago: outside 7-day recency window.
-        no_bonus = compute_score(
-            opens=1, clicks=0,
-            last_open_at=now - 10 * 86400, last_click_at=None,
-            now=now,
-        )
-        assert no_bonus == 1
-
-    def test_recent_click_bonus_applies(self):
-        now = 1_700_000_000
-        # Click 7 days ago -> +5 bonus on top of 3pt click value.
-        with_bonus = compute_score(
-            opens=0, clicks=1,
-            last_open_at=None, last_click_at=now - 7 * 86400,
-            now=now,
-        )
-        assert with_bonus == 3 + 5
-
-    def test_recent_click_bonus_does_not_apply_past_window(self):
-        now = 1_700_000_000
-        no_bonus = compute_score(
-            opens=0, clicks=1,
-            last_open_at=None, last_click_at=now - 30 * 86400,
-            now=now,
-        )
-        assert no_bonus == 3
-
-    def test_full_stack(self):
-        # 3 opens (+3), 2 clicks (+6), open 1d ago (+2), click 5d ago (+5)
-        # = 16, comfortably hot
-        now = 1_700_000_000
+    def test_open_at_half_life_halves_contribution(self):
         score = compute_score(
-            opens=3, clicks=2,
-            last_open_at=now - 86400, last_click_at=now - 5 * 86400,
-            now=now,
+            open_decayed_sum=decayed_value(
+                age_days=OPEN_HALF_LIFE_DAYS,
+                half_life_days=OPEN_HALF_LIFE_DAYS,
+            ),
         )
-        assert score == 16
+        assert score == pytest.approx(OPEN_WEIGHT * 0.5)
+
+    def test_click_decays_slower_than_open_at_same_age(self):
+        age = 7.0
+        open_part = OPEN_WEIGHT * decayed_value(
+            age_days=age, half_life_days=OPEN_HALF_LIFE_DAYS,
+        )
+        click_part = CLICK_WEIGHT * decayed_value(
+            age_days=age, half_life_days=CLICK_HALF_LIFE_DAYS,
+        )
+        # Clicks: weight 3, half-life 14 (so age=7 gives 0.707 of weight).
+        # Opens: weight 1, half-life 7 (so age=7 gives 0.5 of weight).
+        assert click_part > open_part
+
+    def test_score_from_event_ages_hot_user(self):
+        # Heavy engagement: 6 opens at ~1d + 4 clicks at ~2d. Under the
+        # new decay model the score lands well past HOT_THRESHOLD; the
+        # old fixture (3 opens + 2 clicks) lands warm now.
+        score = score_from_event_ages(
+            open_ages_days=[1.0] * 6,
+            click_ages_days=[2.0] * 4,
+        )
+        assert score > HOT_THRESHOLD
         assert tier_for_score(score) == TIER_HOT
+
+    def test_score_falls_with_age(self):
+        recent = score_from_event_ages(click_ages_days=[1.0])
+        old = score_from_event_ages(click_ages_days=[28.0])
+        assert recent > old
 
     def test_replies_weighted_heaviest(self):
-        # 1 reply alone hits hot tier
-        score = compute_score(
-            opens=0, clicks=0,
-            last_open_at=None, last_click_at=None,
-            now=1_700_000_000,
-            replies=1,
-        )
-        assert score == 10
+        # One fresh reply alone hits hot tier.
+        score = score_from_event_ages(reply_ages_days=[0.0])
+        assert score == pytest.approx(REPLY_WEIGHT)
         assert tier_for_score(score) == TIER_HOT
+
+
+class TestDecayedValue:
+    def test_zero_age_returns_one(self):
+        assert decayed_value(
+            age_days=0, half_life_days=7,
+        ) == pytest.approx(1.0)
+
+    def test_half_life_halves(self):
+        assert decayed_value(
+            age_days=7, half_life_days=7,
+        ) == pytest.approx(0.5)
+
+    def test_two_half_lives_quarters(self):
+        assert decayed_value(
+            age_days=14, half_life_days=7,
+        ) == pytest.approx(0.25)
+
+    def test_negative_age_clamps_to_one(self):
+        # Clock skew safety: a future event shouldn't blow the score up.
+        assert decayed_value(
+            age_days=-1, half_life_days=7,
+        ) == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -352,16 +347,19 @@ class TestRecomputeAll:
     async def test_recompute_classifies_hot_user(self, score_db):
         db, path = score_db
         now = 1_700_000_000
-        # Seed events directly on the same DB.
+        # Seed a heavily-engaged recipient: 6 opens + 4 clicks all
+        # inside the last few days. Under exponential decay this
+        # comfortably exceeds HOT_THRESHOLD; the old "3 opens 2 clicks"
+        # fixture now lands warm.
         side = await aiosqlite.connect(str(path))
         try:
-            for i in range(3):
+            for i in range(6):
                 await _seed_event(
                     side, recipient="alice@example.com",
                     event_type="opened",
                     event_at=now - (i + 1) * 86400,
                 )
-            for i in range(2):
+            for i in range(4):
                 await _seed_event(
                     side, recipient="alice@example.com",
                     event_type="clicked",
@@ -375,12 +373,17 @@ class TestRecomputeAll:
 
         row = await db.get("alice@example.com")
         assert row is not None
-        # 3 opens (3) + 2 clicks (6) + recent open (+2) + recent click (+5)
-        # = 16, hot.
-        assert row.score == 16
         assert row.tier == TIER_HOT
-        assert row.opens_30d == 3
-        assert row.clicks_30d == 2
+        assert row.opens_30d == 6
+        assert row.clicks_30d == 4
+        # Cross-check the SQL-side decayed sum against the Python-side
+        # scorer so any drift in the SQL math gets caught.
+        expected = score_from_event_ages(
+            open_ages_days=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            click_ages_days=[1.0, 2.0, 3.0, 4.0],
+        )
+        assert row.score == pytest.approx(expected, rel=1e-3)
+        assert row.score >= HOT_THRESHOLD
 
     async def test_recompute_ignores_events_outside_window(self, score_db):
         db, path = score_db

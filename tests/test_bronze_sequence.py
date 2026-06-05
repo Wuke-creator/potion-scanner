@@ -36,14 +36,18 @@ async def email_db(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_bronze_registered_and_scheduled(email_db: EmailDB):
     assert "bronze" in email_db.KNOWN_SEQUENCES
-    assert email_db._default_offsets("bronze") == (1, 3, 5)
+    # Bronze offsets extended 2026-05-19 from (1,3,5) to (0,1,3,5,7) as
+    # part of the behaviour-tree work. D0 welcomes + drives first Discord
+    # visit; D7 is last-call urgency on the BRONZE30 code minted at D5.
+    assert email_db._default_offsets("bronze") == (0, 1, 3, 5, 7)
     await email_db.upsert_subscriber(Subscriber(
         email="b@x.com", name="B", trigger_type="bronze",
         exit_reason="none", rejoin_url="https://whop.com/potion",
         created_at=int(time.time()),
     ))
     ids = await email_db.schedule_sequence(email="b@x.com", sequence="bronze")
-    assert len(ids) == 3
+    # 5 since the 2026-05-19 D0+D7 extension.
+    assert len(ids) == 5
 
 
 @pytest.mark.asyncio

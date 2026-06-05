@@ -42,7 +42,11 @@ from typing import Mapping
 from aiohttp import web
 
 from src.email_bot.db import Subscriber
-from src.email_bot.events_db import KNOWN_EVENT_TYPES, EmailEventsDB
+from src.email_bot.events_db import (
+    KNOWN_EVENT_TYPES,
+    SOFT_BOUNCE_THRESHOLD_COUNT,
+    EmailEventsDB,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -147,11 +151,27 @@ def _svix_signature_ok(
 
     raw_secret = secret
     if raw_secret.startswith("whsec_"):
+        # Standard Svix / Resend format: whsec_ prefix + base64 key.
         raw_secret = raw_secret[len("whsec_"):]
-    try:
-        secret_bytes = base64.b64decode(raw_secret)
-    except (ValueError, TypeError):
-        return False
+        try:
+            secret_bytes = base64.b64decode(raw_secret)
+        except (ValueError, TypeError):
+            return False
+    elif raw_secret.startswith("ws_"):
+        # Whop-specific format: ws_ prefix + hex-encoded key.
+        # Standard Webhooks spec uses base64, but Whop's dashboard
+        # hands out hex-encoded 32-byte keys with a ws_ prefix.
+        raw_secret = raw_secret[len("ws_"):]
+        try:
+            secret_bytes = bytes.fromhex(raw_secret)
+        except ValueError:
+            return False
+    else:
+        # Bare base64 (no prefix). Covers pasting just the key.
+        try:
+            secret_bytes = base64.b64decode(raw_secret)
+        except (ValueError, TypeError):
+            return False
 
     signed = f"{msg_id}.{msg_ts}.".encode("utf-8") + raw_body
     expected = base64.b64encode(
@@ -777,8 +797,10 @@ class EmailWebhookHandlers:
 
     async def _resend_webhook(self, request: web.Request) -> web.Response:
         """Resend webhook receiver. Records the event for stats and runs
-        auto-suppression on hard bounces and complaints (and on the third
-        soft bounce within 30 days for the same recipient).
+        auto-suppression: hard bounces and complaints fire immediately;
+        soft (or undetermined) bounces only fire once
+        ``SOFT_BOUNCE_THRESHOLD_COUNT`` strikes accumulate inside
+        ``SOFT_BOUNCE_WINDOW_SECONDS`` for the same recipient.
 
         Idempotent: the email_events table has a UNIQUE constraint on
         (resend_email_id, event_type, event_at) so Resend retrying on
@@ -843,59 +865,76 @@ class EmailWebhookHandlers:
         return web.json_response({"ok": True, "stored": inserted})
 
     async def _maybe_suppress(self, event: _ParsedResendEvent) -> None:
-        """Apply the auto-suppression rules described in the plan:
+        """Apply the per-recipient suppression rule (2026-05-25 policy):
 
-          - complained -> immediate suppression
-          - bounced + bounce_type='hard' -> immediate suppression
-          - bounced + bounce_type='soft' -> suppress when count >= 3
-            in the last 30 days
+          - complained                       -> suppress immediately
+          - bounced (hard)                   -> suppress immediately
+          - bounced (soft / undetermined)    -> suppress only when the
+            recipient has accumulated ``SOFT_BOUNCE_THRESHOLD_COUNT``
+            soft bounces inside ``SOFT_BOUNCE_WINDOW_SECONDS`` (14 days)
+
+        Reversed from the prior first-strike-on-any-bounce rule so a
+        single transient failure (full mailbox, server reboot, momentary
+        DNS hiccup) does not permanently silence a recipient.
+
+        Two actions happen atomically per suppression event:
+          1. Mark every whop_members row for that email valid=0.
+             This blocks all FUTURE enrollment (every enrollment
+             query is gated on valid=1).
+          2. Cancel every still-pending row in scheduled_sends for
+             that email across ALL sequences. This stops IN-FLIGHT
+             sequences from firing the next time the worker ticks.
 
         ``event`` is assumed to have just been newly inserted (caller
-        checks the inserted flag), so we only run for first-delivery
-        events. The whop_members_db lookup is case-insensitive exact
-        match on email and may flip multiple rows (the same person can
-        hold multiple memberships under different whop_user_ids).
+        checks the inserted flag), so we only run on first-delivery
+        events. Retries are idempotent: the unique-constraint on
+        (resend_email_id, event_type, event_at) prevents the same
+        event from re-firing this path.
+
+        The whop_members_db lookup is case-insensitive exact match on
+        email and may flip multiple rows (the same person can hold
+        multiple memberships under different whop_user_ids).
         """
+        if event.event_type not in ("bounced", "complained"):
+            return
+
+        reason: str
         if event.event_type == "complained":
-            n = await self._whop_members_db.mark_invalid_by_email(
-                event.recipient,
-            )
-            if n > 0:
-                logger.info(
-                    "Suppressed %d whop_members row(s) for complaint from %s",
-                    n, event.recipient,
-                )
-            return
-
-        if event.event_type != "bounced":
-            return
-
-        if event.bounce_type == "hard":
-            n = await self._whop_members_db.mark_invalid_by_email(
-                event.recipient,
-            )
-            if n > 0:
-                logger.info(
-                    "Suppressed %d whop_members row(s) for hard bounce of %s",
-                    n, event.recipient,
-                )
-            return
-
-        if event.bounce_type == "soft":
-            cutoff = int(time.time()) - 30 * 86400
-            count = await self._events_db.soft_bounce_count(
-                event.recipient, since_epoch=cutoff,
-            )
-            if count >= 3:
-                n = await self._whop_members_db.mark_invalid_by_email(
+            reason = "complaint"
+        else:
+            bounce_type = (event.bounce_type or "").lower()
+            if bounce_type == "hard":
+                reason = "hard bounce"
+            else:
+                # Soft / undetermined / unknown all share the rolling
+                # window rule. Undetermined is treated as soft on the
+                # conservative side: keep sending until the recipient
+                # truly looks dead.
+                assert self._events_db is not None
+                soft_count = await self._events_db.count_soft_bounces_in_window(
                     event.recipient,
                 )
-                if n > 0:
+                if soft_count < SOFT_BOUNCE_THRESHOLD_COUNT:
                     logger.info(
-                        "Suppressed %d whop_members row(s) after %d soft "
-                        "bounces in 30 days for %s",
-                        n, count, event.recipient,
+                        "Soft bounce for %s (count=%d/%d in window): not "
+                        "suppressing yet",
+                        event.recipient, soft_count,
+                        SOFT_BOUNCE_THRESHOLD_COUNT,
                     )
+                    return
+                reason = f"soft bounce x{soft_count}"
+
+        n_invalid = await self._whop_members_db.mark_invalid_by_email(
+            event.recipient,
+        )
+        n_canceled = await self._db.cancel_all_pending(event.recipient)
+
+        if n_invalid > 0 or n_canceled > 0:
+            logger.info(
+                "Suppressed %s: %d whop_members row(s) invalidated, "
+                "%d pending send(s) canceled (reason=%s)",
+                event.recipient, n_invalid, n_canceled, reason,
+            )
 
     @staticmethod
     def _extract_whop_user_id(data: dict) -> str:

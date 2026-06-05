@@ -25,55 +25,85 @@ UTM tagging:
 
 from __future__ import annotations
 
+import os
+import pathlib
 import re
 from dataclasses import dataclass
-import os
 from html import escape
 
-# Ostium plug shown at the bottom of the Day 0 onboarding email so new
-# Elite members know perp trading is part of the offering. Both fields
-# are env-var driven so the URL or banner can change without a code
-# change. ``OSTIUM_BANNER_URL`` is optional — when empty we render the
-# section as text + CTA button only (no image). When set, we add a
-# linked banner image above the heading.
-_OSTIUM_TRADE_URL = os.environ.get(
-    "OSTIUM_TRADE_URL", "https://app.ostium.com/?ref=PTION",
+# Default hosted URL for the Potion logo. Points at the dashboard's
+# /email-assets/ route; underlying asset is a 128x128 PNG, displayed at
+# 64x64 for retina/hi-DPI sharpness. Overridable via POTION_LOGO_URL.
+_DEFAULT_LOGO_URL = (
+    "https://potion-dashboard-production.up.railway.app"
+    "/email-assets/potion-logo-128.png"
 )
-_OSTIUM_BANNER_URL = os.environ.get("OSTIUM_BANNER_URL", "")
 
-# Potion logo, rendered in the header of every email by ``_wrap_html``.
-#
-# Resolution order (matching the memory note "Resend inline images in Gmail"):
-#   1. POTION_LOGO_URL env var -> hosted URL on the ops dashboard
-#      (https://potion-dashboard-production.up.railway.app/email-assets/
-#       potion-logo.png). Cleanest path; CDN-fast; no message-size hit.
-#   2. potion_logo_email_inline.txt at repo root -> inline data URI
-#      (currently a 120x120 ~27KB PNG, well under Gmail's 102KB clip
-#      threshold). Used until the hosted URL is deployed.
-#   3. Empty string -> wrapper renders without a logo.
-#
-# We deliberately do NOT use the legacy potion_logo_datauri.txt (512x512
-# ~349KB), which would push every email past Gmail's clip threshold.
-_POTION_LOGO_URL = os.environ.get("POTION_LOGO_URL", "").strip()
-if not _POTION_LOGO_URL:
-    try:
-        import pathlib
-        _inline_path = pathlib.Path(__file__).resolve().parents[2] / "potion_logo_email_inline.txt"
-        if _inline_path.is_file():
-            _POTION_LOGO_URL = _inline_path.read_text(encoding="utf-8").strip()
-    except Exception:
-        # Don't ever block template rendering on logo loading.
-        _POTION_LOGO_URL = ""
+# Homepage every header logo links to.
+_HOMEPAGE_URL = "https://potionalpha.com"
 
-# Pause-feature feature flag. Membership pause (30-day pause + auto-
-# reactivate) is on the Potion roadmap but not shipped yet. Until it is,
-# save-offer variants B (``not_using``) and C (``market_slow``) MUST NOT
-# promise it -- the rendered copy falls through to a discount-based
-# alternative instead. Flip to ``"1"`` / ``"true"`` once the pause flow
-# is live in Whop and there is a real pause URL to send people to.
-_PAUSE_FEATURE_ENABLED = os.environ.get(
-    "PAUSE_FEATURE_ENABLED", "false",
-).strip().lower() in ("1", "true", "yes", "on")
+
+@dataclass(frozen=True)
+class TemplateConfig:
+    """Every env-var read the template layer needs, in one place.
+
+    Built once at import via ``from_env``; templates reference the
+    resulting ``CONFIG`` module constant. Centralising the env reads
+    means there is one place to point at when an env var name changes
+    or a new flag is added, instead of grepping the file.
+    """
+
+    ostium_trade_url: str
+    ostium_banner_url: str
+    potion_logo_url: str
+    pause_feature_enabled: bool
+    potion_guild_id: str
+    track_record_channel_id: str
+
+    @classmethod
+    def from_env(cls) -> "TemplateConfig":
+        logo = os.environ.get("POTION_LOGO_URL", "").strip()
+        if not logo:
+            logo = _DEFAULT_LOGO_URL
+        return cls(
+            ostium_trade_url=os.environ.get(
+                "OSTIUM_TRADE_URL", "https://app.ostium.com/?ref=PTION",
+            ),
+            ostium_banner_url=os.environ.get("OSTIUM_BANNER_URL", ""),
+            potion_logo_url=logo,
+            pause_feature_enabled=os.environ.get(
+                "PAUSE_FEATURE_ENABLED", "false",
+            ).strip().lower() in ("1", "true", "yes", "on"),
+            potion_guild_id=os.getenv(
+                "POTION_GUILD_ID", "1260259552763580537",
+            ).strip(),
+            track_record_channel_id=os.getenv(
+                "TRACK_RECORD_CHANNEL_ID", "",
+            ).strip(),
+        )
+
+
+def logo_data_uri_from_png(path: str | pathlib.Path) -> str:
+    """Read a PNG and return its ``data:image/png;base64,...`` data URI.
+
+    Kept for the rare case a caller genuinely needs an inline payload
+    (offline previews, etc.). Hosted URLs are preferred everywhere else
+    so messages stay small and Gmail does not clip them.
+    """
+    import base64
+    raw = pathlib.Path(path).read_bytes()
+    return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+
+
+CONFIG = TemplateConfig.from_env()
+
+# Back-compat module-level aliases. Existing callers and tests that read
+# these directly via ``templates.<name>`` (and that ``importlib.reload``
+# the module after flipping env vars) keep working without churn.
+_OSTIUM_TRADE_URL = CONFIG.ostium_trade_url
+_OSTIUM_BANNER_URL = CONFIG.ostium_banner_url
+_POTION_LOGO_URL = CONFIG.potion_logo_url
+_PAUSE_FEATURE_ENABLED = CONFIG.pause_feature_enabled
 
 from src.email_bot.db import Subscriber
 from src.email_bot.stats import StatsBundle
@@ -204,18 +234,21 @@ def _wrap_html(
     the same template ships through both the transactional and broadcast
     paths cleanly.
     """
-    # Header logo. Rendered above the eyebrow when a URL (hosted or
-    # inline data URI) is configured. Width is fixed at 64px to keep the
-    # message size modest on the inline-data-URI path and to match the
-    # eyebrow's visual weight. ``alt`` falls back gracefully when an
-    # image-blocking client refuses to load it.
+    # Header logo. Underlying asset is a 128x128 PNG hosted on the ops
+    # dashboard (/email-assets/potion-logo-128.png); displayed at 64x64
+    # for retina/hi-DPI sharpness via explicit width/height attrs. The
+    # image is wrapped in an anchor so logo clicks land on the Potion
+    # homepage rather than going nowhere. ``alt`` falls back gracefully
+    # when an image-blocking client refuses to load the image.
     logo_html = (
         f'<p style="margin:0 0 16px 0;padding:0;text-align:center;">'
+        f'<a href="{_HOMEPAGE_URL}" target="_blank" rel="noopener noreferrer" '
+        f'style="display:inline-block;border:0;text-decoration:none;">'
         f'<img src="{escape(_POTION_LOGO_URL, quote=True)}" '
         f'alt="Potion Alpha" width="64" height="64" '
         f'style="display:inline-block;width:64px;height:64px;'
         f'border:0;outline:none;text-decoration:none;border-radius:12px;" />'
-        f'</p>'
+        f'</a></p>'
         if _POTION_LOGO_URL else ""
     )
     eyebrow_html = (

@@ -48,6 +48,7 @@ from src.email_bot.discord_commands import EmailSlashCommands
 from src.email_bot.analytics import EmailAnalytics
 from src.email_bot.engagement_scoring import EngagementScoreDB
 from src.email_bot.events_db import EmailEventsDB
+from src.email_bot.protected_sender import ProtectedSender
 from src.email_bot.sender import ResendClient
 from src.email_bot.suppression_metrics import SuppressionMetrics
 from src.email_bot.webhook import EmailWebhookHandlers
@@ -441,6 +442,14 @@ async def run(config: Config) -> None:
                 api_key=config.email_bot.resend_api_key,
                 from_address=config.email_bot.resend_from_address,
             )
+            # ProtectedSender wraps the raw Resend client with the
+            # last-mile suppression gate and a per-recipient throttle
+            # (30 min) so worker.py never has to repeat the checks.
+            protected_sender = ProtectedSender(
+                client=email_sender,
+                events_db=email_events_db,
+                email_db=email_db,
+            )
             # branch_evaluator context. Bundles the three data sources
             # the routing functions read from. Adapter classes wrap the
             # production whop_members_db and email_db handles so the
@@ -469,7 +478,7 @@ async def run(config: Config) -> None:
             )
             email_worker = EmailWorker(
                 db=email_db,
-                sender=email_sender,
+                sender=protected_sender,
                 analytics_db_path="data/analytics.db",
                 poll_interval_sec=config.email_bot.worker_poll_sec,
                 max_per_cycle=config.email_bot.worker_max_per_cycle,

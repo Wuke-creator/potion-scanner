@@ -104,23 +104,37 @@ class TestIsSuppressedRecipient:
         assert ok is True
         assert "hard bounce" in reason
 
-    async def test_soft_bounce_suppresses(self, events_db):
+    async def test_single_soft_bounce_does_not_suppress(self, events_db):
+        # 2026-05-25 policy: one soft bounce is transient.
         await _record(
             events_db, recipient="soft@x.com",
             event_type="bounced", bounce_type="soft",
         )
         ok, reason = await events_db.is_suppressed_recipient("soft@x.com")
+        assert ok is False
+        assert reason is None
+
+    async def test_three_soft_bounces_in_window_suppresses(self, events_db):
+        now = int(time.time())
+        for i in range(3):
+            await _record(
+                events_db, recipient="repeat@x.com",
+                event_type="bounced", bounce_type="soft",
+                resend_id=f"r-{i}", event_at=now - i,
+            )
+        ok, reason = await events_db.is_suppressed_recipient("repeat@x.com")
         assert ok is True
         assert "soft bounce" in reason
 
-    async def test_unknown_bounce_type_suppresses(self, events_db):
+    async def test_single_unknown_bounce_type_does_not_suppress(self, events_db):
+        # Unknown / undetermined bounces ride the same soft-bounce threshold
+        # rather than firing on first strike.
         await _record(
             events_db, recipient="weird@x.com",
             event_type="bounced", bounce_type=None,
         )
-        ok, reason = await events_db.is_suppressed_recipient("weird@x.com")
-        assert ok is True
-        assert "bounce" in reason
+        ok, _ = await events_db.is_suppressed_recipient("weird@x.com")
+        assert ok is False
 
     async def test_complaint_suppresses(self, events_db):
         await _record(

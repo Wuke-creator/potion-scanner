@@ -77,8 +77,16 @@ class ResendClient:
         text: str,
         from_name: str | None = None,
         reply_to: str | None = None,
+        unsubscribe_url: str | None = None,
     ) -> SendResult:
-        """Send one email via Resend. Never raises."""
+        """Send one email via Resend. Never raises.
+
+        ``unsubscribe_url`` is the per-recipient HTTPS endpoint Gmail /
+        Yahoo POST to when the recipient clicks the native one-click
+        unsubscribe button. When provided, we emit the RFC 8058
+        ``List-Unsubscribe`` and ``List-Unsubscribe-Post`` headers Resend
+        forwards on the outgoing message.
+        """
         if self._session is None:
             self._session = aiohttp.ClientSession()
 
@@ -96,6 +104,14 @@ class ResendClient:
         }
         if reply_to:
             payload["reply_to"] = reply_to
+        if unsubscribe_url:
+            payload["headers"] = {
+                "List-Unsubscribe": (
+                    f"<{unsubscribe_url}>, "
+                    f"<mailto:unsubscribe@mail.potionalpha.com>"
+                ),
+                "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+            }
 
         try:
             async with self._session.post(

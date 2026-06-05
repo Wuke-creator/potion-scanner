@@ -50,7 +50,11 @@ from src.parser.perp_pinger_update_parser import (
 from src.parser.wallet_tracker_parser import parse_wallet_tracker
 from src.parser.image_ocr import ocr_available, ocr_image_url, parse_ocr_text
 from src.automations.image_archive import ImageArchive
-from src.automations.open_signals_db import OpenSignalsDB
+from src.automations.open_signals_db import OpenSignal, OpenSignalsDB
+from src.automations.track_record_poster import (
+    TERMINAL_STATUSES_POSTABLE,
+    TrackRecordPoster,
+)
 from src.automations.wallet_tracker_debouncer import WalletTrackerDebouncer
 from src.parser.update_parser import (
     UpdateParseError,
@@ -125,6 +129,7 @@ class Router:
         quick_trade_enabled: bool = False,
         image_archive: ImageArchive | None = None,
         executor_client=None,
+        track_record_poster: TrackRecordPoster | None = None,
     ):
         self._discord_cfg = discord_cfg
         self._dispatcher = dispatcher
@@ -149,6 +154,10 @@ class Router:
         # an Ostium deeplink. None disables coverage gating (1-Tap shows
         # whenever quick_trade_enabled, legacy behaviour).
         self._executor_client = executor_client
+        # When present, terminal closes on perps-source signals also get
+        # posted to the public #track-record Discord channel for
+        # subscribers and prospects to see. None disables (feature flag).
+        self._track_record_poster = track_record_poster
         # Debouncer for rapid same-trader same-token same-action buys on
         # the Wallet Tracker channel. Instantiated here (needs a stable
         # emit callback bound to this router instance).
@@ -556,6 +565,20 @@ class Router:
         ticker = self._extract_pair_or_ticker(message.content)
         if not ticker:
             return
+
+        # Capture the row BEFORE the status flip. The poster needs the
+        # prior status to tell "stopped at breakeven" from "stopped at
+        # SL"; once update_status runs, the prior value is gone.
+        prior_signal: OpenSignal | None = None
+        try:
+            prior_signal = await self._open_signals.find_latest_open(
+                channel_id=message.channel_id, pair_or_base=ticker,
+            )
+        except Exception:
+            logger.exception(
+                "open_signals.find_latest_open crashed (pre-flip)",
+            )
+
         try:
             await self._open_signals.update_status(
                 channel_id=message.channel_id,
@@ -564,6 +587,51 @@ class Router:
             )
         except Exception:
             logger.exception("open_signals.update_status crashed")
+            return
+
+        await self._maybe_post_track_record(
+            prior_signal=prior_signal,
+            new_status=new_status,
+            route=route,
+            message=message,
+        )
+
+    async def _maybe_post_track_record(
+        self,
+        *,
+        prior_signal: OpenSignal | None,
+        new_status: str,
+        route: ChannelRoute,
+        message: IncomingMessage,
+    ) -> None:
+        """Forward a terminal close to the public track-record poster.
+
+        Gated on: poster wired up, signal known, terminal status. Fires
+        for every monitored channel (any source_type) so the track-record
+        mirrors the full Telegram fan-out. Mirror channels short-circuit
+        upstream before _maybe_flip_open_signal_status runs, so they
+        naturally never reach this point. Never raises; failures only log.
+        """
+        if self._track_record_poster is None:
+            return
+        if prior_signal is None or prior_signal.id is None:
+            return
+        if new_status not in TERMINAL_STATUSES_POSTABLE:
+            return
+        caller = f"#{route.name}" if route.name else None
+        try:
+            await self._track_record_poster.maybe_post_close(
+                signal=prior_signal,
+                terminal_status=new_status,
+                prior_status=prior_signal.status,
+                caller_name=caller,
+                close_message_image_urls=list(message.image_urls or []),
+            )
+        except Exception:
+            logger.exception(
+                "track-record poster crashed for signal_id=%s pair=%s",
+                prior_signal.id, prior_signal.pair,
+            )
 
     @staticmethod
     def _build_mirror_keyboard(
@@ -994,6 +1062,13 @@ class Router:
                 logger.exception(
                     "open_signals: failed to flip status %s for %s/%s",
                     new_status, route.name, update.pair,
+                )
+            else:
+                await self._maybe_post_track_record(
+                    prior_signal=original_signal,
+                    new_status=new_status,
+                    route=route,
+                    message=message,
                 )
 
         logger.info(

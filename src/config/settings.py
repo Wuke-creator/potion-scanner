@@ -307,6 +307,37 @@ class ImageArchiveConfig:
 
 
 @dataclass
+class TrackRecordConfig:
+    """Public track-record channel poster.
+
+    When ``channel_id`` is set, every terminal close on any monitored
+    signal channel (the same set we forward to Telegram) posts a "what
+    just happened" card to the configured Discord channel: title
+    (WIN / LOSS / BREAKEVEN + pair + side + leverage), bullet list
+    (entry, SL, TPs hit, source channel, closed timestamp), chart
+    attachment, and a footer link back to the original alert. Wins and
+    losses both post: the channel's value is being unfiltered.
+
+    Idempotency is enforced via a small SQLite table (one row per
+    signal_id) so the same close can't double-post if the lifecycle
+    fires twice. Backfill on startup walks the last N days of closed
+    signals once when ``backfill_on_startup`` is True; the bot remembers
+    what it has already posted, so re-enabling it on restart is safe.
+    """
+
+    channel_id: int = 0           # 0 disables the whole feature
+    db_path: str = "data/track_record.db"
+    footer_url: str = ""          # link appended to each post; blank skips
+    backfill_on_startup: bool = False
+    backfill_days: int = 30
+    backfill_pace_sec: float = 2.5
+
+    @property
+    def enabled(self) -> bool:
+        return self.channel_id != 0
+
+
+@dataclass
 class Config:
     discord: DiscordConfig = field(default_factory=DiscordConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
@@ -322,6 +353,7 @@ class Config:
     image_archive: ImageArchiveConfig = field(
         default_factory=ImageArchiveConfig,
     )
+    track_record: TrackRecordConfig = field(default_factory=TrackRecordConfig)
 
 
 def _env_int(name: str, default: int = 0) -> int:
@@ -689,6 +721,27 @@ def load_config(
         archive_chat_id=_env_int("IMAGE_ARCHIVE_CHAT_ID", 0),
     )
 
+    track_record_yaml = yaml_data.get("track_record", {})
+    track_record_cfg = TrackRecordConfig(
+        channel_id=_env_int(
+            "TRACK_RECORD_CHANNEL_ID",
+            int(track_record_yaml.get("channel_id", 0) or 0),
+        ),
+        db_path=track_record_yaml.get("db_path", "data/track_record.db"),
+        footer_url=os.getenv(
+            "TRACK_RECORD_FOOTER_URL",
+            track_record_yaml.get("footer_url", ""),
+        ).strip(),
+        backfill_on_startup=bool(
+            os.getenv("TRACK_RECORD_BACKFILL_ON_STARTUP", "").strip().lower()
+            in ("1", "true", "yes")
+        ),
+        backfill_days=int(track_record_yaml.get("backfill_days", 30)),
+        backfill_pace_sec=float(
+            track_record_yaml.get("backfill_pace_sec", 2.5)
+        ),
+    )
+
     config = Config(
         discord=discord_cfg,
         telegram=telegram_cfg,
@@ -702,6 +755,7 @@ def load_config(
         ops_capture=ops_cfg,
         trading=trading_cfg,
         image_archive=image_archive_cfg,
+        track_record=track_record_cfg,
     )
 
     _validate(config)

@@ -50,6 +50,14 @@ KNOWN_EVENT_TYPES = frozenset({
 })
 
 
+# Soft-bounce suppression policy (reversed 2026-05-25 from the prior
+# first-strike rule). A single soft bounce is treated as transient
+# (mailbox full, momentary DNS hiccup, server reboot); only repeated
+# failures cross the threshold for permanent suppression.
+SOFT_BOUNCE_THRESHOLD_COUNT = 3
+SOFT_BOUNCE_WINDOW_SECONDS = 14 * 24 * 3600
+
+
 _EVENTS_DDL = """
 CREATE TABLE IF NOT EXISTS email_events (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -414,7 +422,7 @@ class EmailEventsDB:
         self, recipient: str, *, since_epoch: int,
     ) -> int:
         """How many soft bounces this recipient has had since `since_epoch`.
-        Used by the 3-in-30-days suppression rule."""
+        Used by the N-in-window suppression rule."""
         assert self._conn is not None
         async with self._conn.execute(
             "SELECT COUNT(*) FROM email_events "
@@ -427,6 +435,19 @@ class EmailEventsDB:
             row = await cursor.fetchone()
         return int(row[0]) if row else 0
 
+    async def count_soft_bounces_in_window(
+        self, recipient: str, *, window_sec: int = SOFT_BOUNCE_WINDOW_SECONDS,
+    ) -> int:
+        """Soft bounces for ``recipient`` in the trailing ``window_sec``.
+
+        Wrapper over ``soft_bounce_count`` that takes a window-from-now
+        rather than an absolute cutoff. The suppression gate calls this
+        directly so the 14-day window threshold lives in one place
+        (``SOFT_BOUNCE_WINDOW_SECONDS``).
+        """
+        cutoff = int(time.time()) - max(0, int(window_sec))
+        return await self.soft_bounce_count(recipient, since_epoch=cutoff)
+
     async def is_suppressed_recipient(
         self, email: str,
     ) -> tuple[bool, str | None]:
@@ -434,10 +455,11 @@ class EmailEventsDB:
         recipient right now?
 
         Returns ``(True, reason)`` if any of:
-          - the recipient has any prior ``bounced`` event recorded
-            (hard OR soft -- per the 2026-05-19 policy, one bounce is
-            enough forever)
           - the recipient has any prior ``complained`` event recorded
+          - the recipient has any prior hard ``bounced`` event
+          - the recipient has at least ``SOFT_BOUNCE_THRESHOLD_COUNT``
+            soft bounces in the trailing ``SOFT_BOUNCE_WINDOW_SECONDS``
+            window
           - the recipient is in ``email_unsubscribes`` (List-Unsubscribe
             click or manual operator action)
 
@@ -448,10 +470,6 @@ class EmailEventsDB:
         depth against the race window between a bounce webhook arriving
         and ``cancel_all_pending`` reaching the in-flight row. The check
         is case-insensitive on email.
-
-        Cheap: both queries are O(log n) on the recipient index already
-        present on ``email_events`` and the UNIQUE constraint on
-        ``email_unsubscribes.recipient``.
         """
         assert self._conn is not None
         if not email:
@@ -460,21 +478,33 @@ class EmailEventsDB:
         if not e:
             return False, None
 
-        # Bounce / complaint events.
+        # Complaints suppress immediately, always.
         async with self._conn.execute(
-            "SELECT event_type, bounce_type FROM email_events "
+            "SELECT 1 FROM email_events "
             "WHERE LOWER(recipient) = LOWER(?) "
-            "  AND event_type IN ('bounced', 'complained') "
-            "ORDER BY event_at ASC LIMIT 1",
+            "  AND event_type = 'complained' LIMIT 1",
             (e,),
         ) as cursor:
             row = await cursor.fetchone()
         if row is not None:
-            event_type = str(row[0])
-            if event_type == "complained":
-                return True, "complaint"
-            bounce_type = (row[1] or "unknown").lower()
-            return True, f"{bounce_type} bounce"
+            return True, "complaint"
+
+        # Hard bounce suppresses immediately. Soft and undetermined are
+        # transient and gated by the rolling-window count below.
+        async with self._conn.execute(
+            "SELECT 1 FROM email_events "
+            "WHERE LOWER(recipient) = LOWER(?) "
+            "  AND event_type = 'bounced' "
+            "  AND LOWER(COALESCE(bounce_type, '')) = 'hard' LIMIT 1",
+            (e,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is not None:
+            return True, "hard bounce"
+
+        soft_count = await self.count_soft_bounces_in_window(e)
+        if soft_count >= SOFT_BOUNCE_THRESHOLD_COUNT:
+            return True, f"soft bounce x{soft_count}"
 
         # List-Unsubscribe / manual unsub.
         async with self._conn.execute(

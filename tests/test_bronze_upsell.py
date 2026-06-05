@@ -78,14 +78,15 @@ async def test_new_free_member_enrolled(email_db):
     assert out["enrolled"] == 1
     sub = await email_db.get_subscriber("new@x.com")
     assert sub is not None and sub.trigger_type == "bronze"
-    # 3 bronze sends scheduled (days 1/3/5). schedule_sequence uses real
-    # time.time(); query a window 7 days out from now to see all three.
-    horizon = int(time.time()) + 7 * 86400
+    # 5 bronze sends scheduled (days 0/1/3/5/7) since the 2026-05-19
+    # behaviour-tree extension. schedule_sequence uses real time.time();
+    # query a window 8 days out so the D7 send is comfortably included.
+    horizon = int(time.time()) + 8 * 86400
     bronze_sends = [
         s for s in await email_db.due_sends(now=horizon)
         if s.sequence == "bronze"
     ]
-    assert len(bronze_sends) == 3
+    assert len(bronze_sends) == 5
 
 
 @pytest.mark.asyncio
@@ -149,7 +150,8 @@ async def test_upgrade_cancels_pending_bronze(email_db):
         s for s in await email_db.due_sends(now=horizon)
         if s.sequence == "bronze"
     ]
-    assert len(pending_before) == 3
+    # 5 since the 2026-05-19 D0+D7 extension.
+    assert len(pending_before) == 5
 
     b2 = _bronze(email_db)
     b2.observe(FakeMember("conv@x.com", True, FREE, GO_LIVE + 2))
@@ -171,7 +173,8 @@ async def test_cancel_pending_db_method(email_db):
     ))
     await email_db.schedule_sequence(email="c@x.com", sequence="bronze")
     n = await email_db.cancel_pending("c@x.com", "bronze")
-    assert n == 3
+    # 5 since the 2026-05-19 D0+D7 extension.
+    assert n == 5
     # Idempotent: nothing left pending.
     assert await email_db.cancel_pending("c@x.com", "bronze") == 0
 
