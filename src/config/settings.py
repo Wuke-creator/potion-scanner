@@ -155,7 +155,7 @@ class EmailBotConfig:
     whop_webhook_secret: str = ""
     admin_webhook_secret: str = ""
     resend_webhook_secret: str = ""
-    rejoin_url: str = "https://whop.com/potion"
+    rejoin_url: str = "https://whop.com/joined/potion-alpha/"
     db_path: str = "data/email.db"
     email_events_db_path: str = "data/email_events.db"
     worker_poll_sec: float = 60.0
@@ -191,7 +191,7 @@ class AutomationsConfig:
     feeler_detector_interval_hours: int = 24
 
     # Feature 1: feature launch
-    launch_cta_url: str = "https://whop.com/potion"
+    launch_cta_url: str = "https://whop.com/joined/potion-alpha/"
 
     # Whop API (for email lookup by discord_user_id)
     whop_api_key: str = ""
@@ -475,7 +475,7 @@ def load_config(
         elite_role_id=os.getenv("DISCORD_ELITE_ROLE_ID", ""),
         elite_signup_url=os.getenv(
             "ELITE_SIGNUP_URL",
-            discord_oauth_yaml.get("elite_signup_url", "https://whop.com/potion"),
+            discord_oauth_yaml.get("elite_signup_url", "https://whop.com/joined/potion-alpha/"),
         ),
         api_base=discord_oauth_yaml.get("api_base", "https://discord.com/api"),
         authorize_url=discord_oauth_yaml.get(
@@ -533,7 +533,7 @@ def load_config(
         resend_webhook_secret=os.getenv("RESEND_WEBHOOK_SECRET", ""),
         rejoin_url=os.getenv(
             "POTION_REJOIN_URL",
-            email_yaml.get("rejoin_url", "https://whop.com/potion"),
+            email_yaml.get("rejoin_url", "https://whop.com/joined/potion-alpha/"),
         ),
         db_path=email_yaml.get("db_path", "data/email.db"),
         email_events_db_path=os.getenv(
@@ -582,7 +582,7 @@ def load_config(
         feeler_detector_interval_hours=int(automations_yaml.get("feeler_detector_interval_hours", 24)),
         launch_cta_url=os.getenv(
             "AUTOMATIONS_LAUNCH_CTA_URL",
-            automations_yaml.get("launch_cta_url", "https://whop.com/potion"),
+            automations_yaml.get("launch_cta_url", "https://whop.com/joined/potion-alpha/"),
         ),
         whop_api_key=os.getenv("WHOP_API_KEY", ""),
         whop_api_base=automations_yaml.get("whop_api_base", "https://api.whop.com"),

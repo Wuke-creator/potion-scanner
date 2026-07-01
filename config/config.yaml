@@ -102,7 +102,7 @@ discord_oauth:
   authorize_url: https://discord.com/api/oauth2/authorize
   token_url: https://discord.com/api/oauth2/token
   scope: identify email guilds.members.read
-  elite_signup_url: https://whop.com/potion
+  elite_signup_url: https://whop.com/joined/potion-alpha/
 
 oauth:
   host: 0.0.0.0
@@ -117,7 +117,7 @@ verification:
 email_bot:
   # Enabled via env var EMAIL_BOT_ENABLED=true. These are the tunables.
   from_address: "Potion <team@potion.gg>"
-  rejoin_url: https://whop.com/potion
+  rejoin_url: https://whop.com/joined/potion-alpha/
   db_path: data/email.db
   worker_poll_sec: 60
   worker_max_per_cycle: 50
@@ -149,7 +149,7 @@ automations:
   feeler_detector_interval_hours: 24
 
   # Feature 1: feature launch
-  launch_cta_url: https://whop.com/potion
+  launch_cta_url: https://whop.com/joined/potion-alpha/
 
   # Whop API (for email lookup by Discord user ID + full member roster)
   whop_api_base: https://api.whop.com
