@@ -436,42 +436,46 @@ def _winback_day1(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
 
 
 def _winback_day4(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
-    """Day 4: incentive offer, $79/month for 3 months, no-strings urgency."""
+    """Day 4: value-forward reminder of everything Elite unlocks on return."""
     name = _pretty_name(sub)
     rejoin = sub.rejoin_url or "https://whop.com/potion"
 
-    # Luke's exact Day 4 copy, unchanged. Emoji in subject is intentional.
+    # Emoji in subject is intentional.
     subject = "Stop being an Outsider, become an Insider \U0001f440"
     text = (
         f"Hey {name},\n\n"
         f"I know we\u2019d both rather you be an Insider than an Outsider. "
-        f"So we\u2019re going to do something we don\u2019t normally do. "
-        f"$79/month for the next 3 months, 20% off the normal rate, no "
-        f"strings. If it\u2019s not clicking, cancel anytime.\n\n"
-        f"What you get back immediately:\n"
+        f"Here\u2019s what you get back the moment you\u2019re inside Elite "
+        f"again:\n\n"
         f"\u2022 Full Elite access to all channels\n"
         f"\u2022 Telegram alert bot with real-time setups\n"
         f"\u2022 Your personal Concierge thread\n"
         f"\u2022 All tools, guides, and resources\n\n"
-        f"This offer expires in 48 hours. Don\u2019t miss out!\n\n"
+        f"The calls don\u2019t stop firing while you\u2019re out. The "
+        f"Telegram bot is what catches them when you\u2019re not at the "
+        f"screen, and right now it\u2019s pinging setups you\u2019re not "
+        f"seeing.\n\n"
+        f"If it\u2019s not clicking once you\u2019re back, you can cancel "
+        f"anytime.\n\n"
         f"Rejoin the Cabal: {rejoin}\n"
     )
     html_body = (
         f"<p>Hey {escape(name)},</p>"
         f"<p>I know we\u2019d both rather you be an Insider than an "
-        f"Outsider. So we\u2019re going to do something we don\u2019t "
-        f"normally do. <strong>$79/month for the next 3 months, 20% off the "
-        f"normal rate, no strings.</strong> If it\u2019s not clicking, "
-        f"cancel anytime.</p>"
-        f"<p><strong>What you get back immediately:</strong></p>"
+        f"Outsider. Here\u2019s what you get back the moment you\u2019re "
+        f"inside Elite again:</p>"
         f"<ul>"
         f"<li>Full Elite access to all channels</li>"
         f"<li>Telegram alert bot with real-time setups</li>"
         f"<li>Your personal Concierge thread</li>"
         f"<li>All tools, guides, and resources</li>"
         f"</ul>"
-        f"<p style='color:#c23b3b;font-weight:bold;'>"
-        f"This offer expires in 48 hours. Don\u2019t miss out!</p>"
+        f"<p>The calls don\u2019t stop firing while you\u2019re out. The "
+        f"Telegram bot is what catches them when you\u2019re not at the "
+        f"screen, and right now it\u2019s pinging setups you\u2019re not "
+        f"seeing.</p>"
+        f"<p>If it\u2019s not clicking once you\u2019re back, you can "
+        f"cancel anytime.</p>"
         f"{_cta_button_html('Rejoin the Cabal', rejoin)}"
     )
     # Keep stats referenced for future use in template body if desired.
@@ -492,108 +496,31 @@ def _winback_day5_legacy(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
     reason = sub.exit_reason
     rejoin = sub.rejoin_url or "https://whop.com/potion"
 
-    # Default fallback: offers A/B/C/F use the plain-text lead run through
-    # `escape` + newline-to-p. Offers D and E override this with a pre-
-    # rendered top-5 bullets list by setting offer_lead_html directly.
+    # Default fallback: the plain-text lead is run through `escape` +
+    # newline-to-p. offer_lead_html is unused now that every branch renders
+    # from the plain lead, but is kept so the fallback rendering path below
+    # stays intact.
     offer_lead_html: str | None = None
 
-    # Map reason to (subject, offer_text, offer_html, cta_label)
-    if reason == "too_expensive":
-        # Offer A
-        subject = f"{name}, a cheaper way to stay in"
-        offer_lead = (
-            "I understand that pricing can be tough. How about this: "
-            "$79/month for the next 3 months so you can keep going at a "
-            "lower rate.\n\n"
-            "Stay for less, don\u2019t miss out on the action. I can apply for "
-            "it before the cancellation goes through.\n\n"
-            "If this is still too much, we also have an annual option at "
-            "$69/mo ($828/year). Lower monthly cost, one time payment."
-        )
-        cta = "Stay at $79/month"
-    elif reason == "not_using":
-        # Offer B (pause)
-        subject = f"{name}, pause instead of cancel?"
-        offer_lead = (
-            "Completely understand if you\u2019re not using it right now. "
-            "How about a 30-day pause instead?\n\n"
-            "Your spot stays saved, and when you\u2019re ready to jump back in, "
-            "everything\u2019s exactly where you left it. Auto-reactivates, "
-            "zero effort."
-        )
-        cta = "Pause for 30 days"
-    elif reason == "market_slow":
-        # Offer C (pause)
-        subject = f"{name}, pause until things heat up"
-        offer_lead = (
-            "The market\u2019s been quiet. But sentiment changes quickly in "
-            "crypto. We can pause your membership for 30 days and come "
-            "back when things heat up. Markets cycle, and when they do, "
-            "you\u2019ll want to be in the room."
-        )
-        cta = "Pause until the market picks up"
-    elif reason == "quality_declined":
-        # Offer D: top 5 calls + 3 free days. Updated 2026-04-18 to show a
-        # list of 5 calls pulled live from analytics rather than just the
-        # single top call, matching the refreshed Drive spec Doc 06 Offer D.
-        subject = f"{name}, a look at the last 30 days"
-        top_bullets_text = _top_calls_30d_bullets_text(stats)
-        top_bullets_html = _top_calls_30d_bullets_html(stats)
-        offer_lead = (
-            f"Appreciate the honest feedback.\n\n"
-            f"In the background we\u2019ve been working on improvements. "
-            f"Here\u2019s a look at the top 5 calls from the past 30 days:\n\n"
-            f"{top_bullets_text}\n\n"
-            f"We\u2019d like to give you 3 free days to see if it feels "
-            f"different now. No pressure either way."
-        )
-        # Embed the HTML top-5 list into the offer when we render HTML
-        offer_lead_html = (
-            f"<p>Appreciate the honest feedback.</p>"
-            f"<p>In the background we\u2019ve been working on improvements. "
-            f"Here\u2019s a look at the top 5 calls from the past 30 days:</p>"
-            f"{top_bullets_html}"
-            f"<p>We\u2019d like to give you <strong>3 free days</strong> to "
-            f"see if it feels different now. No pressure either way.</p>"
-        )
-        cta = "Try 3 days free"
-    elif reason == "found_alternative":
-        # Offer E: no discount, top-5 comparison + free 3-day trial. Updated
-        # 2026-04-18 to actually show the top 5 calls instead of just
-        # gesturing at them, matching Drive Doc 06 Offer E.
-        subject = "A fair comparison"
-        top_bullets_text = _top_calls_30d_bullets_text(stats)
-        top_bullets_html = _top_calls_30d_bullets_html(stats)
-        offer_lead = (
-            f"Respect the honesty. We\u2019re not going to try to outbid "
-            f"anyone.\n\n"
-            f"Instead, here\u2019s a breakdown of our top calls from the last "
-            f"30 days so you can compare like for like:\n\n"
-            f"{top_bullets_text}\n\n"
-            f"No discount. Just the numbers.\n\n"
-            f"If it doesn\u2019t stack up, we wish you well. If you want to "
-            f"run them side by side, there\u2019s a free 3-day trial on us."
-        )
-        offer_lead_html = (
-            f"<p>Respect the honesty. We\u2019re not going to try to outbid "
-            f"anyone.</p>"
-            f"<p>Instead, here\u2019s a breakdown of our top calls from the "
-            f"last 30 days so you can compare like for like:</p>"
-            f"{top_bullets_html}"
-            f"<p>No discount. Just the numbers.</p>"
-            f"<p>If it doesn\u2019t stack up, we wish you well. If you want "
-            f"to run them side by side, there\u2019s a free 3-day trial on us.</p>"
-        )
-        cta = "Compare and decide"
-    else:
-        # Offer F (fallback for other / fulfillment / none)
-        subject = "We\u2019d like to make it up to you"
-        offer_lead = (
-            "Thanks for the feedback. We\u2019d love to make it up to you. "
-            "Here\u2019s 30% off for 2 months while we work on improvements "
-            "based on your input."
-        )
-        cta = "Claim 30% Off"
+    # This deprecated renderer now leads every reason with the pause option
+    # (a retained, non-discount save lever). Subject is fixed to the pause
+    # framing; the body offers a 30-day pause instead of cancelling.
+    subject = f"{name}, before you cancel: pause instead"
+    offer_lead = (
+        "I understand that stepping away can come down to timing more "
+        "than anything else. Before the cancellation goes through, "
+        "here\u2019s an option that keeps your spot without paying for time "
+        "you\u2019re not using: pause instead of cancel.\n\n"
+        "A 30-day pause holds everything exactly where you left it. Your "
+        "Concierge thread, your channels, the Telegram alert bot, all of "
+        "it stays saved. It auto-reactivates after 30 days unless you "
+        "extend, and you\u2019re not billed while it\u2019s paused.\n\n"
+        "That way you don\u2019t miss the action long-term, and you\u2019re not "
+        "paying at a moment it doesn\u2019t suit you. I can set the pause "
+        "before the cancellation lands."
+    )
+    cta = "Pause instead of cancel"
+    _ = reason
 
     text = (
         f"{name},\n\n"
@@ -622,41 +549,43 @@ def _winback_day5_legacy(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
 
 
 def _winback_day7(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
-    """Day 7: last chance. Final push at the discount before price reverts."""
+    """Day 7: last chance. Final value-forward touch before we stop reaching out."""
     name = _pretty_name(sub)
     rejoin = sub.rejoin_url or "https://whop.com/potion"
 
-    subject = f"Last chance to join the Cabal. {name}"
+    subject = f"Last chance to join the Cabal, {name}"
     text = (
         f"Hey {name},\n\n"
         f"This is the last time we\u2019ll reach out. The Cabal is waiting.\n\n"
-        f"Your $79/month offer expires today. After this, it goes back to "
-        f"full price and we won\u2019t be sending another discount.\n\n"
-        f"No Pressure. If Potion isn\u2019t for you all good. But if it\u2019s "
-        f"just the timing or price holding you back, this is your best "
-        f"shot.\n\n"
-        f"\U0001f449 $79/month. No lock-in. Cancel anytime.\n\n"
+        f"No pressure. If Potion isn\u2019t for you, all good. But if it\u2019s "
+        f"just timing that\u2019s held you back, your seat is still here and "
+        f"it takes one click to get back in.\n\n"
+        f"What you walk back into:\n"
+        f"\u2022 Full Elite access to all channels\n"
+        f"\u2022 The Telegram alert bot firing setups in real time\n"
+        f"\u2022 Your personal Concierge thread\n\n"
         f"One click and you\u2019re back in: {rejoin}\n\n"
-        f"If you do decide to come back later at full price, you\u2019re "
-        f"always welcome. The free Discord link is always open: "
-        f"{DISCORD_FREE_INVITE}\n\n"
+        f"If now isn\u2019t the time, you\u2019re always welcome later. The free "
+        f"Discord link is always open: {DISCORD_FREE_INVITE}\n\n"
         f"Either way, good luck out there. The markets don\u2019t sleep and "
         f"neither does Potion.\n"
     )
     html_body = (
         f"<p>Hey {escape(name)},</p>"
         f"<p>This is the last time we\u2019ll reach out. The Cabal is waiting.</p>"
-        f"<p>Your <strong>$79/month</strong> offer expires today. After "
-        f"this, it goes back to full price and we won\u2019t be sending "
-        f"another discount.</p>"
-        f"<p>No Pressure. If Potion isn\u2019t for you all good. But if "
-        f"it\u2019s just the timing or price holding you back, this is your "
-        f"best shot.</p>"
-        f"<p><strong>\U0001f449 $79/month. No lock-in. Cancel anytime.</strong></p>"
+        f"<p>No pressure. If Potion isn\u2019t for you, all good. But if "
+        f"it\u2019s just timing that\u2019s held you back, your seat is still "
+        f"here and it takes one click to get back in.</p>"
+        f"<p><strong>What you walk back into:</strong></p>"
+        f"<ul>"
+        f"<li>Full Elite access to all channels</li>"
+        f"<li>The Telegram alert bot firing setups in real time</li>"
+        f"<li>Your personal Concierge thread</li>"
+        f"</ul>"
         f"{_cta_button_html('One click and you\u2019re back in', rejoin)}"
-        f"<p style='color:#b0b0b8;font-size:14px;'>If you do decide to come "
-        f"back later at full price, you\u2019re always welcome. The free "
-        f"Discord link is always open: "
+        f"<p style='color:#b0b0b8;font-size:14px;'>If now isn\u2019t the "
+        f"time, you\u2019re always welcome later. The free Discord link is "
+        f"always open: "
         f"<a href='{escape(DISCORD_FREE_INVITE)}'>{escape(DISCORD_FREE_INVITE)}</a>"
         f"</p>"
         f"<p style='color:#b0b0b8;font-size:14px;'>Either way, good luck "
@@ -1598,42 +1527,53 @@ def _bronze_day3(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
 
 
 def _bronze_day5(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
-    """Day 5: the offer. 30% off Elite (router-minted personal link via
-    sub.rejoin_url) plus a plain how-to-join."""
+    """Day 5: the Bronze-vs-Elite gap. What upgrading to Elite unlocks,
+    plain rejoin link via sub.rejoin_url."""
     name = _pretty_name(sub)
     rejoin = sub.rejoin_url or "https://whop.com/potion"
 
-    subject = "Your 30% off Elite (how to claim it)"
+    subject = "The one Bronze doesn't get you"
     text = (
         f"Hey {name},\n\n"
-        f"You’ve been Bronze for a few days. Here’s a reason to "
-        f"move up: 30% off your first stretch of Elite, personal to you.\n\n"
-        f"How to claim it:\n"
-        f"• Click the link below (your discount is already attached)\n"
-        f"• Pick your plan on Whop\n"
-        f"• Your Elite role, alert bot, and Concierge thread go live "
-        f"within minutes\n\n"
-        f"No new signup, no friction. Same account, more access.\n\n"
-        f"Claim 30% off Elite: {rejoin}\n\n"
-        f"This link is personal to you. Reply if anything is unclear, we "
-        f"read every email.\n"
+        f"You've been Bronze for a few days. Bronze gets you a real "
+        f"seat in the room: you see the calls, read the digest, watch "
+        f"the track record. What it does not get you is the timing.\n\n"
+        f"Here's what upgrading to Elite flips on:\n"
+        f"• Real-time call alerts the moment a setup fires, not after\n"
+        f"• The Telegram alert bot pinging you the second a trade goes "
+        f"live\n"
+        f"• Full access to every calls channel and daily VCs, not "
+        f"read-only\n"
+        f"• Your own Concierge thread for setup help, sizing, and trade "
+        f"reviews\n\n"
+        f"No new signup, no friction. Same account, more access. Your "
+        f"Elite role, alert bot, and Concierge thread go live within "
+        f"minutes.\n\n"
+        f"Upgrade to Elite: {rejoin}\n\n"
+        f"Reply if anything is unclear, we read every email.\n"
     )
     html_body = (
         f"<p>Hey {escape(name)},</p>"
-        f"<p>You’ve been Bronze for a few days. Here’s a reason to "
-        f"move up: <strong>30% off your first stretch of Elite</strong>, "
-        f"personal to you.</p>"
-        f"<p><strong>How to claim it:</strong></p>"
+        f"<p>You've been Bronze for a few days. Bronze gets you a real "
+        f"seat in the room: you see the calls, read the digest, watch "
+        f"the track record. What it does not get you is the timing.</p>"
+        f"<p><strong>Here's what upgrading to Elite flips on:</strong></p>"
         f"<ul>"
-        f"<li>Click the button below (your discount is already attached)</li>"
-        f"<li>Pick your plan on Whop</li>"
-        f"<li>Your Elite role, alert bot, and Concierge thread go live "
-        f"within minutes</li>"
+        f"<li>Real-time call alerts the moment a setup fires, not "
+        f"after</li>"
+        f"<li>The Telegram alert bot pinging you the second a trade "
+        f"goes live</li>"
+        f"<li>Full access to every calls channel and daily VCs, not "
+        f"read-only</li>"
+        f"<li>Your own Concierge thread for setup help, sizing, and "
+        f"trade reviews</li>"
         f"</ul>"
-        f"<p>No new signup, no friction. Same account, more access.</p>"
-        f"{_cta_button_html('Claim 30% off Elite', rejoin)}"
-        f"<p style='color:#b0b0b8;font-size:14px;'>This link is personal to "
-        f"you. Reply if anything is unclear, we read every email.</p>"
+        f"<p>No new signup, no friction. Same account, more access. "
+        f"Your Elite role, alert bot, and Concierge thread go live "
+        f"within minutes.</p>"
+        f"{_cta_button_html('Upgrade to Elite', rejoin)}"
+        f"<p style='color:#b0b0b8;font-size:14px;'>Reply if anything is "
+        f"unclear, we read every email.</p>"
     )
     _ = stats
     return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
@@ -1812,41 +1752,34 @@ def _bronze_day3_cold(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
 
 
 def _bronze_day5_hot(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
-    """Day 5 HOT branch: behaviour-earned full-urgency offer. Leads with
-    the discount in the subject and first line. The Bronze rejoin URL
-    already carries the minted single-use BRONZE30 promo (see worker.py
-    _bronze_day5_subscriber)."""
+    """Day 5 HOT branch: behaviour-earned upgrade push. Leads with what
+    Elite unlocks. Uses the plain Bronze rejoin URL via sub.rejoin_url."""
     name = _pretty_name(sub)
     rejoin = sub.rejoin_url or "https://whop.com/potion"
 
-    subject = "30% off Elite, attached to your account"
+    subject = "What flips on the moment you go Elite"
     text = (
         f"Hey {name},\n\n"
         f"You’ve been in the room this week, which is the only reason "
-        f"this email exists. Here’s the easy step forward: 30% off "
-        f"your first Elite cycle, single-use, expires in 14 days, tied "
-        f"to your account.\n\n"
-        f"Claim 30% off Elite: {rejoin}\n\n"
-        f"What flips on the moment you upgrade:\n"
+        f"this email exists. You’ve seen the cadence from the Bronze "
+        f"seat. Here’s what changes the moment you upgrade to Elite:\n\n"
         f"• Real-time alerts (Telegram bot + Discord pings) on every "
         f"structured call\n"
         f"• Daily VC access, not read-only\n"
         f"• Your Concierge thread for setup help, sizing, trade reviews\n"
         f"• Per-pair Trade-now buttons on every alert (Ostium + Blofin)\n\n"
-        f"Same account, no new signup. Elite role drops within minutes "
-        f"of claiming.\n\n"
-        f"If 30% isn’t the lever and there’s something else (timing, "
-        f"size, anything), reply and tell me. Discount or not, I want "
-        f"to know what’s holding you back.\n"
+        f"Same account, no new signup. Elite role drops within minutes.\n\n"
+        f"Upgrade to Elite: {rejoin}\n\n"
+        f"If the upgrade isn’t the lever and there’s something else "
+        f"(timing, size, anything), reply and tell me. Either way, I "
+        f"want to know what’s holding you back.\n"
     )
     html_body = (
         f"<p>Hey {escape(name)},</p>"
         f"<p>You’ve been in the room this week, which is the only "
-        f"reason this email exists. Here’s the easy step forward: "
-        f"<strong>30% off your first Elite cycle</strong>, single-use, "
-        f"expires in 14 days, tied to your account.</p>"
-        f"{_cta_button_html('Claim 30% off Elite', rejoin)}"
-        f"<p><strong>What flips on the moment you upgrade:</strong></p>"
+        f"reason this email exists. You’ve seen the cadence from the "
+        f"Bronze seat. Here’s what changes the moment you upgrade to "
+        f"Elite:</p>"
         f"<ul>"
         f"<li>Real-time alerts (Telegram bot + Discord pings) on every "
         f"structured call</li>"
@@ -1857,20 +1790,20 @@ def _bronze_day5_hot(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"Blofin)</li>"
         f"</ul>"
         f"<p>Same account, no new signup. Elite role drops within "
-        f"minutes of claiming.</p>"
-        f"<p style='color:#b0b0b8;font-size:14px;'>If 30% isn’t the "
-        f"lever and there’s something else (timing, size, anything), "
-        f"reply and tell me. Discount or not, I want to know what’s "
-        f"holding you back.</p>"
+        f"minutes.</p>"
+        f"{_cta_button_html('Upgrade to Elite', rejoin)}"
+        f"<p style='color:#b0b0b8;font-size:14px;'>If the upgrade isn’t "
+        f"the lever and there’s something else (timing, size, anything), "
+        f"reply and tell me. Either way, I want to know what’s holding "
+        f"you back.</p>"
     )
     _ = stats
     return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
 
 
 def _bronze_day5_warm(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
-    """Day 5 WARM branch: proof-first soft hand-off to the offer. The
-    BRONZE30 code is mentioned but is not the lead; the cadence numbers
-    are."""
+    """Day 5 WARM branch: proof-first soft hand-off to the upgrade. The
+    cadence numbers lead; the CTA is a plain upgrade link."""
     name = _pretty_name(sub)
     rejoin = sub.rejoin_url or "https://whop.com/potion"
     calls_30d = getattr(stats, "calls_30d_total", None) or 92
@@ -1881,22 +1814,23 @@ def _bronze_day5_warm(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
     subject = "A month of Elite in numbers"
     text = (
         f"Hey {name},\n\n"
-        f"Before the offer, here’s a month of Elite at the room level "
-        f"so you can see the cadence:\n\n"
+        f"Before anything else, here’s a month of Elite at the room "
+        f"level so you can see the cadence:\n\n"
         f"• {calls_30d} structured calls fired\n"
         f"• {wins_30d} closed at +50% or better\n"
         f"• Headline: {top_pair} ran +{top_pct}%\n"
         f"• Plus the daily VCs, the weekly Mac session, and the alert "
         f"bot\n\n"
-        f"If that rhythm is what you want to be inside of, your 30% "
-        f"off Elite code is still attached to your account:\n\n"
-        f"Claim 30% off Elite: {rejoin}\n\n"
+        f"If that rhythm is what you want to be inside of, upgrading to "
+        f"Elite takes about a minute and your role goes live right "
+        f"after:\n\n"
+        f"Upgrade to Elite: {rejoin}\n\n"
         f"If it’s not, no follow-ups from me. You stay on Bronze, you "
         f"keep reading the digest, no pressure either way.\n"
     )
     html_body = (
         f"<p>Hey {escape(name)},</p>"
-        f"<p>Before the offer, here’s a month of Elite at the room "
+        f"<p>Before anything else, here’s a month of Elite at the room "
         f"level so you can see the cadence:</p>"
         f"<ul>"
         f"<li>{calls_30d} structured calls fired</li>"
@@ -1906,9 +1840,10 @@ def _bronze_day5_warm(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"<li>Plus the daily VCs, the weekly Mac session, and the alert "
         f"bot</li>"
         f"</ul>"
-        f"<p>If that rhythm is what you want to be inside of, your 30% "
-        f"off Elite code is still attached to your account:</p>"
-        f"{_cta_button_html('Claim 30% off Elite', rejoin)}"
+        f"<p>If that rhythm is what you want to be inside of, upgrading "
+        f"to Elite takes about a minute and your role goes live right "
+        f"after:</p>"
+        f"{_cta_button_html('Upgrade to Elite', rejoin)}"
         f"<p style='color:#b0b0b8;font-size:14px;'>If it’s not, no "
         f"follow-ups from me. You stay on Bronze, you keep reading the "
         f"digest, no pressure either way.</p>"
@@ -1917,35 +1852,39 @@ def _bronze_day5_warm(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
 
 
 def _bronze_day7(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
-    """Day 7: last-call urgency on BRONZE30. Factual urgency (actual
-    expiry) + soft-out (move to low cadence) so the suppression handoff
-    is clean for non-converters."""
+    """Day 7: value-forward last touch on the real-time-alert gap +
+    soft-out (move to low cadence) so the suppression handoff is clean
+    for non-converters."""
     name = _pretty_name(sub)
     rejoin = sub.rejoin_url or "https://whop.com/potion"
 
-    subject = "Last day on your 30% Elite code"
+    subject = "The next signal fires whether you're in or not"
     text = (
         f"Hey {name},\n\n"
-        f"Quick one. Your single-use 30% off Elite code expires today. "
-        f"After this it’s gone and Elite goes back to standard "
-        f"pricing.\n\n"
-        f"Claim before it expires: {rejoin}\n\n"
+        f"Quick one. You’ve had a week on the Bronze seat: you’ve "
+        f"seen the calls land, watched them close, read the track "
+        f"record. The one thing you haven’t had is the alert the "
+        f"second a setup fires. That’s the whole Elite difference.\n\n"
+        f"Upgrade to Elite: {rejoin}\n\n"
         f"If you’ve been waiting on a clean entry to justify the "
         f"upgrade, the next signal will fire while you’re still "
-        f"deciding. The bot pings the second it does.\n\n"
+        f"deciding. The bot pings the second it does, and Elite is what "
+        f"gets you that ping.\n\n"
         f"If today isn’t the right time, that’s fine. I’ll move you "
         f"to a low-cadence list and we’ll stop emailing weekly. The "
         f"free channels stay open as long as you want them.\n"
     )
     html_body = (
         f"<p>Hey {escape(name)},</p>"
-        f"<p>Quick one. Your single-use 30% off Elite code "
-        f"<strong>expires today.</strong> After this it’s gone and "
-        f"Elite goes back to standard pricing.</p>"
-        f"{_cta_button_html('Claim before it expires', rejoin)}"
+        f"<p>Quick one. You’ve had a week on the Bronze seat: you’ve "
+        f"seen the calls land, watched them close, read the track "
+        f"record. The one thing you haven’t had is the alert the "
+        f"second a setup fires. That’s the whole Elite difference.</p>"
+        f"{_cta_button_html('Upgrade to Elite', rejoin)}"
         f"<p>If you’ve been waiting on a clean entry to justify the "
         f"upgrade, the next signal will fire while you’re still "
-        f"deciding. The bot pings the second it does.</p>"
+        f"deciding. The bot pings the second it does, and Elite is what "
+        f"gets you that ping.</p>"
         f"<p style='color:#b0b0b8;font-size:14px;'>If today isn’t the "
         f"right time, that’s fine. I’ll move you to a low-cadence list "
         f"and we’ll stop emailing weekly. The free channels stay open "
@@ -1974,11 +1913,10 @@ def _nurture(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"read about it in the digest after.\n\n"
         f"This is the gap, in a single trade. It’s not the chat, it’s "
         f"the timing.\n\n"
-        f"If you want to be in the room when the next one fires, your "
-        f"30% off Elite code is still on your account:\n\n"
-        f"See Elite, code attached: {rejoin}\n\n"
-        f"(One single-use code per month, fresh each time. Expires 14 "
-        f"days from today.)\n"
+        f"If you want to be in the room when the next one fires, Elite "
+        f"is one click away:\n\n"
+        f"Upgrade to Elite: {rejoin}\n\n"
+        f"Reply if anything’s holding you back. We read every one.\n"
     )
     html_body = (
         f"<p>Hey {escape(name)},</p>"
@@ -1990,10 +1928,10 @@ def _nurture(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
         f"<p>This is the gap, in a single trade. It’s not the chat, "
         f"it’s the timing.</p>"
         f"<p>If you want to be in the room when the next one fires, "
-        f"your 30% off Elite code is still on your account:</p>"
-        f"{_cta_button_html('See Elite, code attached', rejoin)}"
-        f"<p style='color:#b0b0b8;font-size:14px;'>One single-use code "
-        f"per month, fresh each time. Expires 14 days from today.</p>"
+        f"Elite is one click away:</p>"
+        f"{_cta_button_html('Upgrade to Elite', rejoin)}"
+        f"<p style='color:#b0b0b8;font-size:14px;'>Reply if anything’s "
+        f"holding you back. We read every one.</p>"
     )
     return RenderedEmail(subject=subject, text=text, html=_wrap_html(html_body))
 
@@ -2350,31 +2288,41 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
     rejoin = sub.rejoin_url or "https://whop.com/potion"
 
     if reason == "too_expensive":
-        # Offer A
-        subject = f"{name}, a cheaper way to stay in"
-        cta = "Stay at $79/month"
+        # Offer A: pause instead of cancel (retained non-discount lever).
+        subject = f"{name}, before you cancel"
+        cta = "Manage your membership"
         text_body = (
             f"Hey {name},\n\n"
-            f"Pricing can be tough, we get it. Before you go, here’s "
-            f"something we don’t normally offer: $79/month for the "
-            f"next 3 months (20% off our standard rate). No commitment, "
-            f"cancel anytime if it’s still not the right fit.\n\n"
-            f"Lock it in here: {rejoin}\n\n"
-            f"This personal link expires in 14 days. If you’d rather "
-            f"go annual, we also offer $69/mo billed yearly ($828). Same "
-            f"full Elite access for a lower monthly rate."
+            f"Pricing can be tough, we get it. Before you go, one thing "
+            f"worth knowing: you don’t have to cancel outright.\n\n"
+            f"You can pause your membership for 30 days instead. No "
+            f"billing while it’s paused. Your spot stays saved: Telegram "
+            f"alert bot, Concierge thread, every channel, exactly where "
+            f"you left it. It auto-reactivates after 30 days unless you "
+            f"extend.\n\n"
+            f"That way you keep your seat in the room without paying for "
+            f"a stretch you’re not using, and you’re already back in when "
+            f"you’re ready.\n\n"
+            f"Manage your membership: {rejoin}\n\n"
+            f"If pricing is the real blocker, reply to this email and "
+            f"tell us. We read every one."
         )
         body_html = (
             f"<p>Hey {escape(name)},</p>"
-            f"<p>Pricing can be tough, we get it. Before you go, here’s "
-            f"something we don’t normally offer: <strong>$79/month for "
-            f"the next 3 months (20% off our standard rate)</strong>. No "
-            f"commitment, cancel anytime if it’s still not the right fit.</p>"
+            f"<p>Pricing can be tough, we get it. Before you go, one "
+            f"thing worth knowing: you don’t have to cancel outright.</p>"
+            f"<p>You can <strong>pause your membership for 30 days</strong> "
+            f"instead. No billing while it’s paused. Your spot stays "
+            f"saved: Telegram alert bot, Concierge thread, every channel, "
+            f"exactly where you left it. It auto-reactivates after 30 "
+            f"days unless you extend.</p>"
+            f"<p>That way you keep your seat in the room without paying "
+            f"for a stretch you’re not using, and you’re already back in "
+            f"when you’re ready.</p>"
             f"{_cta_button_html(cta, rejoin)}"
-            f"<p style='color:#b0b0b8;font-size:14px;'>This personal link "
-            f"expires in 14 days. If you’d rather go annual, we also "
-            f"offer $69/mo billed yearly ($828). Same full Elite access "
-            f"for a lower monthly rate.</p>"
+            f"<p style='color:#b0b0b8;font-size:14px;'>If pricing is the "
+            f"real blocker, reply to this email and tell us. We read "
+            f"every one.</p>"
         )
     elif reason == "not_using" and _PAUSE_FEATURE_ENABLED:
         # Offer B (pause): only rendered when the pause feature flag is on.
@@ -2407,38 +2355,45 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
             f"you stay in the network.</p>"
         )
     elif reason == "not_using":
-        # Offer B alt (pause disabled): same $79/month lever as Offer A,
-        # framed around "find your rhythm" instead of price. Reuses the
-        # existing promo-code minting on the router side so no Whop
-        # changes are needed; only the copy differs.
-        subject = f"{name}, before you go: 20% off while you settle in"
-        cta = "Try at $79/month"
+        # Offer B alt (pause disabled): value-only "here's what you're
+        # missing" message. No discount, no code, and no pause mention
+        # (pause is disabled in this branch, so a pause CTA would be
+        # broken). Plain rejoin CTA.
+        subject = f"{name}, before you go: here's what you're missing"
+        cta = "Take another look"
         text_body = (
             f"Hey {name},\n\n"
-            f"Fair call. No point paying full price if you haven’t "
-            f"found your rhythm with it yet.\n\n"
-            f"Before you go, here’s something we don’t normally offer: "
-            f"$79/month for the next 3 months (20% off our standard "
-            f"rate). Use the lower-cost window to actually plug in: drop "
-            f"into the calls channel, set up the Telegram alert bot, try "
-            f"one VC. If it’s still not landing after that, cancel "
-            f"anytime.\n\n"
-            f"Lock it in here: {rejoin}\n\n"
-            f"This personal link expires in 14 days."
+            f"Fair call. No point paying for time you’re not using.\n\n"
+            f"Before you go, here’s what’s still firing in the room: the "
+            f"calls channel is posting structured setups daily, the "
+            f"Telegram alert bot is pinging entries the second they go "
+            f"live, and the track record shows every call, winners and "
+            f"losers, so nothing’s hidden.\n\n"
+            f"If you haven’t plugged in properly yet, take another look "
+            f"before you decide: drop into the calls channel, set up the "
+            f"Telegram alert bot, sit in on one VC. Most of the value is "
+            f"in the parts people never switch on.\n\n"
+            f"Take another look: {rejoin}\n\n"
+            f"And if there’s a specific reason it wasn’t working, reply "
+            f"and tell us. We read every one."
         )
         body_html = (
             f"<p>Hey {escape(name)},</p>"
-            f"<p>Fair call. No point paying full price if you haven’t "
-            f"found your rhythm with it yet.</p>"
-            f"<p>Before you go, here’s something we don’t normally offer: "
-            f"<strong>$79/month for the next 3 months (20% off our standard "
-            f"rate)</strong>. Use the lower-cost window to actually plug "
-            f"in: drop into the calls channel, set up the Telegram alert "
-            f"bot, try one VC. If it’s still not landing after that, "
-            f"cancel anytime.</p>"
+            f"<p>Fair call. No point paying for time you’re not "
+            f"using.</p>"
+            f"<p>Before you go, here’s what’s still firing in the room: "
+            f"the calls channel is posting structured setups daily, the "
+            f"Telegram alert bot is pinging entries the second they go "
+            f"live, and the track record shows every call, winners and "
+            f"losers, so nothing’s hidden.</p>"
+            f"<p>If you haven’t plugged in properly yet, take another "
+            f"look before you decide: drop into the calls channel, set "
+            f"up the Telegram alert bot, sit in on one VC. Most of the "
+            f"value is in the parts people never switch on.</p>"
             f"{_cta_button_html(cta, rejoin)}"
-            f"<p style='color:#b0b0b8;font-size:14px;'>This personal link "
-            f"expires in 14 days.</p>"
+            f"<p style='color:#b0b0b8;font-size:14px;'>And if there’s a "
+            f"specific reason it wasn’t working, reply and tell us. We "
+            f"read every one.</p>"
         )
     elif reason == "market_slow" and _PAUSE_FEATURE_ENABLED:
         # Offer C (pause): only when the pause feature flag is on. See
@@ -2471,41 +2426,51 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
             f"extend or cancel.</p>"
         )
     elif reason == "market_slow":
-        # Offer C alt (pause disabled): same $79/month lever, framed
-        # around "the quiet stretch is when the room sharpens" instead
-        # of pause. Reuses the existing promo-code minting on the router
-        # side so no Whop changes are needed; only the copy differs.
+        # Offer C alt (pause disabled): value-only "the quiet stretch is
+        # when the room sharpens" message. No discount, no code, and no
+        # pause mention (pause is disabled in this branch). Plain rejoin
+        # CTA.
         subject = f"{name}, the quiet stretch is when the room sharpens"
-        cta = "Stay at $79/month"
+        cta = "Stay in the room"
         text_body = (
             f"Hey {name},\n\n"
-            f"Markets cycle. The quiet stretches are when most people "
-            f"drift off, and they’re also when the prepared ones get "
-            f"sharper on setups they’d miss in a hot market.\n\n"
-            f"Instead of stepping out: $79/month for the next 3 months "
-            f"(20% off standard). When sentiment flips, you’re already "
-            f"plugged in and pattern-matching. Cancel anytime if it’s "
-            f"still not landing.\n\n"
-            f"Lock it in here: {rejoin}\n\n"
-            f"This personal link expires in 14 days."
+            f"The market’s been quiet, fair call. But sentiment turns "
+            f"fast in crypto, and you don’t want to be on the sidelines "
+            f"when it does.\n\n"
+            f"The quiet stretches are when most people drift off. "
+            f"They’re also when the prepared ones get sharper: the calls "
+            f"keep coming, the Telegram bot keeps flagging setups, and "
+            f"the room keeps building the pattern-matching that pays off "
+            f"the moment things heat up again.\n\n"
+            f"Stay plugged in through the slow part and you’re already "
+            f"positioned when it flips, instead of scrambling to catch "
+            f"up:\n\n"
+            f"Stay in the room: {rejoin}\n\n"
+            f"If something specific is holding you back, reply and tell "
+            f"us. We read every one."
         )
         body_html = (
             f"<p>Hey {escape(name)},</p>"
-            f"<p>Markets cycle. The quiet stretches are when most people "
-            f"drift off, and they’re also when the prepared ones get "
-            f"sharper on setups they’d miss in a hot market.</p>"
-            f"<p>Instead of stepping out: <strong>$79/month for the next "
-            f"3 months</strong> (20% off standard). When sentiment "
-            f"flips, you’re already plugged in and pattern-matching. "
-            f"Cancel anytime if it’s still not landing.</p>"
+            f"<p>The market’s been quiet, fair call. But sentiment turns "
+            f"fast in crypto, and you don’t want to be on the sidelines "
+            f"when it does.</p>"
+            f"<p>The quiet stretches are when most people drift off. "
+            f"They’re also when the prepared ones get sharper: the calls "
+            f"keep coming, the Telegram bot keeps flagging setups, and "
+            f"the room keeps building the pattern-matching that pays off "
+            f"the moment things heat up again.</p>"
+            f"<p>Stay plugged in through the slow part and you’re "
+            f"already positioned when it flips, instead of scrambling to "
+            f"catch up:</p>"
             f"{_cta_button_html(cta, rejoin)}"
-            f"<p style='color:#b0b0b8;font-size:14px;'>This personal link "
-            f"expires in 14 days.</p>"
+            f"<p style='color:#b0b0b8;font-size:14px;'>If something "
+            f"specific is holding you back, reply and tell us. We read "
+            f"every one.</p>"
         )
     elif reason == "quality_declined":
-        # Offer D: 7 free days + top 5 calls digest
+        # Offer D: top 5 calls digest + fresh-eyes look (no trial).
         subject = f"{name}, a look at the last 30 days"
-        cta = "Try 7 days free"
+        cta = "Give it another look"
         bullets_text = _top_calls_30d_bullets_text(stats)
         bullets_html = _top_calls_30d_bullets_html(stats)
         text_body = (
@@ -2516,11 +2481,13 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
             f"Here’s the top 5 calls from the last 30 days so you can "
             f"see for yourself:\n\n"
             f"{bullets_text}\n\n"
-            f"We’d like to give you 7 free days to see if it feels "
-            f"different now. No pressure either way. If it’s still "
-            f"not landing for you after the trial, the cancellation "
-            f"goes through as planned.\n\n"
-            f"Claim 7 days free: {rejoin}"
+            f"If that’s not what you were seeing while you were in, take "
+            f"another look with fresh eyes. No pressure either way. If "
+            f"it’s still not landing for you, the cancellation goes "
+            f"through as planned.\n\n"
+            f"Give it another look: {rejoin}\n\n"
+            f"And if there’s a specific thing that fell short, reply and "
+            f"tell us. We read every one."
         )
         body_html = (
             f"<p>Hey {escape(name)},</p>"
@@ -2530,16 +2497,19 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
             f"Here’s the top 5 calls from the last 30 days so you can "
             f"see for yourself:</p>"
             f"{bullets_html}"
-            f"<p><strong>We’d like to give you 7 free days</strong> "
-            f"to see if it feels different now. No pressure either way. "
-            f"If it’s still not landing for you after the trial, the "
-            f"cancellation goes through as planned.</p>"
+            f"<p>If that’s not what you were seeing while you were in, "
+            f"take another look with fresh eyes. No pressure either way. "
+            f"If it’s still not landing for you, the cancellation goes "
+            f"through as planned.</p>"
             f"{_cta_button_html(cta, rejoin)}"
+            f"<p style='color:#b0b0b8;font-size:14px;'>And if there’s a "
+            f"specific thing that fell short, reply and tell us. We read "
+            f"every one.</p>"
         )
     elif reason == "found_alternative":
-        # Offer E: comparison + 7-day trial
+        # Offer E: comparison, numbers only (no discount, no trial).
         subject = "A fair comparison"
-        cta = "Compare and decide"
+        cta = "Come back"
         bullets_text = _top_calls_30d_bullets_text(stats)
         bullets_html = _top_calls_30d_bullets_html(stats)
         text_body = (
@@ -2548,11 +2518,14 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
             f"anyone. Instead, here’s our last 30 days of calls so "
             f"you can compare like for like:\n\n"
             f"{bullets_text}\n\n"
-            f"No discount on this one. Just the numbers.\n\n"
-            f"If you want to run them side by side, here’s a 7-day "
-            f"free trial. Keep both subscriptions, see which one’s "
-            f"actually working for you, then decide.\n\n"
-            f"Start the comparison: {rejoin}"
+            f"No discount, no gimmick. Just the numbers, next to "
+            f"whatever you’re comparing us against.\n\n"
+            f"If ours stack up, your seat is still here and it takes 30 "
+            f"seconds to come back. If they don’t, we wish you well, "
+            f"genuinely.\n\n"
+            f"Come back: {rejoin}\n\n"
+            f"Either way, reply and tell us what won you over. We read "
+            f"every one."
         )
         body_html = (
             f"<p>Hey {escape(name)},</p>"
@@ -2560,40 +2533,57 @@ def _save_offer_day0(sub: Subscriber, stats: StatsBundle) -> RenderedEmail:
             f"anyone. Instead, here’s our last 30 days of calls so "
             f"you can compare like for like:</p>"
             f"{bullets_html}"
-            f"<p><strong>No discount on this one. Just the numbers.</strong></p>"
-            f"<p>If you want to run them side by side, here’s a 7-day "
-            f"free trial. Keep both subscriptions, see which one’s "
-            f"actually working for you, then decide.</p>"
+            f"<p><strong>No discount, no gimmick. Just the numbers, next "
+            f"to whatever you’re comparing us against.</strong></p>"
+            f"<p>If ours stack up, your seat is still here and it takes "
+            f"30 seconds to come back. If they don’t, we wish you well, "
+            f"genuinely.</p>"
             f"{_cta_button_html(cta, rejoin)}"
+            f"<p style='color:#b0b0b8;font-size:14px;'>Either way, reply "
+            f"and tell us what won you over. We read every one.</p>"
         )
     else:
-        # Offer F (other / fulfillment / unknown reason fallback)
+        # Offer F (other / fulfillment / unknown reason fallback):
+        # "we hear you, here's what's changed" + pause as the retention lever.
         subject = "We’d like to make it up to you"
-        cta = "Stay at 25% off"
+        cta = "Come back or pause"
         text_body = (
             f"Hey {name},\n\n"
             f"Thanks for the feedback. We’d love to make it up to you "
             f"while we work on the things you flagged.\n\n"
-            f"Here’s 25% off for 2 months. No strings, just our way "
-            f"of saying we hear you.\n\n"
-            f"Lock in 25% off: {rejoin}\n\n"
-            f"This link is personal to you and expires in 14 days. If "
-            f"there’s something specific that drove you to cancel, "
-            f"reply to this email. We read every one and we’re "
-            f"actively reshaping the room based on member feedback."
+            f"We read every cancellation reason and it genuinely shapes "
+            f"the room. A lot of what’s shipped lately came straight "
+            f"from members telling us what wasn’t working: faster "
+            f"alerts, the Telegram bot pinging the second a setup fires, "
+            f"the track record showing every call (winners and losers) "
+            f"so nothing’s hidden.\n\n"
+            f"If whatever drove you out is something we can fix, reply to "
+            f"this email and tell us specifically. We read every one and "
+            f"we’re actively reshaping the room based on member "
+            f"feedback.\n\n"
+            f"And if you’d rather step away without losing your seat, "
+            f"you can pause instead of cancel: your spot stays saved and "
+            f"it auto-reactivates when you’re ready.\n\n"
+            f"Come back or pause: {rejoin}"
         )
         body_html = (
             f"<p>Hey {escape(name)},</p>"
             f"<p>Thanks for the feedback. We’d love to make it up to "
             f"you while we work on the things you flagged.</p>"
-            f"<p><strong>Here’s 25% off for 2 months.</strong> No "
-            f"strings, just our way of saying we hear you.</p>"
+            f"<p>We read every cancellation reason and it genuinely "
+            f"shapes the room. A lot of what’s shipped lately came "
+            f"straight from members telling us what wasn’t working: "
+            f"faster alerts, the Telegram bot pinging the second a setup "
+            f"fires, the track record showing every call (winners and "
+            f"losers) so nothing’s hidden.</p>"
+            f"<p>If whatever drove you out is something we can fix, reply "
+            f"to this email and tell us specifically. We read every one "
+            f"and we’re actively reshaping the room based on member "
+            f"feedback.</p>"
+            f"<p>And if you’d rather step away without losing your seat, "
+            f"you can pause instead of cancel: your spot stays saved and "
+            f"it auto-reactivates when you’re ready.</p>"
             f"{_cta_button_html(cta, rejoin)}"
-            f"<p style='color:#b0b0b8;font-size:14px;'>This link is personal "
-            f"to you and expires in 14 days. If there’s something "
-            f"specific that drove you to cancel, reply to this email. We "
-            f"read every one and we’re actively reshaping the room "
-            f"based on member feedback.</p>"
         )
 
     return RenderedEmail(

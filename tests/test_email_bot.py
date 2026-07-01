@@ -181,21 +181,25 @@ class TestTemplates:
         # wins_7d_over_50pct value is rendered as the first bullet
         assert "3 calls hit over 50%+" in email.text
 
-    def test_day5_winback_segments_by_reason(self):
+    def test_day5_winback_leads_with_pause_no_promo(self):
+        # The deprecated day-5 legacy renderer now leads every reason with
+        # the pause option (a non-discount save lever). No promo copy.
         base_stats = _stats()
-        too_expensive = render("winback", 5, _sub(reason="too_expensive"), base_stats)
-        market_slow = render("winback", 5, _sub(reason="market_slow"), base_stats)
-        alt = render("winback", 5, _sub(reason="found_alternative"), base_stats)
+        for reason in ("too_expensive", "market_slow", "found_alternative"):
+            email = render("winback", 5, _sub(reason=reason), base_stats)
+            assert "before you cancel: pause instead" in email.subject
+            assert "pause" in email.text.lower()
+            # No discount / trial / code copy survives.
+            assert "$79" not in email.text
+            assert "% off" not in email.text
+            assert "free trial" not in email.text.lower()
 
-        # Each reason produces a distinct subject + offer copy
-        assert "$79" in too_expensive.text
-        assert "pause" in market_slow.text.lower()
-        assert "compare" in alt.text.lower()
-
-    def test_day5_winback_unknown_reason_falls_back_to_offer_f(self):
-        # "fulfillment" should render the Offer F fallback (30% off 2 months)
+    def test_day5_winback_unknown_reason_still_renders_pause(self):
+        # An unknown reason ("fulfillment") also renders the pause copy,
+        # with no promo/discount content.
         email = render("winback", 5, _sub(reason="fulfillment"), _stats())
-        assert "30%" in email.text
+        assert "pause" in email.text.lower()
+        assert "% off" not in email.text
 
     def test_html_escapes_subscriber_name(self):
         """Subscriber names flow from Whop and could theoretically contain

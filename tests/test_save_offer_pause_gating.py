@@ -84,7 +84,7 @@ class TestOfferVariantsShape:
 
 @pytest.mark.asyncio
 class TestRouteOfferFlagOff:
-    async def test_not_using_routes_to_discount_with_promo_url(
+    async def test_not_using_routes_to_discount_plain_url_no_promo(
         self, tmp_path, monkeypatch,
     ):
         m = _reload_router(pause_enabled=False, monkeypatch=monkeypatch)
@@ -105,22 +105,19 @@ class TestRouteOfferFlagOff:
                 result = await router.route_offer(
                     email="nu@x.com", name="N", reason="not_using",
                 )
-            # With the flag off, not_using becomes a discount offer:
+            # With the flag off, not_using becomes a discount-type offer.
             assert result.offer_type == "discount"
-            # The promo mint was called (with STAY79 base code).
-            mock_mint.assert_called_once()
-            kwargs = mock_mint.call_args.kwargs
-            assert kwargs["base_code"] == "STAY79"
-            assert kwargs["amount_off"] == 20.0
-            # Rejoin URL carries the promo, NOT the pause URL.
-            assert result.rejoin_url == (
-                "https://whop.com/potion?promo=STAY79-AB12"
-            )
+            # Promo codes were removed: no mint, no coded URL.
+            mock_mint.assert_not_called()
+            assert result.promo_code is None
+            # Rejoin URL is the plain base, NOT a promo URL or the pause URL.
+            assert result.rejoin_url == "https://whop.com/potion"
+            assert "promo=" not in result.rejoin_url
             assert "orders" not in result.rejoin_url
         finally:
             await db.close()
 
-    async def test_market_slow_routes_to_discount_with_promo_url(
+    async def test_market_slow_routes_to_discount_plain_url_no_promo(
         self, tmp_path, monkeypatch,
     ):
         m = _reload_router(pause_enabled=False, monkeypatch=monkeypatch)
@@ -137,11 +134,15 @@ class TestRouteOfferFlagOff:
             with patch(
                 "src.automations.save_offer_router.create_one_time_promo",
                 new=AsyncMock(return_value="STAY79-CD34"),
-            ):
+            ) as mock_mint:
                 result = await router.route_offer(
                     email="ms@x.com", name="M", reason="market_slow",
                 )
             assert result.offer_type == "discount"
+            # Plain base URL, no promo minted or appended.
+            mock_mint.assert_not_called()
+            assert result.rejoin_url == "https://whop.com/potion"
+            assert "promo=" not in result.rejoin_url
             assert "orders" not in result.rejoin_url
         finally:
             await db.close()
@@ -163,12 +164,15 @@ class TestRouteOfferFlagOff:
             with patch(
                 "src.automations.save_offer_router.create_one_time_promo",
                 new=AsyncMock(return_value="STAY79-XY99"),
-            ):
+            ) as mock_mint:
                 result = await router.route_offer(
                     email="te@x.com", name="T", reason="too_expensive",
                 )
             assert result.offer_type == "discount"
-            assert "promo=STAY79-XY99" in result.rejoin_url
+            # Promo removed: plain base URL, no code minted.
+            mock_mint.assert_not_called()
+            assert result.rejoin_url == "https://whop.com/potion"
+            assert "promo=" not in result.rejoin_url
         finally:
             await db.close()
 

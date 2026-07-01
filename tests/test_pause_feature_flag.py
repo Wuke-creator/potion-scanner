@@ -3,10 +3,10 @@
 The pause flow (30-day membership pause + auto-reactivate) is on the
 Potion roadmap but not yet shipped. Until it ships, save_offer variants
 B (``not_using``) and C (``market_slow``) MUST NOT promise pause -- they
-render a discount-based fallback. These tests pin that behaviour both
-directions:
+render a value-only fallback (no discount, no code, no pause mention).
+These tests pin that behaviour both directions:
 
-  - flag off (default): rendered copy talks about discount, not pause
+  - flag off (default): rendered copy is value-only, no pause, no discount
   - flag on:            rendered copy talks about pause as before
 
 Other reasons (``too_expensive`` Offer A, ``quality_declined`` Offer D,
@@ -82,31 +82,44 @@ def _restore_templates_module(monkeypatch):
 
 
 class TestPauseFlagOff:
-    def test_not_using_renders_discount_not_pause(self, monkeypatch):
+    def test_not_using_renders_value_not_pause_or_discount(self, monkeypatch):
         email = _render("not_using", pause_enabled=False, monkeypatch=monkeypatch)
-        # Subject does NOT mention pause
+        # Pause is disabled in this branch, so it must NOT mention pause
+        # anywhere (a pause CTA would be broken).
         assert "pause" not in email.subject.lower()
-        # Body talks about discount instead of pause
         assert "pause" not in email.text.lower()
-        assert "$79" in email.text
-        assert "20% off" in email.text
+        # Promo removed: no discount, no price, no code.
+        assert "$79" not in email.text
+        assert "% off" not in email.text
+        assert "promo" not in email.text.lower()
+        # Value-only copy still points members back with a plain rejoin CTA.
+        assert "telegram" in email.text.lower()
+        assert "https://whop.com/potion" in email.text
 
-    def test_market_slow_renders_discount_not_pause(self, monkeypatch):
+    def test_market_slow_renders_value_not_pause_or_discount(self, monkeypatch):
         email = _render("market_slow", pause_enabled=False, monkeypatch=monkeypatch)
         assert "pause" not in email.subject.lower()
         assert "pause" not in email.text.lower()
-        assert "$79" in email.text
+        assert "$79" not in email.text
+        assert "% off" not in email.text
+        assert "promo" not in email.text.lower()
+        assert "https://whop.com/potion" in email.text
 
     def test_too_expensive_unaffected(self, monkeypatch):
         email = _render("too_expensive", pause_enabled=False, monkeypatch=monkeypatch)
-        # Offer A always uses $79/month discount regardless of flag.
-        assert "$79" in email.text
-        assert "cheaper way to stay in" in email.subject
+        # Offer A was rewritten to the pause-instead-of-cancel lever with no
+        # discount. Unaffected by the flag (A is not a B/C pause variant).
+        assert "before you cancel" in email.subject
+        assert "pause" in email.text.lower()
+        assert "$79" not in email.text
+        assert "% off" not in email.text
 
     def test_other_unaffected(self, monkeypatch):
         email = _render("other", pause_enabled=False, monkeypatch=monkeypatch)
-        # Offer F always uses 25% off regardless of flag.
-        assert "25%" in email.text
+        # Offer F was rewritten to a "we hear you" + pause message with no
+        # discount. No promo copy survives.
+        assert "% off" not in email.text
+        assert "pause" in email.text.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -127,5 +140,9 @@ class TestPauseFlagOn:
 
     def test_too_expensive_still_unaffected(self, monkeypatch):
         email = _render("too_expensive", pause_enabled=True, monkeypatch=monkeypatch)
-        # Offer A never mentions pause regardless of flag.
-        assert "pause" not in email.subject.lower()
+        # Offer A is not a B/C pause variant, so the flag doesn't change it.
+        # After the promo removal it leads with the pause lever in both
+        # states, and carries no discount copy.
+        assert "before you cancel" in email.subject
+        assert "$79" not in email.text
+        assert "% off" not in email.text

@@ -75,20 +75,20 @@ def _sub(url="https://whop.com/potion"):
 
 
 @pytest.mark.asyncio
-async def test_day5_mints_and_overrides_url(monkeypatch):
+async def test_day5_returns_plain_url_no_promo(monkeypatch):
+    # Promo codes were removed from Bronze emails: day 5 now returns the
+    # subscriber unchanged on the plain rejoin URL and never mints a code.
     w = _worker()
     mock_mint = AsyncMock(return_value="BRONZE30-AB12CD")
     monkeypatch.setattr(
         "src.email_bot.worker.create_one_time_promo", mock_mint,
     )
-    out = await w._bronze_day5_subscriber(_sub())
-    assert out.rejoin_url == "https://whop.com/potion?promo=BRONZE30-AB12CD"
-    # original passed through unchanged in identity terms (per-send copy)
-    mock_mint.assert_awaited_once()
-    kwargs = mock_mint.await_args.kwargs
-    assert kwargs["amount_off"] == 30.0
-    assert kwargs["ttl_days"] == 14
-    assert kwargs["base_code"] == "BRONZE30"
+    sub = _sub()
+    out = await w._bronze_day5_subscriber(sub)
+    assert out is sub
+    assert out.rejoin_url == "https://whop.com/potion"
+    assert "promo=" not in out.rejoin_url
+    mock_mint.assert_not_awaited()  # no promo minting anymore
 
 
 @pytest.mark.asyncio
@@ -113,18 +113,23 @@ async def test_day5_no_promo_keys_falls_back(monkeypatch):
     sub = _sub()
     out = await w._bronze_day5_subscriber(sub)
     assert out is sub
-    called.assert_not_awaited()  # never even calls Whop when unconfigured
+    called.assert_not_awaited()  # never calls Whop
 
 
 @pytest.mark.asyncio
-async def test_day5_appends_with_ampersand_when_url_has_query(monkeypatch):
+async def test_day5_leaves_query_url_untouched(monkeypatch):
+    # A rejoin URL that already carries a query param passes through
+    # unchanged: no ?promo= / &promo= is appended.
     w = _worker()
     monkeypatch.setattr(
         "src.email_bot.worker.create_one_time_promo",
         AsyncMock(return_value="BRONZE30-XYZ999"),
     )
-    out = await w._bronze_day5_subscriber(_sub("https://whop.com/potion?ref=x"))
-    assert out.rejoin_url == "https://whop.com/potion?ref=x&promo=BRONZE30-XYZ999"
+    sub = _sub("https://whop.com/potion?ref=x")
+    out = await w._bronze_day5_subscriber(sub)
+    assert out is sub
+    assert out.rejoin_url == "https://whop.com/potion?ref=x"
+    assert "promo=" not in out.rejoin_url
 
 
 # ---- webhook: enrolment trigger ------------------------------------------

@@ -264,32 +264,12 @@ class SaveOfferRouter:
         rejoin_url = self._rejoin_url_base
 
         if config.offer_type in ("discount", "trial"):
-            if self.is_promo_configured:
-                try:
-                    promo_code = await create_one_time_promo(
-                        api_key=self._promo_api_key,
-                        company_id=self._whop_company_id,
-                        base_code=config.base_code,
-                        amount_off=config.amount_off,
-                        duration_months=config.duration_months,
-                        discord_user_id=discord_user_id,
-                        reason_tag=f"save_{reason}",
-                        ttl_days=self._promo_ttl_days,
-                    )
-                except Exception:
-                    logger.exception(
-                        "SaveOfferRouter: promo mint crashed for reason=%s",
-                        reason,
-                    )
-                    promo_code = None
-            if promo_code:
-                rejoin_url = self._build_promo_url(promo_code)
-            else:
-                logger.warning(
-                    "SaveOfferRouter: %s offer for %s falling back to "
-                    "non-coded rejoin URL (promo mint failed or disabled)",
-                    config.label, email,
-                )
+            # Promo codes, coded links, and discounts have been removed from
+            # the save-offer emails. Discount/trial variants now send the
+            # plain base rejoin URL with no ?promo= param and no minted code.
+            # The email copy for these variants has been rewritten to a
+            # value / pause message that carries no discount.
+            _ = discord_user_id
         elif config.offer_type == "pause":
             # Defense in depth: even if the OFFER_VARIANTS table somehow
             # still has a pause variant when the flag is off (manual

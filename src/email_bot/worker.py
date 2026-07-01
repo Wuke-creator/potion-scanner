@@ -188,59 +188,16 @@ class EmailWorker:
                     logger.exception("Also failed to mark failed")
 
     async def _bronze_day5_subscriber(self, sub: Subscriber) -> Subscriber:
-        """Return a per-send copy of ``sub`` whose rejoin_url carries a
-        freshly-minted single-use 30%-off Elite promo.
+        """Return the subscriber unchanged, on the plain rejoin URL.
 
-        The code is single-use (``create_one_time_promo`` sets stock=1 +
-        one_per_customer) and expires after ``bronze_promo_ttl_days``
-        (default 14). Minting at send time means the recipient gets the
-        full window from the moment the offer email lands.
-
-        On any failure (keys unset, Whop rejects, network) we log and
-        return the original subscriber unchanged so the email still goes
-        out — the link works, it just won't have the discount
-        pre-applied. We never drop the send over a promo problem.
+        Bronze day 5 used to mint a single-use discount code and inject it
+        into a per-send copy of ``sub.rejoin_url``. Promo codes, coded
+        links, and discounts have been removed from the member emails, so
+        this now leaves the subscriber (and its plain rejoin_url) as-is.
+        The day-5 email still fires normally; the CTA points at the plain
+        upgrade link.
         """
-        if not (self._whop_promo_api_key and self._whop_company_id):
-            logger.warning(
-                "Bronze day5 for %s: promo API not configured — sending "
-                "plain link (no discount pre-applied)",
-                sub.email,
-            )
-            return sub
-        try:
-            code = await create_one_time_promo(
-                api_key=self._whop_promo_api_key,
-                company_id=self._whop_company_id,
-                base_code=_BRONZE_PROMO_BASE_CODE,
-                amount_off=_BRONZE_PROMO_AMOUNT_OFF,
-                duration_months=_BRONZE_PROMO_DURATION_MONTHS,
-                reason_tag="bronze_upsell",
-                ttl_days=self._bronze_promo_ttl_days,
-            )
-        except Exception:
-            logger.exception(
-                "Bronze day5 promo mint crashed for %s", sub.email,
-            )
-            code = None
-        if not code:
-            logger.warning(
-                "Bronze day5 for %s: promo mint failed/disabled — sending "
-                "plain link (no discount pre-applied)",
-                sub.email,
-            )
-            return sub
-        base = sub.rejoin_url or "https://whop.com/potion"
-        sep = "&" if "?" in base else "?"
-        promo_url = f"{base}{sep}promo={code}"
-        logger.info(
-            "Bronze day5 for %s: minted single-use promo %s (ttl=%dd)",
-            sub.email, code, self._bronze_promo_ttl_days,
-        )
-        # Per-send override only — the subscriber row stays on the plain
-        # URL so a re-send (rare) re-mints a fresh single-use code rather
-        # than reusing a spent one.
-        return dataclasses.replace(sub, rejoin_url=promo_url)
+        return sub
 
     def _record_suppression_metric(self, reason: str) -> None:
         """Best-effort suppression counter increment. Wrapped so the call

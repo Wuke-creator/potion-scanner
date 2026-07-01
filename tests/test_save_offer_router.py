@@ -180,7 +180,10 @@ class TestSaveOfferRouter:
             monkeypatch.delenv("PAUSE_FEATURE_ENABLED", raising=False)
             importlib.reload(router_mod)
 
-    async def test_discount_offer_mints_promo_and_embeds_in_url(self, tmp_path):
+    async def test_discount_offer_sends_plain_url_no_promo(self, tmp_path):
+        # Promo codes/discounts were removed from save-offer emails.
+        # Discount/trial variants now send the plain base rejoin URL and
+        # never mint a code.
         db = await self._make_db(tmp_path)
         router = SaveOfferRouter(
             email_db=db,
@@ -200,18 +203,15 @@ class TestSaveOfferRouter:
             )
         assert result.routed is True
         assert result.offer_type == "discount"
-        assert result.promo_code == "STAY79-A8K2X9"
-        assert result.rejoin_url == "https://whop.com/potion?promo=STAY79-A8K2X9"
-        mock_mint.assert_awaited_once()
-        kwargs = mock_mint.await_args.kwargs
-        assert kwargs["amount_off"] == 20.0
-        assert kwargs["duration_months"] == 3
-        assert kwargs["base_code"] == "STAY79"
-        assert kwargs["discord_user_id"] == "123456"
-        assert kwargs["reason_tag"] == "save_too_expensive"
+        assert result.promo_code is None
+        assert result.rejoin_url == "https://whop.com/potion"
+        assert "promo=" not in result.rejoin_url
+        mock_mint.assert_not_called()
         await db.close()
 
-    async def test_promo_mint_failure_falls_back_to_bare_url(self, tmp_path):
+    async def test_trial_offer_sends_plain_url_no_promo(self, tmp_path):
+        # Trial variants (quality_declined / found_alternative) likewise
+        # send the plain base rejoin URL with no minted code.
         db = await self._make_db(tmp_path)
         router = SaveOfferRouter(
             email_db=db,
@@ -221,20 +221,22 @@ class TestSaveOfferRouter:
         )
         with patch(
             "src.automations.save_offer_router.create_one_time_promo",
-            new=AsyncMock(return_value=None),
-        ):
+            new=AsyncMock(return_value="FREE7-A8K2X9"),
+        ) as mock_mint:
             result = await router.route_offer(
-                email="fallback@example.com", name="F", reason="other",
+                email="trial@example.com", name="T", reason="quality_declined",
             )
         assert result.routed is True
+        assert result.offer_type == "trial"
         assert result.promo_code is None
-        # Falls back to base rejoin URL with no ?promo= param
         assert result.rejoin_url == "https://whop.com/potion"
+        assert "promo=" not in result.rejoin_url
+        mock_mint.assert_not_called()
         await db.close()
 
     async def test_unconfigured_promo_skips_mint_attempt(self, tmp_path):
         db = await self._make_db(tmp_path)
-        # No promo key — router should skip the API call entirely.
+        # No promo key. Router never calls the API for any variant now.
         router = SaveOfferRouter(
             email_db=db,
             promo_api_key="",
@@ -249,6 +251,7 @@ class TestSaveOfferRouter:
             )
         assert result.routed is True
         assert result.promo_code is None
+        assert result.rejoin_url == "https://whop.com/potion"
         mock_mint.assert_not_called()
         await db.close()
 
