@@ -208,6 +208,8 @@ async def run(config: Config) -> None:
     delegates_db = None
     trading_settings_db = None
     trade_executor_client = None
+    autotrade_engine = None
+    autotrade_prefs_db = None
     if config.trading.enabled:
         from src.trading.commands import TradingCommands
         from src.trading.delegates_db import DelegatesDB
@@ -393,6 +395,52 @@ async def run(config: Config) -> None:
             "Track-record poster disabled (set TRACK_RECORD_CHANNEL_ID to enable)",
         )
 
+    # --- Autotrade (Hyperliquid, signal-driven; dark by default) ---
+    # Built only when AUTOTRADE_ENABLED. Reuses the shared DelegatesDB
+    # (master address + agent key). Dry-run + testnet by default, so
+    # enabling it previews without placing real orders until DRY_RUN=false.
+    if config.autotrade.enabled:
+        from src.trading.autotrade_commands import AutotradeCommands
+        from src.trading.autotrade_engine import AutotradeEngine
+        from src.trading.autotrade_prefs_db import AutotradePrefsDB
+        from src.trading.delegates_db import DelegatesDB
+        from src.trading.hyperliquid_client import HyperliquidClient
+
+        if delegates_db is None:
+            delegates_db = DelegatesDB(db_path=config.trading.delegates_db_path)
+            await delegates_db.open()
+        autotrade_prefs_db = AutotradePrefsDB(
+            db_path=config.autotrade.prefs_db_path,
+        )
+        await autotrade_prefs_db.open()
+        hyperliquid_client = HyperliquidClient(network=config.autotrade.network)
+
+        async def _autotrade_send_dm(user_id: int, text: str) -> None:
+            await telegram_bot.send_message(chat_id=user_id, text=text)
+
+        autotrade_engine = AutotradeEngine(
+            config=config.autotrade,
+            max_collateral_usdc=config.trading.max_collateral_usdc,
+            client=hyperliquid_client,
+            delegates_db=delegates_db,
+            prefs_db=autotrade_prefs_db,
+            verification_db=verification.db,
+            send_dm=_autotrade_send_dm,
+        )
+        AutotradeCommands(
+            config=config,
+            verification_db=verification.db,
+            delegates_db=delegates_db,
+            prefs_db=autotrade_prefs_db,
+        ).register(verification.application)
+        logger.info(
+            "Autotrade enabled: network=%s dry_run=%s allowlist=%d source=%s",
+            config.autotrade.network,
+            config.autotrade.dry_run,
+            len(config.autotrade.allowlist),
+            config.autotrade.source_channel_key,
+        )
+
     # --- Router: classify + parse + format, enqueue to dispatcher ---
     router = Router(
         discord_cfg=config.discord,
@@ -403,6 +451,8 @@ async def run(config: Config) -> None:
         image_archive=image_archive,
         executor_client=trade_executor_client,
         track_record_poster=track_record_poster,
+        autotrade_engine=autotrade_engine,
+        autotrade_source_key=config.autotrade.source_channel_key,
     )
 
     # --- Email bot DB + sender (construction only; registration later) ---
@@ -1026,6 +1076,11 @@ async def run(config: Config) -> None:
                 await trading_settings_db.close()
             except Exception:
                 logger.exception("Trading settings DB close error")
+        if autotrade_prefs_db is not None:
+            try:
+                await autotrade_prefs_db.close()
+            except Exception:
+                logger.exception("Autotrade prefs DB close error")
         try:
             await verification.stop()
         except Exception:

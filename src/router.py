@@ -130,6 +130,8 @@ class Router:
         image_archive: ImageArchive | None = None,
         executor_client=None,
         track_record_poster: TrackRecordPoster | None = None,
+        autotrade_engine=None,
+        autotrade_source_key: str = "perp_bot",
     ):
         self._discord_cfg = discord_cfg
         self._dispatcher = dispatcher
@@ -158,6 +160,11 @@ class Router:
         # posted to the public #track-record Discord channel for
         # subscribers and prospects to see. None disables (feature flag).
         self._track_record_poster = track_record_poster
+        # Autotrade engine: when set, a brand-new signal on the configured
+        # source channel is handed to it to place per-user trades (dry-run
+        # or live). None disables the hook entirely.
+        self._autotrade_engine = autotrade_engine
+        self._autotrade_source_key = autotrade_source_key
         # Debouncer for rapid same-trader same-token same-action buys on
         # the Wallet Tracker channel. Instantiated here (needs a stable
         # emit callback bound to this router instance).
@@ -428,6 +435,25 @@ class Router:
         # terminal lifecycle events so future events don't pull the
         # closed trade as 'original context'.
         await self._maybe_flip_open_signal_status(msg_type, message, route)
+
+        # Autotrade: hand a brand-new signal on the configured source
+        # channel to the engine (per-user, dry-run or live). Never blocks
+        # or breaks the forward path.
+        if (
+            self._autotrade_engine is not None
+            and msg_type == MessageType.SIGNAL_ALERT
+            and open_signal_id is not None
+            and self._open_signals is not None
+            and route.key == self._autotrade_source_key
+        ):
+            try:
+                _sig = await self._open_signals.find_by_id(open_signal_id)
+                if _sig is not None:
+                    await self._autotrade_engine.on_new_signal(_sig)
+            except Exception:
+                logger.exception(
+                    "autotrade hook failed (signal_id=%s)", open_signal_id,
+                )
 
     async def _try_ocr_new_signal(
         self,
