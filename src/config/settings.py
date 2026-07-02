@@ -285,6 +285,38 @@ class TradingConfig:
 
 
 @dataclass
+class AutotradeConfig:
+    """Signal-driven autotrade on Hyperliquid (dark by default).
+
+    When a "Perp Bot Calls" signal is recorded, fire a perp trade for each
+    allowlisted, connected, opted-in user, sized as a percent of their
+    withdrawable USDC. Dark + dry-run + testnet by default so the whole
+    path can be validated before any real order is placed.
+
+    Safe go-live progression (all via Railway env):
+      1. (testnet, dry_run)  -- default; nothing real, testnet reads
+      2. (mainnet, dry_run)  -- real balances/sizing shown in DMs, places nothing
+      3. (mainnet, live)     -- set AUTOTRADE_DRY_RUN=false
+
+    Credentials reuse the trading DelegatesDB (master address + agent key);
+    only allowlisted users can enable it, and each must also run /autotrade
+    and accept the disclosure.
+    """
+
+    enabled: bool = False              # master switch / kill switch
+    dry_run: bool = True               # log + DM the intended trade, place nothing
+    network: str = "testnet"           # "testnet" | "mainnet"
+    allowlist: frozenset[int] = field(default_factory=frozenset)
+    source_channel_key: str = "perp_bot"   # only this channel auto-fires
+    prefs_db_path: str = "data/autotrade_prefs.db"
+    default_size_pct: float = 5.0      # % of withdrawable USDC per trade
+    max_leverage: int = 20             # caps whatever the signal says
+    max_per_day: int = 10              # per-user daily trade cap
+    min_collateral_usdc: float = 5.0   # skip if computed size below this
+    slippage_bps: int = 100            # IOC crossing slippage for market-in
+
+
+@dataclass
 class ImageArchiveConfig:
     """Permanent image archive on Telegram's CDN.
 
@@ -350,6 +382,7 @@ class Config:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     ops_capture: OpsCaptureConfig = field(default_factory=OpsCaptureConfig)
     trading: TradingConfig = field(default_factory=TradingConfig)
+    autotrade: AutotradeConfig = field(default_factory=AutotradeConfig)
     image_archive: ImageArchiveConfig = field(
         default_factory=ImageArchiveConfig,
     )
@@ -717,6 +750,62 @@ def load_config(
         ),
     )
 
+    autotrade_yaml = yaml_data.get("autotrade", {})
+    _allow_raw = os.getenv("AUTOTRADE_ALLOWLIST", "").strip()
+    _allow_ids: set[int] = set()
+    for part in _allow_raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            _allow_ids.add(int(part))
+        except ValueError:
+            raise ConfigError(
+                f"AUTOTRADE_ALLOWLIST entries must be integer Telegram IDs, got {part!r}"
+            )
+    autotrade_cfg = AutotradeConfig(
+        enabled=os.getenv("AUTOTRADE_ENABLED", "").strip().lower()
+        in ("1", "true", "yes"),
+        # Defaults ON: unset means dry-run. Only an explicit false disables it.
+        dry_run=os.getenv("AUTOTRADE_DRY_RUN", "true").strip().lower()
+        not in ("0", "false", "no"),
+        network=os.getenv(
+            "AUTOTRADE_NETWORK", autotrade_yaml.get("network", "testnet"),
+        ).strip().lower(),
+        allowlist=frozenset(_allow_ids),
+        source_channel_key=os.getenv(
+            "AUTOTRADE_SOURCE_KEY",
+            autotrade_yaml.get("source_channel_key", "perp_bot"),
+        ).strip(),
+        prefs_db_path=autotrade_yaml.get(
+            "prefs_db_path", "data/autotrade_prefs.db",
+        ),
+        default_size_pct=float(
+            os.getenv(
+                "AUTOTRADE_DEFAULT_PCT",
+                autotrade_yaml.get("default_size_pct", 5.0),
+            )
+        ),
+        max_leverage=_env_int(
+            "AUTOTRADE_MAX_LEVERAGE",
+            int(autotrade_yaml.get("max_leverage", 20)),
+        ),
+        max_per_day=_env_int(
+            "AUTOTRADE_MAX_PER_DAY",
+            int(autotrade_yaml.get("max_per_day", 10)),
+        ),
+        min_collateral_usdc=float(
+            os.getenv(
+                "AUTOTRADE_MIN_COLLATERAL_USDC",
+                autotrade_yaml.get("min_collateral_usdc", 5.0),
+            )
+        ),
+        slippage_bps=_env_int(
+            "AUTOTRADE_SLIPPAGE_BPS",
+            int(autotrade_yaml.get("slippage_bps", 100)),
+        ),
+    )
+
     image_archive_cfg = ImageArchiveConfig(
         archive_chat_id=_env_int("IMAGE_ARCHIVE_CHAT_ID", 0),
     )
@@ -754,6 +843,7 @@ def load_config(
         logging=logging_cfg,
         ops_capture=ops_cfg,
         trading=trading_cfg,
+        autotrade=autotrade_cfg,
         image_archive=image_archive_cfg,
         track_record=track_record_cfg,
     )

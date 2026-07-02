@@ -167,6 +167,20 @@ trading:
   max_collateral_usdc: 5000.0
   executor_timeout_sec: 30.0
 
+autotrade:
+  # Signal-driven autotrade on Hyperliquid. Master switch + dry-run + the
+  # allowlist are env-only (AUTOTRADE_ENABLED / AUTOTRADE_DRY_RUN /
+  # AUTOTRADE_ALLOWLIST). Dark, dry-run and testnet by default.
+  # Reuses the trading delegates DB (master address + agent key).
+  network: testnet               # AUTOTRADE_NETWORK; flip to mainnet at go-live
+  source_channel_key: perp_bot   # only this channel auto-fires
+  prefs_db_path: data/autotrade_prefs.db
+  default_size_pct: 5.0          # % of withdrawable USDC per trade
+  max_leverage: 20               # caps whatever the signal says
+  max_per_day: 10                # per-user daily trade cap
+  min_collateral_usdc: 5.0       # skip if computed size below this
+  slippage_bps: 100              # IOC crossing slippage for market-in
+
 
 logging:
   level: INFO
