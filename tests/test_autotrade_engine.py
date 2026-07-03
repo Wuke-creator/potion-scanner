@@ -17,7 +17,7 @@ import pytest_asyncio
 from src.config.settings import AutotradeConfig
 from src.trading.autotrade_engine import AutotradeEngine
 from src.trading.autotrade_prefs_db import AutotradePrefsDB
-from src.trading.hyperliquid_client import HyperliquidError, TradePlan
+from src.trading.hyperliquid_client import AccountSnapshot, HyperliquidError, TradePlan
 
 UID = 111
 _DEFAULT_PLAN = TradePlan(
@@ -57,6 +57,11 @@ def _make_engine(
     )
     client = AsyncMock()
     client.get_available_usdc = AsyncMock(return_value=balance)
+    # Clean account for the risk guard: comfortable value, no open positions,
+    # so existing engine-behaviour tests are unaffected by the guard.
+    client.get_account_snapshot = AsyncMock(
+        return_value=AccountSnapshot(account_value=100_000.0, positions={}),
+    )
     client.plan_trade = AsyncMock(
         return_value=_DEFAULT_PLAN if plan is _SENTINEL else plan,
     )
