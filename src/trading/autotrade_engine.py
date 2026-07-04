@@ -23,6 +23,7 @@ import logging
 from typing import Awaitable, Callable
 
 from src.config.settings import AutotradeConfig
+from src.trading.autotrade_risk import AutotradeRiskGuard
 from src.trading.hyperliquid_client import HyperliquidClient, HyperliquidError, TradePlan
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ class AutotradeEngine:
         self._prefs_db = prefs_db
         self._verification_db = verification_db
         self._send_dm = send_dm
+        self._risk = AutotradeRiskGuard(config=config, client=client, prefs_db=prefs_db)
 
     async def on_new_signal(self, signal) -> None:
         """Entry point from the router. Never raises into the caller."""
@@ -132,9 +134,29 @@ class AutotradeEngine:
             )
             return
 
+        # --- account-level risk guard (passivbot-derived; see autotrade_risk) ---
+        # Runs before BOTH branches so the dry-run soak shows exactly what the
+        # guard would have blocked live. Fail-closed: an unreadable account
+        # state blocks the trade rather than waving it through.
+        verdict = await self._risk.check(uid, delegate.trader_address, plan)
+
         # --- dry-run: preview only, no order, no daily-slot spend ---
         if self._config.dry_run:
-            await self._dm(uid, self._fmt_preview(plan, tp1, stop_loss))
+            preview = self._fmt_preview(plan, tp1, stop_loss)
+            if not verdict.allowed:
+                preview += f"\nRISK GUARD would block this: {verdict.reason}"
+            await self._dm(uid, preview)
+            return
+
+        if not verdict.allowed:
+            await self._prefs_db.release_fire(uid, signal_id)
+            await self._dm(
+                uid,
+                f"Autotrade blocked {plan.coin}: {verdict.reason}",
+            )
+            logger.info(
+                "risk guard blocked user=%s coin=%s: %s", uid, plan.coin, verdict.reason,
+            )
             return
 
         # --- live: daily cap, then place ---

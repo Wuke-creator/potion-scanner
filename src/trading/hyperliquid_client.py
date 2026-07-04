@@ -50,6 +50,14 @@ class TradePlan:
     notional_usd: float   # size * price
 
 
+@dataclass(frozen=True)
+class AccountSnapshot:
+    """Account state the risk guard needs: total value + open exposure."""
+
+    account_value: float           # marginSummary.accountValue (USD)
+    positions: dict[str, float]    # coin -> abs position notional (USD)
+
+
 # ---------------------------------------------------------------------------
 # Pure helpers (unit-tested without the SDK)
 # ---------------------------------------------------------------------------
@@ -266,6 +274,41 @@ class HyperliquidClient:
         except (TypeError, ValueError, AttributeError):
             pass
         return total
+
+    async def get_account_snapshot(self, master_address: str) -> "AccountSnapshot | None":
+        """Account value + per-coin open notionals for the risk guard.
+
+        One user_state call. Returns None on ANY failure so the guard can
+        fail closed; never raises into the engine.
+        """
+        def _fetch():
+            info = self._ensure_info()
+            return info.user_state(master_address)
+        try:
+            state = await asyncio.to_thread(_fetch)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("user_state failed for %s: %s", master_address, e)
+            return None
+        try:
+            account_value = float(
+                (state.get("marginSummary") or {}).get("accountValue", 0) or 0
+            )
+            positions: dict[str, float] = {}
+            for entry in state.get("assetPositions") or []:
+                pos = (entry or {}).get("position") or {}
+                coin = pos.get("coin")
+                if not coin:
+                    continue
+                try:
+                    notional = abs(float(pos.get("positionValue", 0) or 0))
+                except (TypeError, ValueError):
+                    continue
+                if notional > 0:
+                    positions[coin] = positions.get(coin, 0.0) + notional
+            return AccountSnapshot(account_value=account_value, positions=positions)
+        except (TypeError, ValueError, AttributeError) as e:
+            logger.warning("could not parse user_state for %s: %s", master_address, e)
+            return None
 
     async def plan_trade(
         self,

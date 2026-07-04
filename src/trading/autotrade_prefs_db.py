@@ -67,6 +67,17 @@ CREATE TABLE IF NOT EXISTS autotrade_fires (
 );
 """
 
+# Peak account value per user, for the risk guard's drawdown brake
+# (src/trading/autotrade_risk.py). Withdrawals do not lower the peak;
+# resetting after a withdrawal = DELETE the row (documented operator action).
+_DDL_PEAKS = """
+CREATE TABLE IF NOT EXISTS autotrade_equity_peaks (
+  telegram_user_id  INTEGER PRIMARY KEY,
+  peak_value        REAL NOT NULL,
+  updated_at        INTEGER NOT NULL
+);
+"""
+
 
 def _utc_date(now: int | None = None) -> str:
     ts = time.time() if now is None else now
@@ -84,6 +95,7 @@ class AutotradePrefsDB:
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute(_DDL_PREFS)
         await self._conn.execute(_DDL_FIRES)
+        await self._conn.execute(_DDL_PEAKS)
         await self._conn.commit()
         logger.info("Autotrade prefs DB opened at %s", self._db_path)
 
@@ -205,3 +217,26 @@ class AutotradePrefsDB:
         )
         await self._conn.commit()
         return True
+
+    async def bump_equity_peak(
+        self, telegram_user_id: int, account_value: float, now: int | None = None,
+    ) -> float:
+        """Record ``account_value`` as the new peak if it is one; return the
+        current peak either way. Used by the risk guard's drawdown brake."""
+        assert self._conn is not None
+        ts = int(time.time()) if now is None else now
+        await self._conn.execute(
+            "INSERT INTO autotrade_equity_peaks (telegram_user_id, peak_value, updated_at) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(telegram_user_id) DO UPDATE SET "
+            "  peak_value = MAX(peak_value, excluded.peak_value), "
+            "  updated_at = excluded.updated_at",
+            (telegram_user_id, float(account_value), ts),
+        )
+        await self._conn.commit()
+        async with self._conn.execute(
+            "SELECT peak_value FROM autotrade_equity_peaks WHERE telegram_user_id = ?",
+            (telegram_user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return float(row[0]) if row else float(account_value)

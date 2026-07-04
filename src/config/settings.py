@@ -314,6 +314,12 @@ class AutotradeConfig:
     max_per_day: int = 10              # per-user daily trade cap
     min_collateral_usdc: float = 5.0   # skip if computed size below this
     slippage_bps: int = 100            # IOC crossing slippage for market-in
+    # Account-level risk guard (passivbot-derived; src/trading/autotrade_risk.py).
+    # Wallet exposure = position notional / account value. 0 disables a check.
+    risk_symbol_we_limit: float = 1.0   # max exposure per coin (1.0 = 100% of account)
+    risk_total_we_limit: float = 2.0    # max exposure across all open positions
+    risk_max_drawdown_pct: float = 15.0  # block new entries this far below peak balance
+    risk_no_stacking: bool = True       # one open position per coin
 
 
 @dataclass
@@ -804,6 +810,28 @@ def load_config(
             "AUTOTRADE_SLIPPAGE_BPS",
             int(autotrade_yaml.get("slippage_bps", 100)),
         ),
+        risk_symbol_we_limit=float(
+            os.getenv(
+                "AUTOTRADE_RISK_SYMBOL_WE",
+                autotrade_yaml.get("risk_symbol_we_limit", 1.0),
+            )
+        ),
+        risk_total_we_limit=float(
+            os.getenv(
+                "AUTOTRADE_RISK_TOTAL_WE",
+                autotrade_yaml.get("risk_total_we_limit", 2.0),
+            )
+        ),
+        risk_max_drawdown_pct=float(
+            os.getenv(
+                "AUTOTRADE_RISK_MAX_DRAWDOWN_PCT",
+                autotrade_yaml.get("risk_max_drawdown_pct", 15.0),
+            )
+        ),
+        risk_no_stacking=os.getenv(
+            "AUTOTRADE_RISK_NO_STACKING",
+            str(autotrade_yaml.get("risk_no_stacking", "true")),
+        ).strip().lower() != "false",
     )
 
     image_archive_cfg = ImageArchiveConfig(
