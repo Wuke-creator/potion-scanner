@@ -231,19 +231,41 @@ class HyperliquidClient:
             return None
 
     async def get_available_usdc(self, master_address: str) -> float:
-        """Withdrawable USDC on the perps account (basis for %-of-balance)."""
+        """Tradable USDC for the account (basis for %-of-balance sizing).
+
+        Sums the perps clearinghouse ``withdrawable`` and the spot
+        clearinghouse USDC balance (total minus hold). Under Hyperliquid's
+        unified account mode the trading USDC lives in the SPOT
+        clearinghouse while the perps state reads 0, so reading perps
+        alone under-reports unified accounts to $0. For a classic
+        (separated) account this can over-report by the spot portion; the
+        failure mode there is a rejected order (reported to the user),
+        never an oversized fill.
+        """
         def _fetch():
             info = self._ensure_info()
-            return info.user_state(master_address)
+            perp = info.user_state(master_address)
+            spot = info.spot_user_state(master_address)
+            return perp, spot
         try:
-            state = await asyncio.to_thread(_fetch)
+            perp_state, spot_state = await asyncio.to_thread(_fetch)
         except Exception as e:  # noqa: BLE001
-            logger.warning("user_state failed for %s: %s", master_address, e)
+            logger.warning("balance fetch failed for %s: %s", master_address, e)
             return 0.0
+        total = 0.0
         try:
-            return float(state.get("withdrawable", 0) or 0)
+            total += float(perp_state.get("withdrawable", 0) or 0)
         except (TypeError, ValueError, AttributeError):
-            return 0.0
+            pass
+        try:
+            for bal in (spot_state or {}).get("balances", []):
+                if str(bal.get("coin", "")).upper() == "USDC":
+                    held = float(bal.get("hold", 0) or 0)
+                    total += max(0.0, float(bal.get("total", 0) or 0) - held)
+                    break
+        except (TypeError, ValueError, AttributeError):
+            pass
+        return total
 
     async def plan_trade(
         self,
