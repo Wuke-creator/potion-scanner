@@ -283,9 +283,9 @@ class HyperliquidClient:
         """
         def _fetch():
             info = self._ensure_info()
-            return info.user_state(master_address)
+            return info.user_state(master_address), info.spot_user_state(master_address)
         try:
-            state = await asyncio.to_thread(_fetch)
+            state, spot_state = await asyncio.to_thread(_fetch)
         except Exception as e:  # noqa: BLE001
             logger.warning("user_state failed for %s: %s", master_address, e)
             return None
@@ -293,6 +293,16 @@ class HyperliquidClient:
             account_value = float(
                 (state.get("marginSummary") or {}).get("accountValue", 0) or 0
             )
+            # Unified accounts keep trading USDC in the SPOT clearinghouse while
+            # perps accountValue reads 0; include spot USDC so the exposure
+            # denominator isn't 0 (which would fail the guard closed and block
+            # every trade on a perfectly funded account). Over-counting on a
+            # classic account only understates exposure (more permissive), never
+            # the reverse.
+            for _bal in (spot_state or {}).get("balances", []):
+                if str(_bal.get("coin", "")).upper() == "USDC":
+                    account_value += float(_bal.get("total", 0) or 0)
+                    break
             positions: dict[str, float] = {}
             for entry in state.get("assetPositions") or []:
                 pos = (entry or {}).get("position") or {}
