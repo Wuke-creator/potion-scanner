@@ -72,11 +72,14 @@ def parse_signal(raw_message: str) -> ParsedSignal:
     pair = m.group(1).upper()
     trade_id = int(m.group(2))
 
-    # --- Risk Level ---
-    m = re.search(r"\((LOW|MEDIUM|HIGH)\s+RISK\)", text, re.IGNORECASE)
-    if not m:
-        raise SignalParseError("Could not extract risk level")
-    risk_level = RiskLevel(m.group(1).upper())
+    # --- Risk Level (optional) ---
+    # The Pinger format dropped the parentheses (e.g. "MEDIUM RISK" after an
+    # emoji, not "(MEDIUM RISK)"). Match it with or without parens, and treat
+    # a missing risk level as MEDIUM rather than failing the whole parse:
+    # risk level is cosmetic and unused downstream (autotrade needs only
+    # side/entry/SL/TP/leverage), so it must never block a real signal.
+    m = re.search(r"\(?\s*(LOW|MEDIUM|HIGH)\s+RISK\s*\)?", text, re.IGNORECASE)
+    risk_level = RiskLevel(m.group(1).upper()) if m else RiskLevel.MEDIUM
 
     # --- Type (SWING / SCALP) ---
     m = re.search(r"TYPE[:\s]+(SWING|SCALP)", text, re.IGNORECASE)

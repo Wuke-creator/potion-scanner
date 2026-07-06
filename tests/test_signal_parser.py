@@ -109,3 +109,33 @@ class TestSignalParserEdgeCases:
         assert s.trade_id == 9999
         assert s.entry == 50000.0
         assert s.leverage == 10
+
+    def test_pinger_risk_without_parentheses(self):
+        """Live Potion Pinger format writes risk as an emoji + 'MEDIUM RISK'
+        (no parentheses) and prepends a pipe-delimited summary line. The whole
+        thing must still parse — this exact XLM call was forwarded raw and
+        skipped by autotrade because the risk regex demanded parentheses.
+        """
+        msg = (
+            "SHORT XLM @ 0.1986 | TP1: 0.19457 | TP2: 0.19034 | TP3: 0.17202 | SL: 0.20748\n"
+            "**TRADING SIGNAL ALERT**\n\n"
+            "**PAIR:** XLM/USDT #2410\n"
+            "\U0001f7e1 MEDIUM RISK\n\n"
+            "**TYPE:** SWING\n"
+            "**SIZE:** 1-4%\n"
+            "**SIDE:** SHORT\n\n"
+            "**ENTRY:** 0.1986\n"
+            "**SL:** 0.20748          (-73.55%)\n\n"
+            "**TP1:** 0.19457      (32.47%)\n"
+            "**TP2:** 0.19034      (66.55%)\n"
+            "**TP3:** 0.17202      (215.83%)\n\n"
+            "**LEVERAGE:** 16x\n"
+        )
+        s = parse_signal(msg)
+        assert s.pair == "XLM/USDT"
+        assert s.side == Side.SHORT
+        assert s.entry == 0.1986
+        assert s.stop_loss == 0.20748
+        assert s.tp1 == 0.19457
+        assert s.leverage == 16
+        assert s.risk_level == RiskLevel.MEDIUM
