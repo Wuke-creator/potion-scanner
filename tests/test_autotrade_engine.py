@@ -225,3 +225,37 @@ class TestLive:
         assert "failed" in send_dm.await_args.args[1].lower()
         # claim released -> the (user, signal) can be retried
         assert await prefs_db.try_claim_fire(UID, 7) is True
+
+
+class TestManualFire:
+    @pytest.mark.asyncio
+    async def test_manual_fire_places_for_invoker(self, prefs_db):
+        engine, client, delegates, _, send_dm = _make_engine(prefs_db, dry_run=False)
+        await _opt_in(prefs_db)
+        await engine.manual_fire(UID, pair="XLM/USDT", side="short", leverage=5, stop_loss=0.207)
+        client.place_trade.assert_awaited_once()
+        delegates.mark_trade_success.assert_awaited_once()
+        assert "filled" in send_dm.await_args.args[1].lower()
+
+    @pytest.mark.asyncio
+    async def test_manual_fire_dry_run_previews(self, prefs_db):
+        engine, client, _, _, send_dm = _make_engine(prefs_db, dry_run=True)
+        await _opt_in(prefs_db)
+        await engine.manual_fire(UID, pair="XLM/USDT", side="long", leverage=5)
+        client.place_trade.assert_not_called()
+        assert "[DRY RUN]" in send_dm.await_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_manual_fire_bad_direction(self, prefs_db):
+        engine, client, _, _, send_dm = _make_engine(prefs_db, dry_run=False)
+        await _opt_in(prefs_db)
+        await engine.manual_fire(UID, pair="XLM/USDT", side="sideways", leverage=5)
+        client.place_trade.assert_not_called()
+        assert "direction" in send_dm.await_args.args[1].lower()
+
+    @pytest.mark.asyncio
+    async def test_manual_fire_not_allowlisted(self, prefs_db):
+        engine, client, _, _, send_dm = _make_engine(prefs_db, allowlist=frozenset({999}), dry_run=False)
+        await _opt_in(prefs_db)
+        await engine.manual_fire(UID, pair="XLM/USDT", side="short", leverage=5)
+        client.place_trade.assert_not_called()

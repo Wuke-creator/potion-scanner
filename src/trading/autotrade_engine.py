@@ -74,6 +74,36 @@ class AutotradeEngine:
                     "autotrade crashed for user=%s signal=%s", uid, signal_id,
                 )
 
+    async def manual_fire(
+        self, uid: int, *, pair: str, side: str, leverage: int = 0,
+        stop_loss: float | None = None, take_profit: float | None = None,
+    ) -> None:
+        """User-initiated single trade (the /autotrade fire command).
+
+        Runs the exact live placement path _maybe_fire uses, for the one
+        invoking user, off a synthetic signal. Honors every gate + dry_run
+        + the risk guard. Never raises into the caller.
+        """
+        import time
+        from types import SimpleNamespace
+
+        side = (side or "").strip().upper()
+        if side not in ("LONG", "SHORT"):
+            await self._dm(uid, "Manual fire needs a direction: long or short.")
+            return
+        if uid not in self._config.allowlist:
+            return
+        sid = int(time.time() * 1000)  # unique id so it always claims + never dedupes
+        sig = SimpleNamespace(
+            id=sid, pair=pair, side=side, leverage=leverage or 0,
+            tp1=take_profit, stop_loss=stop_loss,
+        )
+        try:
+            await self._maybe_fire(uid, sig, sid, side)
+        except Exception:  # noqa: BLE001
+            logger.exception("manual_fire crashed for user=%s", uid)
+            await self._dm(uid, "Manual fire hit an unexpected error.")
+
     async def _dm(self, user_id: int, text: str) -> None:
         try:
             await self._send_dm(user_id, text)

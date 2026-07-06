@@ -432,6 +432,7 @@ async def run(config: Config) -> None:
             verification_db=verification.db,
             delegates_db=delegates_db,
             prefs_db=autotrade_prefs_db,
+            engine=autotrade_engine,
         ).register(verification.application)
         logger.info(
             "Autotrade enabled: network=%s dry_run=%s allowlist=%d source=%s",

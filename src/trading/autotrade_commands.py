@@ -40,6 +40,8 @@ logger = logging.getLogger(__name__)
 
 _STATE_KEY = "autotrade_state"
 _STATE_AWAITING = "awaiting_connect_paste"
+_FIRE_PENDING = "autotrade_fire_pending"
+_FIRE_TTL_SEC = 120
 
 _ADDR_RE = re.compile(
     r"(?:address|master|account)\s*[:=]\s*(0x[a-fA-F0-9]{40})", re.IGNORECASE
@@ -81,11 +83,13 @@ class AutotradeCommands:
         verification_db: VerificationDB,
         delegates_db: DelegatesDB,
         prefs_db: AutotradePrefsDB,
+        engine=None,
     ):
         self._config = config
         self._verification_db = verification_db
         self._delegates_db = delegates_db
         self._prefs_db = prefs_db
+        self._engine = engine
 
     def register(self, application: Application) -> None:
         application.add_handler(CommandHandler("autotrade", self._cmd))
@@ -163,6 +167,8 @@ class AutotradeCommands:
             await self._prefs_db.set_enabled(uid, False)
             await reply("Autotrade <b>disabled</b>. No further trades will fire.", parse_mode="HTML")
             logger.info("autotrade disabled for user=%d", uid)
+        elif sub == "fire":
+            await self._fire(uid, args, ctx, reply)
         elif sub == "size":
             await self._set_size(uid, args, reply)
         elif sub == "disconnect":
@@ -178,9 +184,86 @@ class AutotradeCommands:
                 "/autotrade on - enable (shows disclosure)\n"
                 "/autotrade agree - accept + enable\n"
                 "/autotrade size <pct> - set percent of balance per trade\n"
+                "/autotrade fire <coin> <long|short> [lev] [sl] - manually place one trade\n"
                 "/autotrade off - stop\n"
                 "/autotrade disconnect - wipe key + stop"
             )
+
+    async def _fire(self, uid, args, ctx, reply) -> None:
+        """Manual single trade the user pulls the trigger on.
+
+        Two steps for safety: `/autotrade fire <coin> <long|short> [lev] [sl]`
+        previews, then `/autotrade fire confirm` places it. Places a REAL
+        order via the same engine path as an auto-fired signal.
+        """
+        import time
+
+        if self._engine is None:
+            await reply("Manual fire is not available on this bot.")
+            return
+        if not await self._is_connected(uid):
+            await reply("Connect first: /autotrade connect")
+            return
+        prefs = await self._prefs_db.get_or_default(uid)
+        if not prefs.ready:
+            await reply("Enable autotrade first: /autotrade on then /autotrade agree")
+            return
+
+        # --- confirm step ---
+        if len(args) >= 2 and args[1] == "confirm":
+            pend = (ctx.user_data or {}).get(_FIRE_PENDING)
+            if not pend or (time.time() - pend["ts"]) > _FIRE_TTL_SEC:
+                await reply("Nothing pending (or it expired). Start with "
+                            "/autotrade fire <coin> <long|short> [leverage] [sl].")
+                return
+            ctx.user_data.pop(_FIRE_PENDING, None)
+            await reply(f"Firing {pend['side']} {pend['coin']} now...")
+            await self._engine.manual_fire(
+                uid, pair=pend["pair"], side=pend["side"],
+                leverage=pend["lev"], stop_loss=pend["sl"],
+            )
+            return
+
+        # --- preview step ---
+        if len(args) < 3:
+            await reply("Usage: /autotrade fire <coin> <long|short> [leverage] [sl]\n"
+                        "e.g. /autotrade fire XLM short 5 0.20748")
+            return
+        coin = args[1].upper()
+        side = args[2].upper()
+        if side not in ("LONG", "SHORT"):
+            await reply("Direction must be long or short.")
+            return
+        lev = 0
+        if len(args) >= 4:
+            try:
+                lev = int(args[3])
+            except ValueError:
+                await reply("Leverage must be a whole number.")
+                return
+        sl = None
+        if len(args) >= 5:
+            try:
+                sl = float(args[4])
+            except ValueError:
+                await reply("Stop loss must be a number.")
+                return
+
+        pair = f"{coin}/USDT"
+        if ctx.user_data is not None:
+            ctx.user_data[_FIRE_PENDING] = {
+                "pair": pair, "coin": coin, "side": side,
+                "lev": lev, "sl": sl, "ts": time.time(),
+            }
+        await reply(
+            f"<b>Confirm manual trade</b>\n"
+            f"REAL {side} {coin} at market"
+            + (f", {lev}x" if lev else " (leverage capped to the asset max)")
+            + (f", SL {sl}" if sl is not None else ", no stop")
+            + f"\nSized at your {prefs.size_pct:g}% of balance.\n\n"
+            "Reply <code>/autotrade fire confirm</code> within 2 minutes to place it.",
+            parse_mode="HTML",
+        )
 
     async def _set_size(self, uid: int, args: list[str], reply) -> None:
         if len(args) < 2:
