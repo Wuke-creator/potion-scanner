@@ -305,17 +305,22 @@ class AutotradeConfig:
 
     enabled: bool = False              # master switch / kill switch
     dry_run: bool = True               # log + DM the intended trade, place nothing
-    network: str = "testnet"           # "testnet" | "mainnet"
+    venue: str = "hyperliquid"         # "hyperliquid" | "blofin"
+    network: str = "testnet"           # HL: testnet|mainnet; Blofin: demo|prod (mainnet->prod)
     allowlist: frozenset[int] = field(default_factory=frozenset)
     source_channel_key: str = "perp_bot"   # only this channel auto-fires
     prefs_db_path: str = "data/autotrade_prefs.db"
-    default_size_pct: float = 5.0      # % of withdrawable USDC per trade
+    blofin_creds_db_path: str = "data/blofin_creds.db"
+    default_size_pct: float = 5.0      # % of available balance per trade
     max_leverage: int = 20             # caps whatever the signal says
     max_per_day: int = 10              # per-user daily trade cap
     min_collateral_usdc: float = 5.0   # skip if computed size below this
     slippage_bps: int = 100            # IOC crossing slippage for market-in
     # Account-level risk guard (passivbot-derived; src/trading/autotrade_risk.py).
-    # Wallet exposure = position notional / account value. 0 disables a check.
+    # Only runs when risk_enabled AND the venue can supply an account snapshot
+    # (Hyperliquid yes, Blofin not yet). Wallet exposure = notional / account
+    # value; 0 disables an individual check.
+    risk_enabled: bool = True            # master switch for the whole guard
     risk_symbol_we_limit: float = 1.0   # max exposure per coin (1.0 = 100% of account)
     risk_total_we_limit: float = 2.0    # max exposure across all open positions
     risk_max_drawdown_pct: float = 15.0  # block new entries this far below peak balance
@@ -775,6 +780,9 @@ def load_config(
         # Defaults ON: unset means dry-run. Only an explicit false disables it.
         dry_run=os.getenv("AUTOTRADE_DRY_RUN", "true").strip().lower()
         not in ("0", "false", "no"),
+        venue=os.getenv(
+            "AUTOTRADE_VENUE", autotrade_yaml.get("venue", "hyperliquid"),
+        ).strip().lower(),
         network=os.getenv(
             "AUTOTRADE_NETWORK", autotrade_yaml.get("network", "testnet"),
         ).strip().lower(),
@@ -785,6 +793,9 @@ def load_config(
         ).strip(),
         prefs_db_path=autotrade_yaml.get(
             "prefs_db_path", "data/autotrade_prefs.db",
+        ),
+        blofin_creds_db_path=autotrade_yaml.get(
+            "blofin_creds_db_path", "data/blofin_creds.db",
         ),
         default_size_pct=float(
             os.getenv(
@@ -810,6 +821,10 @@ def load_config(
             "AUTOTRADE_SLIPPAGE_BPS",
             int(autotrade_yaml.get("slippage_bps", 100)),
         ),
+        risk_enabled=os.getenv(
+            "AUTOTRADE_RISK_ENABLED",
+            str(autotrade_yaml.get("risk_enabled", "true")),
+        ).strip().lower() not in ("0", "false", "no"),
         risk_symbol_we_limit=float(
             os.getenv(
                 "AUTOTRADE_RISK_SYMBOL_WE",

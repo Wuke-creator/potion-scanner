@@ -1,20 +1,22 @@
-"""Signal-driven autotrade engine (Hyperliquid).
+"""Signal-driven autotrade engine (venue-agnostic).
 
 When the router records a new "Perp Bot Calls" signal it calls
 ``on_new_signal``. For each allowlisted, connected, opted-in user the engine:
 
-  1. checks eligibility (allowlist AND Elite-active AND agent connected
+  1. checks eligibility (allowlist AND Elite-active AND venue-connected
      AND /autotrade on + disclosure accepted),
   2. atomically claims (user, signal) so a re-broadcast can't double-fire,
-  3. sizes collateral as ``withdrawable_usdc * size_pct`` (clamped),
-  4. builds a Hyperliquid plan (coin resolution, price, szDecimals-floored
-     size, leverage capped by the signal, the user max, and the asset max),
+  3. sizes collateral as ``balance * size_pct`` (clamped),
+  4. asks the venue to build a plan (symbol resolution, price, sizing,
+     leverage capped by the signal, the user max, and the asset max),
   5. in dry-run: DMs the intended trade and places nothing,
      live: consumes a daily-cap slot, places the trade, DMs the result.
 
-Every user is isolated: one user's failure never blocks another. Nothing
-fires unless ``config.enabled`` and the allowlist is non-empty; the router
-only calls this for the configured source channel.
+The engine is venue-agnostic: it talks to a ``Venue`` (Hyperliquid or Blofin)
+and never sees an address, agent key, or API secret. Every user is isolated:
+one user's failure never blocks another. Nothing fires unless
+``config.enabled`` and the allowlist is non-empty; the router only calls this
+for the configured source channel.
 """
 
 from __future__ import annotations
@@ -24,11 +26,16 @@ from typing import Awaitable, Callable
 
 from src.config.settings import AutotradeConfig
 from src.trading.autotrade_risk import AutotradeRiskGuard
-from src.trading.hyperliquid_client import HyperliquidClient, HyperliquidError, TradePlan
+from src.trading.venue import Venue, VenueError, VenuePlan
 
 logger = logging.getLogger(__name__)
 
 SendDM = Callable[[int, str], Awaitable[None]]
+
+_MANAGE_URL = {
+    "hyperliquid": "app.hyperliquid.xyz",
+    "blofin": "blofin.com",
+}
 
 
 def _fmt_num(value: float) -> str:
@@ -41,20 +48,24 @@ class AutotradeEngine:
         *,
         config: AutotradeConfig,
         max_collateral_usdc: float,
-        client: HyperliquidClient,
-        delegates_db,
+        venue: Venue,
         prefs_db,
         verification_db,
         send_dm: SendDM,
     ):
         self._config = config
         self._max_collateral_usdc = max_collateral_usdc
-        self._client = client
-        self._delegates_db = delegates_db
+        self._venue = venue
         self._prefs_db = prefs_db
         self._verification_db = verification_db
         self._send_dm = send_dm
-        self._risk = AutotradeRiskGuard(config=config, client=client, prefs_db=prefs_db)
+        # The risk guard only runs when explicitly enabled AND the venue can
+        # supply an account snapshot. Blofin can't yet, so it's off there.
+        self._guard_on = bool(
+            getattr(config, "risk_enabled", True)
+            and getattr(venue, "supports_risk_guard", False)
+        )
+        self._risk = AutotradeRiskGuard(config=config, venue=venue, prefs_db=prefs_db)
 
     async def on_new_signal(self, signal) -> None:
         """Entry point from the router. Never raises into the caller."""
@@ -115,8 +126,8 @@ class AutotradeEngine:
         verified = await self._verification_db.get_verified(uid)
         if verified is None or not verified.is_active:
             return
-        delegate = await self._delegates_db.get(uid)
-        if delegate is None or not delegate.is_active:
+        conn = await self._venue.get_connection(uid)
+        if conn is None or not conn.is_active:
             return
         prefs = await self._prefs_db.get_or_default(
             uid, default_pct=self._config.default_size_pct,
@@ -133,8 +144,13 @@ class AutotradeEngine:
         stop_loss = getattr(signal, "stop_loss", None)
         req_leverage = getattr(signal, "leverage", None) or 0
 
-        # --- sizing: percent of withdrawable USDC ---
-        balance = await self._client.get_available_usdc(delegate.trader_address)
+        # --- sizing: percent of available balance ---
+        try:
+            balance = await self._venue.get_balance(uid)
+        except VenueError as e:
+            await self._prefs_db.release_fire(uid, signal_id)
+            await self._dm(uid, f"Autotrade skipped {pair}: could not read balance ({e}).")
+            return
         collateral = balance * (prefs.size_pct / 100.0)
         if self._max_collateral_usdc and self._max_collateral_usdc > 0:
             collateral = min(collateral, self._max_collateral_usdc)
@@ -148,42 +164,45 @@ class AutotradeEngine:
             )
             return
 
-        plan = await self._client.plan_trade(
-            pair=pair,
-            direction=side,
-            collateral_usdc=collateral,
-            requested_leverage=int(req_leverage),
-            max_leverage=self._config.max_leverage,
-        )
+        try:
+            plan = await self._venue.plan(
+                pair=pair,
+                direction=side,
+                collateral_usdc=collateral,
+                requested_leverage=int(req_leverage),
+                max_leverage=self._config.max_leverage,
+            )
+        except VenueError as e:
+            await self._prefs_db.release_fire(uid, signal_id)
+            await self._dm(uid, f"Autotrade skipped {pair}: {e}.")
+            return
         if plan is None:
             await self._prefs_db.release_fire(uid, signal_id)
             await self._dm(
                 uid,
-                f"Autotrade skipped {pair}: not listed on Hyperliquid, "
-                f"or the size falls below the $10 minimum.",
+                f"Autotrade skipped {pair}: not listed on {self._venue.name}, "
+                f"or the size falls below the venue minimum.",
             )
             return
 
-        # --- account-level risk guard (passivbot-derived; see autotrade_risk) ---
-        # Runs before BOTH branches so the dry-run soak shows exactly what the
-        # guard would have blocked live. Fail-closed: an unreadable account
-        # state blocks the trade rather than waving it through.
-        verdict = await self._risk.check(uid, delegate.trader_address, plan)
+        # --- account-level risk guard (only when enabled AND venue-supported) ---
+        # Fail-closed: an unreadable account state blocks the trade. Runs before
+        # both branches so a dry-run soak shows exactly what it would block.
+        verdict = None
+        if self._guard_on:
+            verdict = await self._risk.check(uid, plan)
 
         # --- dry-run: preview only, no order, no daily-slot spend ---
         if self._config.dry_run:
             preview = self._fmt_preview(plan, tp1, stop_loss)
-            if not verdict.allowed:
+            if verdict is not None and not verdict.allowed:
                 preview += f"\nRISK GUARD would block this: {verdict.reason}"
             await self._dm(uid, preview)
             return
 
-        if not verdict.allowed:
+        if verdict is not None and not verdict.allowed:
             await self._prefs_db.release_fire(uid, signal_id)
-            await self._dm(
-                uid,
-                f"Autotrade blocked {plan.coin}: {verdict.reason}",
-            )
+            await self._dm(uid, f"Autotrade blocked {plan.coin}: {verdict.reason}")
             logger.info(
                 "risk guard blocked user=%s coin=%s: %s", uid, plan.coin, verdict.reason,
             )
@@ -199,39 +218,34 @@ class AutotradeEngine:
             )
             return
 
-        agent_key = await self._delegates_db.get_plaintext_key(uid)
-        if not agent_key:
-            await self._prefs_db.release_fire(uid, signal_id)
-            return
-
         try:
-            result = await self._client.place_trade(
-                agent_private_key=agent_key,
-                master_address=delegate.trader_address,
-                plan=plan,
-                take_profit=tp1,
-                stop_loss=stop_loss,
+            result = await self._venue.place(
+                uid, plan, take_profit=tp1, stop_loss=stop_loss,
                 slippage_bps=self._config.slippage_bps,
             )
-        except HyperliquidError as e:
+        except VenueError as e:
             await self._prefs_db.release_fire(uid, signal_id)
-            await self._delegates_db.mark_trade_failure(uid, str(e))
+            await self._venue.mark_failure(uid, str(e))
             await self._dm(uid, f"Autotrade failed on {plan.coin}: {e}")
             return
         except Exception as e:  # noqa: BLE001
             await self._prefs_db.release_fire(uid, signal_id)
-            await self._delegates_db.mark_trade_failure(uid, repr(e))
+            await self._venue.mark_failure(uid, repr(e))
             await self._dm(uid, f"Autotrade failed on {plan.coin}: unexpected error.")
-            logger.exception("place_trade crashed for user=%s", uid)
+            logger.exception("place crashed for user=%s", uid)
             return
 
-        await self._delegates_db.mark_trade_success(uid)
+        await self._venue.mark_success(uid)
         await self._dm(uid, self._fmt_success(plan, result, tp1, stop_loss))
 
     # ---- DM formatting -----------------------------------------------------
 
+    def _manage_hint(self) -> str:
+        url = _MANAGE_URL.get(getattr(self._venue, "name", ""), "your exchange")
+        return f"Manage the position on {url}."
+
     def _fmt_preview(
-        self, plan: TradePlan, tp1: float | None, stop_loss: float | None,
+        self, plan: VenuePlan, tp1: float | None, stop_loss: float | None,
     ) -> str:
         direction = "LONG" if plan.is_long else "SHORT"
         lines = [
@@ -248,7 +262,7 @@ class AutotradeEngine:
         return "\n".join(lines)
 
     def _fmt_success(
-        self, plan: TradePlan, result, tp1: float | None, stop_loss: float | None,
+        self, plan: VenuePlan, result, tp1: float | None, stop_loss: float | None,
     ) -> str:
         direction = "LONG" if plan.is_long else "SHORT"
         lines = [
@@ -262,5 +276,5 @@ class AutotradeEngine:
             lines.append(f"SL {_fmt_num(stop_loss)}: {'set' if sl_ok else 'FAILED - set it manually'}")
         if tp1 is not None:
             lines.append(f"TP {_fmt_num(tp1)}: {'set' if tp_ok else 'FAILED - set it manually'}")
-        lines.append("Manage the position on app.hyperliquid.xyz.")
+        lines.append(self._manage_hint())
         return "\n".join(lines)

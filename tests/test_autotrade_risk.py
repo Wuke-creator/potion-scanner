@@ -41,10 +41,10 @@ def _config(**kw):
     return AutotradeConfig(**base)
 
 
-def _client(snapshot):
-    client = SimpleNamespace()
-    client.get_account_snapshot = AsyncMock(return_value=snapshot)
-    return client
+def _venue(snapshot):
+    venue = SimpleNamespace()
+    venue.get_account_snapshot = AsyncMock(return_value=snapshot)
+    return venue
 
 
 @pytest_asyncio.fixture
@@ -59,19 +59,19 @@ async def prefs_db(tmp_path: Path):
 async def test_allows_clean_account(prefs_db):
     guard = AutotradeRiskGuard(
         config=_config(),
-        client=_client(AccountSnapshot(account_value=10_000.0, positions={})),
+        venue=_venue(AccountSnapshot(account_value=10_000.0, positions={})),
         prefs_db=prefs_db,
     )
-    verdict = await guard.check(UID, ADDR, _plan(notional=1000.0))
+    verdict = await guard.check(UID,_plan(notional=1000.0))
     assert verdict.allowed
 
 
 @pytest.mark.asyncio
 async def test_fails_closed_when_snapshot_unavailable(prefs_db):
     guard = AutotradeRiskGuard(
-        config=_config(), client=_client(None), prefs_db=prefs_db,
+        config=_config(), venue=_venue(None), prefs_db=prefs_db,
     )
-    verdict = await guard.check(UID, ADDR, _plan())
+    verdict = await guard.check(UID,_plan())
     assert not verdict.allowed
     assert "risk data unavailable" in verdict.reason
 
@@ -79,8 +79,8 @@ async def test_fails_closed_when_snapshot_unavailable(prefs_db):
 @pytest.mark.asyncio
 async def test_no_stacking_blocks_second_position_same_coin(prefs_db):
     snapshot = AccountSnapshot(account_value=10_000.0, positions={"BTC": 2_000.0})
-    guard = AutotradeRiskGuard(config=_config(), client=_client(snapshot), prefs_db=prefs_db)
-    verdict = await guard.check(UID, ADDR, _plan(coin="BTC"))
+    guard = AutotradeRiskGuard(config=_config(), venue=_venue(snapshot), prefs_db=prefs_db)
+    verdict = await guard.check(UID,_plan(coin="BTC"))
     assert not verdict.allowed
     assert "already open" in verdict.reason
 
@@ -90,20 +90,20 @@ async def test_no_stacking_disabled_falls_through_to_exposure(prefs_db):
     snapshot = AccountSnapshot(account_value=10_000.0, positions={"BTC": 2_000.0})
     guard = AutotradeRiskGuard(
         config=_config(risk_no_stacking=False),
-        client=_client(snapshot),
+        venue=_venue(snapshot),
         prefs_db=prefs_db,
     )
     # 2k existing + 1k new = 0.3x on a 10k account: fine.
-    verdict = await guard.check(UID, ADDR, _plan(coin="BTC", notional=1_000.0))
+    verdict = await guard.check(UID,_plan(coin="BTC", notional=1_000.0))
     assert verdict.allowed
 
 
 @pytest.mark.asyncio
 async def test_symbol_exposure_limit_blocks(prefs_db):
     snapshot = AccountSnapshot(account_value=10_000.0, positions={})
-    guard = AutotradeRiskGuard(config=_config(), client=_client(snapshot), prefs_db=prefs_db)
+    guard = AutotradeRiskGuard(config=_config(), venue=_venue(snapshot), prefs_db=prefs_db)
     # 12k notional on a 10k account = 1.2x > 1.0x per-symbol limit.
-    verdict = await guard.check(UID, ADDR, _plan(notional=12_000.0))
+    verdict = await guard.check(UID,_plan(notional=12_000.0))
     assert not verdict.allowed
     assert "per-symbol" in verdict.reason
 
@@ -115,8 +115,8 @@ async def test_total_exposure_limit_blocks(prefs_db):
     snapshot = AccountSnapshot(
         account_value=10_000.0, positions={"ETH": 9_000.0, "SOL": 7_000.0},
     )
-    guard = AutotradeRiskGuard(config=_config(), client=_client(snapshot), prefs_db=prefs_db)
-    verdict = await guard.check(UID, ADDR, _plan(coin="BTC", notional=5_000.0))
+    guard = AutotradeRiskGuard(config=_config(), venue=_venue(snapshot), prefs_db=prefs_db)
+    verdict = await guard.check(UID,_plan(coin="BTC", notional=5_000.0))
     assert not verdict.allowed
     assert "total wallet exposure" in verdict.reason
 
@@ -126,8 +126,8 @@ async def test_drawdown_brake_blocks_below_peak(prefs_db):
     # Establish a 10k peak, then present an 8k account: 20% > 15% brake.
     await prefs_db.bump_equity_peak(UID, 10_000.0)
     snapshot = AccountSnapshot(account_value=8_000.0, positions={})
-    guard = AutotradeRiskGuard(config=_config(), client=_client(snapshot), prefs_db=prefs_db)
-    verdict = await guard.check(UID, ADDR, _plan(notional=500.0))
+    guard = AutotradeRiskGuard(config=_config(), venue=_venue(snapshot), prefs_db=prefs_db)
+    verdict = await guard.check(UID,_plan(notional=500.0))
     assert not verdict.allowed
     assert "below its" in verdict.reason
 
@@ -136,8 +136,8 @@ async def test_drawdown_brake_blocks_below_peak(prefs_db):
 async def test_drawdown_brake_releases_on_recovery(prefs_db):
     await prefs_db.bump_equity_peak(UID, 10_000.0)
     snapshot = AccountSnapshot(account_value=9_000.0, positions={})  # 10% below
-    guard = AutotradeRiskGuard(config=_config(), client=_client(snapshot), prefs_db=prefs_db)
-    verdict = await guard.check(UID, ADDR, _plan(notional=500.0))
+    guard = AutotradeRiskGuard(config=_config(), venue=_venue(snapshot), prefs_db=prefs_db)
+    verdict = await guard.check(UID,_plan(notional=500.0))
     assert verdict.allowed
 
 
@@ -158,8 +158,8 @@ async def test_zero_limits_disable_checks(prefs_db):
             risk_symbol_we_limit=0, risk_total_we_limit=0,
             risk_max_drawdown_pct=0, risk_no_stacking=False,
         ),
-        client=_client(snapshot),
+        venue=_venue(snapshot),
         prefs_db=prefs_db,
     )
-    verdict = await guard.check(UID, ADDR, _plan(notional=100_000.0))
+    verdict = await guard.check(UID,_plan(notional=100_000.0))
     assert verdict.allowed

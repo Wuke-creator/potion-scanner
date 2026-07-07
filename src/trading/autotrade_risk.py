@@ -60,13 +60,13 @@ class RiskVerdict:
 class AutotradeRiskGuard:
     """Sequential pre-trade checks; the first failure wins."""
 
-    def __init__(self, *, config, client, prefs_db):
+    def __init__(self, *, config, venue, prefs_db):
         self._config = config
-        self._client = client
+        self._venue = venue
         self._prefs_db = prefs_db
 
-    async def check(self, uid: int, master_address: str, plan) -> RiskVerdict:
-        snapshot = await self._client.get_account_snapshot(master_address)
+    async def check(self, uid: int, plan) -> RiskVerdict:
+        snapshot = await self._venue.get_account_snapshot(uid)
         if snapshot is None or snapshot.account_value <= 0:
             return RiskVerdict.blocked(
                 "risk data unavailable (could not read account state); "

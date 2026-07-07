@@ -1,8 +1,10 @@
 """Tests for the autotrade engine loop.
 
 Uses a real AutotradePrefsDB (tmp) so dedupe + daily-cap behaviour is
-exercised for real; the venue client, delegates store, and verification
-store are mocked.
+exercised for real; the venue (Hyperliquid or Blofin adapter) and the
+verification store are mocked. The mock venue advertises risk-guard support
+and returns a clean account snapshot, so the guard runs and passes exactly
+as it does on Hyperliquid.
 """
 
 from __future__ import annotations
@@ -17,15 +19,16 @@ import pytest_asyncio
 from src.config.settings import AutotradeConfig
 from src.trading.autotrade_engine import AutotradeEngine
 from src.trading.autotrade_prefs_db import AutotradePrefsDB
-from src.trading.hyperliquid_client import AccountSnapshot, HyperliquidError, TradePlan
+from src.trading.hyperliquid_client import AccountSnapshot
+from src.trading.venue import VenueConnection, VenueError, VenuePlan, VenueResult
 
 UID = 111
-_DEFAULT_PLAN = TradePlan(
+_DEFAULT_PLAN = VenuePlan(
     coin="BTC", is_long=True, price=50000.0, size=0.02, leverage=10,
     notional_usd=1000.0,
 )
-_DEFAULT_RESULT = SimpleNamespace(
-    coin="BTC", size=0.02, sl_ok=True, tp_ok=True, entry_oid=1, entry_avg_px=50000.0,
+_DEFAULT_RESULT = VenueResult(
+    coin="BTC", size=0.02, sl_ok=True, tp_ok=True, ref="1",
 )
 _SENTINEL = object()
 
@@ -48,36 +51,35 @@ def _signal(**kw):
 def _make_engine(
     prefs_db, *, enabled=True, dry_run=True, allowlist=frozenset({UID}),
     max_per_day=10, balance=1000.0, plan=_SENTINEL, place_result=None,
-    place_error=None, verified=True, delegate=True,
+    place_error=None, verified=True, connected=True, risk_enabled=True,
+    venue_name="hyperliquid",
 ):
     cfg = AutotradeConfig(
-        enabled=enabled, dry_run=dry_run, network="testnet",
+        enabled=enabled, dry_run=dry_run, venue=venue_name, network="testnet",
         allowlist=allowlist, default_size_pct=5.0, max_leverage=20,
         max_per_day=max_per_day, min_collateral_usdc=5.0, slippage_bps=100,
+        risk_enabled=risk_enabled,
     )
-    client = AsyncMock()
-    client.get_available_usdc = AsyncMock(return_value=balance)
-    # Clean account for the risk guard: comfortable value, no open positions,
-    # so existing engine-behaviour tests are unaffected by the guard.
-    client.get_account_snapshot = AsyncMock(
+    venue = AsyncMock()
+    venue.name = venue_name
+    venue.supports_risk_guard = True
+    venue.get_connection = AsyncMock(return_value=(
+        VenueConnection(is_active=True, label="0xMASTER") if connected else None
+    ))
+    venue.get_balance = AsyncMock(return_value=balance)
+    # Clean account for the risk guard: comfortable value, no open positions.
+    venue.get_account_snapshot = AsyncMock(
         return_value=AccountSnapshot(account_value=100_000.0, positions={}),
     )
-    client.plan_trade = AsyncMock(
+    venue.plan = AsyncMock(
         return_value=_DEFAULT_PLAN if plan is _SENTINEL else plan,
     )
     if place_error is not None:
-        client.place_trade = AsyncMock(side_effect=place_error)
+        venue.place = AsyncMock(side_effect=place_error)
     else:
-        client.place_trade = AsyncMock(return_value=place_result or _DEFAULT_RESULT)
-
-    delegates = AsyncMock()
-    delegates.get = AsyncMock(return_value=(
-        SimpleNamespace(trader_address="0xMASTER", is_active=True)
-        if delegate else None
-    ))
-    delegates.get_plaintext_key = AsyncMock(return_value="0xAGENTKEY")
-    delegates.mark_trade_success = AsyncMock()
-    delegates.mark_trade_failure = AsyncMock()
+        venue.place = AsyncMock(return_value=place_result or _DEFAULT_RESULT)
+    venue.mark_success = AsyncMock()
+    venue.mark_failure = AsyncMock()
 
     verification = AsyncMock()
     verification.get_verified = AsyncMock(return_value=(
@@ -86,11 +88,10 @@ def _make_engine(
 
     send_dm = AsyncMock()
     engine = AutotradeEngine(
-        config=cfg, max_collateral_usdc=5000.0, client=client,
-        delegates_db=delegates, prefs_db=prefs_db,
-        verification_db=verification, send_dm=send_dm,
+        config=cfg, max_collateral_usdc=5000.0, venue=venue,
+        prefs_db=prefs_db, verification_db=verification, send_dm=send_dm,
     )
-    return engine, client, delegates, verification, send_dm
+    return engine, venue, send_dm
 
 
 async def _opt_in(prefs_db, uid=UID):
@@ -101,57 +102,57 @@ async def _opt_in(prefs_db, uid=UID):
 class TestGates:
     @pytest.mark.asyncio
     async def test_disabled_does_nothing(self, prefs_db):
-        engine, client, _, _, send_dm = _make_engine(prefs_db, enabled=False)
+        engine, venue, send_dm = _make_engine(prefs_db, enabled=False)
         await _opt_in(prefs_db)
         await engine.on_new_signal(_signal())
-        client.plan_trade.assert_not_called()
+        venue.plan.assert_not_called()
         send_dm.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_empty_allowlist_does_nothing(self, prefs_db):
-        engine, client, _, _, send_dm = _make_engine(prefs_db, allowlist=frozenset())
+        engine, venue, send_dm = _make_engine(prefs_db, allowlist=frozenset())
         await _opt_in(prefs_db)
         await engine.on_new_signal(_signal())
-        client.plan_trade.assert_not_called()
+        venue.plan.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_not_elite_skipped(self, prefs_db):
-        engine, client, _, _, _ = _make_engine(prefs_db, verified=False)
+        engine, venue, _ = _make_engine(prefs_db, verified=False)
         await _opt_in(prefs_db)
         await engine.on_new_signal(_signal())
-        client.plan_trade.assert_not_called()
+        venue.plan.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_no_delegate_skipped(self, prefs_db):
-        engine, client, _, _, _ = _make_engine(prefs_db, delegate=False)
+    async def test_not_connected_skipped(self, prefs_db):
+        engine, venue, _ = _make_engine(prefs_db, connected=False)
         await _opt_in(prefs_db)
         await engine.on_new_signal(_signal())
-        client.plan_trade.assert_not_called()
+        venue.plan.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_not_opted_in_skipped(self, prefs_db):
-        engine, client, _, _, _ = _make_engine(prefs_db)
-        # enabled but no disclosure -> not ready
+        engine, venue, _ = _make_engine(prefs_db)
+        # connected but no disclosure -> not ready
         await prefs_db.set_enabled(UID, True)
         await engine.on_new_signal(_signal())
-        client.plan_trade.assert_not_called()
+        venue.plan.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_direction_skipped(self, prefs_db):
-        engine, client, _, _, _ = _make_engine(prefs_db)
+        engine, venue, _ = _make_engine(prefs_db)
         await _opt_in(prefs_db)
         await engine.on_new_signal(_signal(side=None))
-        client.plan_trade.assert_not_called()
+        venue.plan.assert_not_called()
 
 
 class TestDryRun:
     @pytest.mark.asyncio
     async def test_previews_without_placing(self, prefs_db):
-        engine, client, delegates, _, send_dm = _make_engine(prefs_db, dry_run=True)
+        engine, venue, send_dm = _make_engine(prefs_db, dry_run=True)
         await _opt_in(prefs_db)
         await engine.on_new_signal(_signal())
-        client.place_trade.assert_not_called()
-        delegates.mark_trade_success.assert_not_called()
+        venue.place.assert_not_called()
+        venue.mark_success.assert_not_called()
         assert send_dm.await_count == 1
         assert "[DRY RUN]" in send_dm.await_args.args[1]
         # dry-run must not consume a daily slot
@@ -160,7 +161,7 @@ class TestDryRun:
 
     @pytest.mark.asyncio
     async def test_dedupe_same_signal(self, prefs_db):
-        engine, _, _, _, send_dm = _make_engine(prefs_db, dry_run=True)
+        engine, _, send_dm = _make_engine(prefs_db, dry_run=True)
         await _opt_in(prefs_db)
         sig = _signal(id=42)
         await engine.on_new_signal(sig)
@@ -171,57 +172,57 @@ class TestDryRun:
 class TestLive:
     @pytest.mark.asyncio
     async def test_places_and_reports(self, prefs_db):
-        engine, client, delegates, _, send_dm = _make_engine(prefs_db, dry_run=False)
+        engine, venue, send_dm = _make_engine(prefs_db, dry_run=False)
         await _opt_in(prefs_db)
         await engine.on_new_signal(_signal())
-        client.place_trade.assert_awaited_once()
+        venue.place.assert_awaited_once()
         # sized off balance*pct: 1000 * 5% = $50 collateral requested
-        assert client.plan_trade.await_args.kwargs["collateral_usdc"] == pytest.approx(50.0)
-        delegates.mark_trade_success.assert_awaited_once()
+        assert venue.plan.await_args.kwargs["collateral_usdc"] == pytest.approx(50.0)
+        venue.mark_success.assert_awaited_once()
         assert "filled" in send_dm.await_args.args[1].lower()
         prefs = await prefs_db.get_or_default(UID)
         assert prefs.trades_today == 1
 
     @pytest.mark.asyncio
     async def test_balance_too_low_skips(self, prefs_db):
-        engine, client, _, _, send_dm = _make_engine(
+        engine, venue, send_dm = _make_engine(
             prefs_db, dry_run=False, balance=50.0,  # 5% -> $2.50 < $5 min
         )
         await _opt_in(prefs_db)
         await engine.on_new_signal(_signal())
-        client.plan_trade.assert_not_called()
-        client.place_trade.assert_not_called()
+        venue.plan.assert_not_called()
+        venue.place.assert_not_called()
         assert "too low" in send_dm.await_args.args[1].lower()
 
     @pytest.mark.asyncio
     async def test_unlisted_coin_skips(self, prefs_db):
-        engine, client, _, _, send_dm = _make_engine(
-            prefs_db, dry_run=False, plan=None,  # plan_trade returns None
+        engine, venue, send_dm = _make_engine(
+            prefs_db, dry_run=False, plan=None,  # venue.plan returns None
         )
         await _opt_in(prefs_db)
         await engine.on_new_signal(_signal(pair="OBSCURE/USDT"))
-        client.place_trade.assert_not_called()
+        venue.place.assert_not_called()
         assert "hyperliquid" in send_dm.await_args.args[1].lower()
 
     @pytest.mark.asyncio
     async def test_daily_cap_enforced(self, prefs_db):
-        engine, client, _, _, send_dm = _make_engine(
+        engine, venue, send_dm = _make_engine(
             prefs_db, dry_run=False, max_per_day=1,
         )
         await _opt_in(prefs_db)
         await engine.on_new_signal(_signal(id=1))
         await engine.on_new_signal(_signal(id=2))
-        assert client.place_trade.await_count == 1
+        assert venue.place.await_count == 1
         assert "daily cap" in send_dm.await_args.args[1].lower()
 
     @pytest.mark.asyncio
     async def test_place_error_reports_and_releases(self, prefs_db):
-        engine, client, delegates, _, send_dm = _make_engine(
-            prefs_db, dry_run=False, place_error=HyperliquidError("insufficient margin"),
+        engine, venue, send_dm = _make_engine(
+            prefs_db, dry_run=False, place_error=VenueError("insufficient margin"),
         )
         await _opt_in(prefs_db)
         await engine.on_new_signal(_signal(id=7))
-        delegates.mark_trade_failure.assert_awaited_once()
+        venue.mark_failure.assert_awaited_once()
         assert "failed" in send_dm.await_args.args[1].lower()
         # claim released -> the (user, signal) can be retried
         assert await prefs_db.try_claim_fire(UID, 7) is True
@@ -230,32 +231,32 @@ class TestLive:
 class TestManualFire:
     @pytest.mark.asyncio
     async def test_manual_fire_places_for_invoker(self, prefs_db):
-        engine, client, delegates, _, send_dm = _make_engine(prefs_db, dry_run=False)
+        engine, venue, send_dm = _make_engine(prefs_db, dry_run=False)
         await _opt_in(prefs_db)
         await engine.manual_fire(UID, pair="XLM/USDT", side="short", leverage=5, stop_loss=0.207)
-        client.place_trade.assert_awaited_once()
-        delegates.mark_trade_success.assert_awaited_once()
+        venue.place.assert_awaited_once()
+        venue.mark_success.assert_awaited_once()
         assert "filled" in send_dm.await_args.args[1].lower()
 
     @pytest.mark.asyncio
     async def test_manual_fire_dry_run_previews(self, prefs_db):
-        engine, client, _, _, send_dm = _make_engine(prefs_db, dry_run=True)
+        engine, venue, send_dm = _make_engine(prefs_db, dry_run=True)
         await _opt_in(prefs_db)
         await engine.manual_fire(UID, pair="XLM/USDT", side="long", leverage=5)
-        client.place_trade.assert_not_called()
+        venue.place.assert_not_called()
         assert "[DRY RUN]" in send_dm.await_args.args[1]
 
     @pytest.mark.asyncio
     async def test_manual_fire_bad_direction(self, prefs_db):
-        engine, client, _, _, send_dm = _make_engine(prefs_db, dry_run=False)
+        engine, venue, send_dm = _make_engine(prefs_db, dry_run=False)
         await _opt_in(prefs_db)
         await engine.manual_fire(UID, pair="XLM/USDT", side="sideways", leverage=5)
-        client.place_trade.assert_not_called()
+        venue.place.assert_not_called()
         assert "direction" in send_dm.await_args.args[1].lower()
 
     @pytest.mark.asyncio
     async def test_manual_fire_not_allowlisted(self, prefs_db):
-        engine, client, _, _, send_dm = _make_engine(prefs_db, allowlist=frozenset({999}), dry_run=False)
+        engine, venue, send_dm = _make_engine(prefs_db, allowlist=frozenset({999}), dry_run=False)
         await _opt_in(prefs_db)
         await engine.manual_fire(UID, pair="XLM/USDT", side="short", leverage=5)
-        client.place_trade.assert_not_called()
+        venue.place.assert_not_called()

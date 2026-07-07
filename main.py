@@ -210,6 +210,8 @@ async def run(config: Config) -> None:
     trade_executor_client = None
     autotrade_engine = None
     autotrade_prefs_db = None
+    blofin_client = None
+    blofin_creds_db = None
     if config.trading.enabled:
         from src.trading.commands import TradingCommands
         from src.trading.delegates_db import DelegatesDB
@@ -395,34 +397,60 @@ async def run(config: Config) -> None:
             "Track-record poster disabled (set TRACK_RECORD_CHANNEL_ID to enable)",
         )
 
-    # --- Autotrade (Hyperliquid, signal-driven; dark by default) ---
-    # Built only when AUTOTRADE_ENABLED. Reuses the shared DelegatesDB
-    # (master address + agent key). Dry-run + testnet by default, so
-    # enabling it previews without placing real orders until DRY_RUN=false.
+    # --- Autotrade (signal-driven; venue = Hyperliquid or Blofin; dark by default) ---
+    # Built only when AUTOTRADE_ENABLED. Dry-run by default, so enabling it
+    # previews without placing real orders until AUTOTRADE_DRY_RUN=false.
+    # AUTOTRADE_VENUE picks the exchange: Hyperliquid (agent keys) reuses the
+    # shared DelegatesDB; Blofin (API key/secret/passphrase) uses BlofinCredsDB.
     if config.autotrade.enabled:
         from src.trading.autotrade_commands import AutotradeCommands
         from src.trading.autotrade_engine import AutotradeEngine
         from src.trading.autotrade_prefs_db import AutotradePrefsDB
-        from src.trading.delegates_db import DelegatesDB
-        from src.trading.hyperliquid_client import HyperliquidClient
 
-        if delegates_db is None:
-            delegates_db = DelegatesDB(db_path=config.trading.delegates_db_path)
-            await delegates_db.open()
         autotrade_prefs_db = AutotradePrefsDB(
             db_path=config.autotrade.prefs_db_path,
         )
         await autotrade_prefs_db.open()
-        hyperliquid_client = HyperliquidClient(network=config.autotrade.network)
 
         async def _autotrade_send_dm(user_id: int, text: str) -> None:
             await telegram_bot.send_message(chat_id=user_id, text=text)
 
+        if config.autotrade.venue == "blofin":
+            from src.trading.blofin_client import (
+                DEMO_BASE_URL,
+                PROD_BASE_URL,
+                BlofinClient,
+            )
+            from src.trading.blofin_creds_db import BlofinCredsDB
+            from src.trading.venue import BlofinVenue
+
+            base_url = (
+                PROD_BASE_URL
+                if config.autotrade.network in ("mainnet", "prod", "live")
+                else DEMO_BASE_URL
+            )
+            blofin_client = BlofinClient(base_url=base_url)
+            await blofin_client.open()
+            blofin_creds_db = BlofinCredsDB(
+                db_path=config.autotrade.blofin_creds_db_path,
+            )
+            await blofin_creds_db.open()
+            autotrade_venue = BlofinVenue(blofin_client, blofin_creds_db)
+        else:
+            from src.trading.delegates_db import DelegatesDB
+            from src.trading.hyperliquid_client import HyperliquidClient
+            from src.trading.venue import HyperliquidVenue
+
+            if delegates_db is None:
+                delegates_db = DelegatesDB(db_path=config.trading.delegates_db_path)
+                await delegates_db.open()
+            hyperliquid_client = HyperliquidClient(network=config.autotrade.network)
+            autotrade_venue = HyperliquidVenue(hyperliquid_client, delegates_db)
+
         autotrade_engine = AutotradeEngine(
             config=config.autotrade,
             max_collateral_usdc=config.trading.max_collateral_usdc,
-            client=hyperliquid_client,
-            delegates_db=delegates_db,
+            venue=autotrade_venue,
             prefs_db=autotrade_prefs_db,
             verification_db=verification.db,
             send_dm=_autotrade_send_dm,
@@ -430,12 +458,15 @@ async def run(config: Config) -> None:
         AutotradeCommands(
             config=config,
             verification_db=verification.db,
-            delegates_db=delegates_db,
             prefs_db=autotrade_prefs_db,
             engine=autotrade_engine,
+            venue=autotrade_venue,
+            delegates_db=delegates_db,
+            blofin_creds_db=blofin_creds_db,
         ).register(verification.application)
         logger.info(
-            "Autotrade enabled: network=%s dry_run=%s allowlist=%d source=%s",
+            "Autotrade enabled: venue=%s network=%s dry_run=%s allowlist=%d source=%s",
+            config.autotrade.venue,
             config.autotrade.network,
             config.autotrade.dry_run,
             len(config.autotrade.allowlist),
@@ -1082,6 +1113,16 @@ async def run(config: Config) -> None:
                 await autotrade_prefs_db.close()
             except Exception:
                 logger.exception("Autotrade prefs DB close error")
+        if blofin_creds_db is not None:
+            try:
+                await blofin_creds_db.close()
+            except Exception:
+                logger.exception("Blofin creds DB close error")
+        if blofin_client is not None:
+            try:
+                await blofin_client.close()
+            except Exception:
+                logger.exception("Blofin client close error")
         try:
             await verification.stop()
         except Exception:

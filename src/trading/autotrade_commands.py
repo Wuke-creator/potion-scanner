@@ -50,6 +50,13 @@ _KEY_RE = re.compile(
     r"(?:key|agent|delegate)\s*[:=]\s*(0x[a-fA-F0-9]{64})", re.IGNORECASE
 )
 
+# Blofin creds paste: three labelled lines. Values are opaque tokens (no
+# spaces), so \S+ is the right matcher. Order the patterns so "secret" and
+# "passphrase" win over the bare "key" alternative.
+_BLOFIN_SECRET_RE = re.compile(r"secret\s*(?:key)?\s*[:=]\s*(\S+)", re.IGNORECASE)
+_BLOFIN_PASS_RE = re.compile(r"(?:passphrase|pass\s*phrase|phrase)\s*[:=]\s*(\S+)", re.IGNORECASE)
+_BLOFIN_KEY_RE = re.compile(r"(?:api[-_ ]?key|\bkey)\s*[:=]\s*(\S+)", re.IGNORECASE)
+
 _CONNECT_HOWTO = (
     "<b>Connect your Hyperliquid agent wallet</b>\n\n"
     "1. Go to app.hyperliquid.xyz, connect your wallet.\n"
@@ -63,17 +70,34 @@ _CONNECT_HOWTO = (
     "I store the key encrypted and delete your message. Send /cancel to abort."
 )
 
-_AUTOEXEC_DISCLOSURE = (
-    "<b>Autotrade - read before enabling</b>\n\n"
-    "When you enable this, the bot will <b>automatically open real trades</b> "
-    "on your Hyperliquid account whenever a Perp Bot Calls signal fires. "
-    "Each trade uses a percent of your available USDC (default 5%), the "
-    "signal's direction and leverage (capped), and the signal's TP1 and stop. "
-    "You can lose money, including on bad or fast-moving signals.\n\n"
-    "You stay in control: <code>/autotrade off</code> stops it immediately, "
-    "and you manage or close any position yourself on app.hyperliquid.xyz.\n\n"
-    "If you understand and accept this, run <code>/autotrade agree</code>."
+_BLOFIN_CONNECT_HOWTO = (
+    "<b>Connect your Blofin API key</b>\n\n"
+    "1. On blofin.com open <b>Account -> APIs -> Create API Key</b>.\n"
+    "2. Permissions: <b>Read + Trade</b>. Do <b>NOT</b> enable Withdraw or "
+    "Transfer. A trade-only key can place orders but can never move your "
+    "funds off the account.\n"
+    "3. Set a passphrase you choose, and copy the API key + secret.\n"
+    "4. Reply here with three lines:\n\n"
+    "<code>key: yourApiKey</code>\n"
+    "<code>secret: yourApiSecret</code>\n"
+    "<code>passphrase: yourPassphrase</code>\n\n"
+    "I store all three encrypted and delete your message. Send /cancel to abort."
 )
+
+
+def _autoexec_disclosure(venue_name: str, manage_url: str) -> str:
+    label = "Blofin" if venue_name == "blofin" else "Hyperliquid"
+    return (
+        "<b>Autotrade - read before enabling</b>\n\n"
+        "When you enable this, the bot will <b>automatically open real trades</b> "
+        f"on your {label} account whenever a Perp Bot Calls signal fires. "
+        "Each trade uses a percent of your available balance (default 5%), the "
+        "signal's direction and leverage (capped), and the signal's TP1 and stop. "
+        "You can lose money, including on bad or fast-moving signals.\n\n"
+        "You stay in control: <code>/autotrade off</code> stops it immediately, "
+        f"and you manage or close any position yourself on {manage_url}.\n\n"
+        "If you understand and accept this, run <code>/autotrade agree</code>."
+    )
 
 
 class AutotradeCommands:
@@ -81,15 +105,25 @@ class AutotradeCommands:
         self,
         config: Config,
         verification_db: VerificationDB,
-        delegates_db: DelegatesDB,
         prefs_db: AutotradePrefsDB,
         engine=None,
+        venue=None,
+        delegates_db: DelegatesDB | None = None,
+        blofin_creds_db=None,
     ):
         self._config = config
         self._verification_db = verification_db
-        self._delegates_db = delegates_db
         self._prefs_db = prefs_db
         self._engine = engine
+        self._venue = venue
+        self._delegates_db = delegates_db
+        self._blofin_creds_db = blofin_creds_db
+
+    def _venue_name(self) -> str:
+        return getattr(self._config.autotrade, "venue", "hyperliquid")
+
+    def _manage_url(self) -> str:
+        return "blofin.com" if self._venue_name() == "blofin" else "app.hyperliquid.xyz"
 
     def register(self, application: Application) -> None:
         application.add_handler(CommandHandler("autotrade", self._cmd))
@@ -111,6 +145,9 @@ class AutotradeCommands:
         return rec is not None and rec.is_active
 
     async def _is_connected(self, uid: int) -> bool:
+        if self._venue is not None:
+            conn = await self._venue.get_connection(uid)
+            return conn is not None and conn.is_active
         d = await self._delegates_db.get(uid)
         return d is not None and d.is_active
 
@@ -137,17 +174,23 @@ class AutotradeCommands:
                 return
             if ctx.user_data is not None:
                 ctx.user_data[_STATE_KEY] = _STATE_AWAITING
+            howto = (
+                _BLOFIN_CONNECT_HOWTO
+                if self._venue_name() == "blofin"
+                else _CONNECT_HOWTO
+            )
             await reply(
-                _CONNECT_HOWTO, parse_mode="HTML", disable_web_page_preview=True,
+                howto, parse_mode="HTML", disable_web_page_preview=True,
             )
         elif sub in ("on", "enable"):
             if not await self._is_connected(uid):
                 await reply(
-                    "Connect your Hyperliquid wallet first: /autotrade connect"
+                    "Connect first: /autotrade connect"
                 )
                 return
             await reply(
-                _AUTOEXEC_DISCLOSURE, parse_mode="HTML",
+                _autoexec_disclosure(self._venue_name(), self._manage_url()),
+                parse_mode="HTML",
                 disable_web_page_preview=True,
             )
         elif sub == "agree":
@@ -172,9 +215,12 @@ class AutotradeCommands:
         elif sub == "size":
             await self._set_size(uid, args, reply)
         elif sub == "disconnect":
-            await self._delegates_db.delete(uid)
+            if self._venue_name() == "blofin" and self._blofin_creds_db is not None:
+                await self._blofin_creds_db.delete(uid)
+            elif self._delegates_db is not None:
+                await self._delegates_db.delete(uid)
             await self._prefs_db.set_enabled(uid, False)
-            await reply("Disconnected and disabled. Your stored key was wiped.")
+            await reply("Disconnected and disabled. Your stored credentials were wiped.")
             logger.info("autotrade disconnected for user=%d", uid)
         else:
             await reply(
@@ -292,7 +338,7 @@ class AutotradeCommands:
         mode = "DRY-RUN (previews only)" if at.dry_run else "LIVE"
         lines = [
             "<b>Autotrade status</b>",
-            f"Global: {'on' if at.enabled else 'off'} - {mode} - {at.network}",
+            f"Global: {'on' if at.enabled else 'off'} - {mode} - {at.venue}/{at.network}",
             f"Connected: {'yes' if connected else 'no'}",
             f"Your switch: {'ON' if prefs.enabled else 'off'}"
             + ("" if prefs.disclosure_accepted_at else " (disclosure not accepted)"),
@@ -323,6 +369,32 @@ class AutotradeCommands:
             await update.effective_message.reply_text("Cancelled.")
             return
 
+        if self._venue_name() == "blofin":
+            label = await self._store_blofin(uid, text, update)
+        else:
+            label = await self._store_hyperliquid(uid, text, update)
+        if label is None:
+            return  # a parse/store error already replied to the user
+
+        ctx.user_data.pop(_STATE_KEY, None)
+        try:
+            await update.effective_message.delete()
+        except Exception:
+            logger.debug("could not delete connect paste for user=%d", uid)
+
+        await ctx.bot.send_message(
+            chat_id=uid,
+            text=(
+                "<b>Connected.</b>\n"
+                f"{label}\n\n"
+                "Now enable it: <code>/autotrade on</code>, then "
+                "<code>/autotrade agree</code>."
+            ),
+            parse_mode="HTML",
+        )
+        logger.info("autotrade connected for user=%d", uid)
+
+    async def _store_hyperliquid(self, uid, text, update) -> str | None:
         addr_m = _ADDR_RE.search(text)
         key_m = _KEY_RE.search(text)
         if not addr_m or not key_m:
@@ -333,8 +405,7 @@ class AutotradeCommands:
                 "Try again, or send /cancel.",
                 parse_mode="HTML",
             )
-            return
-
+            return None
         address, agent_key = addr_m.group(1), key_m.group(1)
         try:
             await self._delegates_db.upsert(
@@ -348,22 +419,41 @@ class AutotradeCommands:
                 "Something went wrong storing your key. Nothing was saved. "
                 "Try /autotrade connect again."
             )
-            return
+            return None
+        return f"Account: <code>{address}</code>"
 
-        ctx.user_data.pop(_STATE_KEY, None)
+    async def _store_blofin(self, uid, text, update) -> str | None:
+        key_m = _BLOFIN_KEY_RE.search(text)
+        secret_m = _BLOFIN_SECRET_RE.search(text)
+        pass_m = _BLOFIN_PASS_RE.search(text)
+        if not key_m or not secret_m or not pass_m:
+            await update.effective_message.reply_text(
+                "I need three lines:\n"
+                "<code>key: yourApiKey</code>\n"
+                "<code>secret: yourApiSecret</code>\n"
+                "<code>passphrase: yourPassphrase</code>\n"
+                "Try again, or send /cancel.",
+                parse_mode="HTML",
+            )
+            return None
+        if self._blofin_creds_db is None:
+            await update.effective_message.reply_text(
+                "Blofin connect is not available on this bot."
+            )
+            return None
         try:
-            await update.effective_message.delete()
+            await self._blofin_creds_db.upsert(
+                telegram_user_id=uid,
+                api_key=key_m.group(1),
+                api_secret=secret_m.group(1),
+                passphrase=pass_m.group(1),
+            )
         except Exception:
-            logger.debug("could not delete connect paste for user=%d", uid)
-
-        await ctx.bot.send_message(
-            chat_id=uid,
-            text=(
-                "<b>Connected.</b>\n"
-                f"Account: <code>{address}</code>\n\n"
-                "Now enable it: <code>/autotrade on</code>, then "
-                "<code>/autotrade agree</code>."
-            ),
-            parse_mode="HTML",
-        )
-        logger.info("autotrade connected for user=%d account=%s", uid, address)
+            logger.exception("blofin connect store failed for user=%d", uid)
+            await update.effective_message.reply_text(
+                "Something went wrong storing your credentials. Nothing was "
+                "saved. Try /autotrade connect again."
+            )
+            return None
+        masked = key_m.group(1)[:4] + "..." + key_m.group(1)[-2:]
+        return f"Blofin key: <code>{masked}</code>"
