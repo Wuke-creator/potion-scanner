@@ -22,8 +22,8 @@ inst_id + contract count) without the engine knowing either shape.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from decimal import Decimal
+from dataclasses import dataclass, field
+from decimal import ROUND_DOWN, Decimal
 from typing import Any, Protocol, runtime_checkable
 
 from src.trading.hyperliquid_client import (
@@ -69,6 +69,7 @@ class VenueResult:
     sl_ok: bool = True
     tp_ok: bool = True
     ref: str = ""         # order id / oid for the DM
+    tp_legs: list = field(default_factory=list)   # (price, size) legs actually placed
 
 
 @runtime_checkable
@@ -83,7 +84,7 @@ class Venue(Protocol):
         requested_leverage: int, max_leverage: int,
     ) -> VenuePlan | None: ...
     async def place(
-        self, uid: int, plan: VenuePlan, *, take_profit: float | None,
+        self, uid: int, plan: VenuePlan, *, take_profits: list[float],
         stop_loss: float | None, slippage_bps: int,
     ) -> VenueResult: ...
     async def mark_success(self, uid: int) -> None: ...
@@ -102,6 +103,43 @@ def cap_leverage(requested: int, asset_max: int, caller_max: int) -> int:
         ceiling = 1
     effective = int(requested) if requested and int(requested) > 0 else ceiling
     return max(1, min(effective, ceiling))
+
+
+def split_ladder(total: Decimal, n_legs: int, step: Decimal) -> list[Decimal]:
+    """Split ``total`` into up to ``n_legs`` sizes for a scale-out ladder.
+
+    Each returned size is a positive multiple of ``step`` (the venue's lot /
+    size increment). The split is as even as possible, with any remainder
+    given to the EARLIEST legs (nearest take-profits fill slightly more, so
+    profit is secured sooner). The sizes always sum to ``total``.
+
+    Degrades gracefully: if ``total`` can't fund ``n_legs`` whole steps, it
+    returns fewer legs (the nearest ones). One step -> one leg -> the whole
+    size goes to the first target, i.e. the old single-TP behaviour. Returns
+    [] when nothing tradeable.
+
+    The caller zips the result with the TP prices in order (tp1, tp2, tp3);
+    a shorter result drops the furthest targets.
+    """
+    if n_legs <= 0 or step <= 0 or total <= 0:
+        return []
+    total_steps = int((total / step).to_integral_value(rounding=ROUND_DOWN))
+    if total_steps <= 0:
+        return []
+    k = min(n_legs, total_steps)
+    base, rem = divmod(total_steps, k)
+    return [Decimal(base + (1 if i < rem else 0)) * step for i in range(k)]
+
+
+def ladder_legs(
+    total: Decimal, prices: list[float], step: Decimal,
+) -> list[tuple[float, float]]:
+    """Pair each TP price with its scaled-out size. Furthest prices are
+    dropped when the size can't fund every leg (see ``split_ladder``)."""
+    if not prices:
+        return []
+    sizes = split_ladder(total, len(prices), step)
+    return [(float(p), float(s)) for p, s in zip(prices, sizes)]
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +185,7 @@ class HyperliquidVenue:
         )
 
     async def place(
-        self, uid: int, plan: VenuePlan, *, take_profit: float | None,
+        self, uid: int, plan: VenuePlan, *, take_profits: list[float],
         stop_loss: float | None, slippage_bps: int,
     ) -> VenueResult:
         d = await self._delegates.get(uid)
@@ -156,17 +194,23 @@ class HyperliquidVenue:
         agent_key = await self._delegates.get_plaintext_key(uid)
         if not agent_key:
             raise VenueError("no stored key")
+        # Split the size into a scale-out ladder, floored to the asset's
+        # size increment (10^-szDecimals). The client just places the legs.
+        sz_decimals = int(getattr(plan.exec_payload, "sz_decimals", 0) or 0)
+        tp_legs = ladder_legs(
+            Decimal(str(plan.size)), take_profits, Decimal(1).scaleb(-sz_decimals),
+        )
         try:
             res = await self._client.place_trade(
                 agent_private_key=agent_key, master_address=d.trader_address,
-                plan=plan.exec_payload, take_profit=take_profit,
+                plan=plan.exec_payload, tp_legs=tp_legs,
                 stop_loss=stop_loss, slippage_bps=slippage_bps,
             )
         except HyperliquidError as e:
             raise VenueError(str(e)) from e
         return VenueResult(
             coin=res.coin, size=res.size, sl_ok=res.sl_ok, tp_ok=res.tp_ok,
-            ref=str(res.entry_oid or ""),
+            ref=str(res.entry_oid or ""), tp_legs=tp_legs,
         )
 
     async def mark_success(self, uid: int) -> None:
@@ -250,13 +294,14 @@ class BlofinVenue:
             exec_payload={
                 "inst_id": info.inst_id,
                 "size_contracts": contracts,
+                "lot_size": info.lot_size,
                 "side": signal_side_to_blofin(direction),
                 "margin_mode": self._margin_mode,
             },
         )
 
     async def place(
-        self, uid: int, plan: VenuePlan, *, take_profit: float | None,
+        self, uid: int, plan: VenuePlan, *, take_profits: list[float],
         stop_loss: float | None, slippage_bps: int,
     ) -> VenueResult:
         from src.trading.blofin_client import BlofinError
@@ -264,24 +309,55 @@ class BlofinVenue:
         c = await self._creds_or_raise(uid)
         ep = plan.exec_payload or {}
         inst_id = ep["inst_id"]
+        margin_mode = ep["margin_mode"]
+        total = ep["size_contracts"]
+        lot = ep.get("lot_size") or Decimal(0)
+        # Close side is the opposite of the entry: sell to close a long.
+        close_side = "sell" if plan.is_long else "buy"
+        tp_legs = ladder_legs(total, take_profits, lot) if lot > 0 else []
+
+        # 1. Bare market entry. A rejected entry is the only fatal failure.
         try:
             await self._client.set_leverage(
-                c, inst_id, plan.leverage, margin_mode=ep["margin_mode"],
+                c, inst_id, plan.leverage, margin_mode=margin_mode,
             )
             res = await self._client.place_market_order(
-                c, inst_id=inst_id, side=ep["side"],
-                size_contracts=ep["size_contracts"],
-                take_profit=take_profit, stop_loss=stop_loss,
-                margin_mode=ep["margin_mode"],
+                c, inst_id=inst_id, side=ep["side"], size_contracts=total,
+                take_profit=None, stop_loss=None, margin_mode=margin_mode,
             )
         except BlofinError as e:
             raise VenueError(str(e)) from e
-        # Blofin attaches TP/SL to the same market order; a clean return means
-        # they were accepted. Only report the ones we actually asked for.
+
+        # 2. Full-size reduce-only stop (clamps to whatever remains as TPs fill).
+        sl_ok = True
+        if stop_loss is not None:
+            try:
+                await self._client.place_tpsl_order(
+                    c, inst_id=inst_id, side=close_side, size_contracts=total,
+                    sl_trigger=stop_loss, margin_mode=margin_mode,
+                )
+            except BlofinError as e:
+                logger.warning("Blofin SL failed for %s: %s", plan.coin, e)
+                sl_ok = False
+
+        # 3. Scale-out take-profits (thirds), each reduce-only.
+        tp_ok = True
+        placed: list[tuple[float, float]] = []
+        for tp_price, tp_size in tp_legs:
+            try:
+                await self._client.place_tpsl_order(
+                    c, inst_id=inst_id, side=close_side,
+                    size_contracts=Decimal(str(tp_size)),
+                    tp_trigger=tp_price, margin_mode=margin_mode,
+                )
+                placed.append((tp_price, tp_size))
+            except BlofinError as e:
+                logger.warning("Blofin TP %s failed for %s: %s", tp_price, plan.coin, e)
+                tp_ok = False
+
         return VenueResult(
-            coin=plan.coin, size=plan.size,
-            sl_ok=stop_loss is not None, tp_ok=take_profit is not None,
-            ref=res.order_id,
+            coin=plan.coin, size=plan.size, sl_ok=sl_ok, tp_ok=tp_ok,
+            ref=res.order_id, tp_legs=placed,
         )
 
     async def mark_success(self, uid: int) -> None:

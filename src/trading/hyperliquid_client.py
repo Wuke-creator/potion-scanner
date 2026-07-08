@@ -48,6 +48,7 @@ class TradePlan:
     size: float           # base-asset units, floored to szDecimals
     leverage: int         # capped by caller max + asset max
     notional_usd: float   # size * price
+    sz_decimals: int = 0  # asset size precision, for splitting the TP ladder
 
 
 @dataclass(frozen=True)
@@ -345,8 +346,9 @@ class HyperliquidClient:
             _safe_int(info.get("maxLeverage")),
             max_leverage,
         )
+        sz_decimals = _safe_int(info.get("szDecimals"), 0) or 0
         notional = collateral_usdc * leverage
-        size = compute_size(notional, price, _safe_int(info.get("szDecimals"), 0) or 0)
+        size = compute_size(notional, price, sz_decimals)
         if size is None:
             return None
         return TradePlan(
@@ -356,6 +358,7 @@ class HyperliquidClient:
             size=size,
             leverage=leverage,
             notional_usd=size * price,
+            sz_decimals=sz_decimals,
         )
 
     async def place_trade(
@@ -364,11 +367,15 @@ class HyperliquidClient:
         agent_private_key: str,
         master_address: str,
         plan: TradePlan,
-        take_profit: float | None,
+        tp_legs: list[tuple[float, float]],
         stop_loss: float | None,
         slippage_bps: int,
     ) -> TradeSubmitResult:
-        """Set leverage, market-in via IOC, then attach reduce-only SL/TP.
+        """Set leverage, market-in via IOC, then attach reduce-only SL + TP ladder.
+
+        ``tp_legs`` is a list of (trigger_price, size) reduce-only take-profits,
+        the scale-out ladder (e.g. thirds at TP1/TP2/TP3). The stop is one
+        full-size reduce-only order that clamps to whatever remains as TPs fill.
 
         Runs the whole sequence in one worker thread. Raises HyperliquidError
         if the entry is rejected; SL/TP failures are reported as flags, not
@@ -424,17 +431,20 @@ class HyperliquidClient:
                 except Exception as e:  # noqa: BLE001
                     logger.warning("SL submit failed for %s: %s", plan.coin, e)
                     sl_ok = False
-            if take_profit:
-                tp_px = round_price(take_profit)
+            for tp_price, tp_size in tp_legs:
+                if tp_size <= 0:
+                    continue
+                tp_px = round_price(tp_price)
                 try:
                     res = exchange.order(
-                        plan.coin, not plan.is_long, plan.size, tp_px,
+                        plan.coin, not plan.is_long, tp_size, tp_px,
                         {"trigger": {"triggerPx": tp_px, "isMarket": True, "tpsl": "tp"}},
                         reduce_only=True,
                     )
-                    tp_ok = _first_error(res) is None
+                    if _first_error(res) is not None:
+                        tp_ok = False
                 except Exception as e:  # noqa: BLE001
-                    logger.warning("TP submit failed for %s: %s", plan.coin, e)
+                    logger.warning("TP submit failed for %s @ %s: %s", plan.coin, tp_px, e)
                     tp_ok = False
 
             return TradeSubmitResult(

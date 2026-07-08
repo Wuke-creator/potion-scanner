@@ -392,3 +392,54 @@ class BlofinClient:
         else:
             order_id = ""
         return OrderResult(order_id=order_id, raw=body)
+
+    async def place_tpsl_order(
+        self,
+        creds: BlofinCreds,
+        *,
+        inst_id: str,
+        side: str,
+        size_contracts: Decimal,
+        tp_trigger: float | None = None,
+        sl_trigger: float | None = None,
+        margin_mode: str = "isolated",
+        position_side: str = "net",
+    ) -> OrderResult:
+        """Place ONE reduce-only take-profit or stop-loss for a partial size.
+
+        Uses the dedicated /api/v1/trade/order-tpsl endpoint. Unlike a TP/SL
+        attached to the entry order, these are per-size, so a position can
+        carry several take-profits at different triggers (the scale-out
+        ladder). ``side`` is the closing side (sell to close a long). Order
+        price "-1" means market execution on trigger.
+        """
+        body_obj: dict[str, Any] = {
+            "instId": inst_id,
+            "marginMode": margin_mode,
+            "positionSide": position_side,
+            "side": side,
+            "size": _fmt_decimal(size_contracts),
+            "reduceOnly": "true",
+        }
+        if tp_trigger is not None:
+            body_obj["tpTriggerPrice"] = str(tp_trigger)
+            body_obj["tpOrderPrice"] = "-1"
+        if sl_trigger is not None:
+            body_obj["slTriggerPrice"] = str(sl_trigger)
+            body_obj["slOrderPrice"] = "-1"
+
+        body = await self._private_request(
+            creds, "POST", "/api/v1/trade/order-tpsl", body_obj=body_obj,
+        )
+        data = body.get("data")
+        row = data[0] if isinstance(data, list) and data else (data or {})
+        if isinstance(row, dict):
+            inner_code = str(row.get("code", "0"))
+            if inner_code and inner_code != "0":
+                raise BlofinError(
+                    row.get("msg") or f"tpsl code {inner_code}", code=inner_code,
+                )
+            order_id = str(row.get("tpslId", "") or row.get("orderId", ""))
+        else:
+            order_id = ""
+        return OrderResult(order_id=order_id, raw=body)

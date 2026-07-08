@@ -31,7 +31,56 @@ from src.trading.venue import (
     HyperliquidVenue,
     VenueError,
     cap_leverage,
+    ladder_legs,
+    split_ladder,
 )
+
+
+class TestSplitLadder:
+    def test_even_thirds(self):
+        legs = split_ladder(Decimal("18.6"), 3, Decimal("0.1"))
+        assert legs == [Decimal("6.2"), Decimal("6.2"), Decimal("6.2")]
+        assert sum(legs) == Decimal("18.6")
+
+    def test_remainder_goes_to_earliest_legs(self):
+        # 160 steps / 3 = 53 r1 -> first leg gets the extra step
+        legs = split_ladder(Decimal("16"), 3, Decimal("0.1"))
+        assert legs == [Decimal("5.4"), Decimal("5.3"), Decimal("5.3")]
+        assert sum(legs) == Decimal("16")
+
+    def test_degrades_when_too_small_for_all_legs(self):
+        # only 2 steps but 3 targets -> 2 legs (nearest), furthest dropped
+        legs = split_ladder(Decimal("0.2"), 3, Decimal("0.1"))
+        assert legs == [Decimal("0.1"), Decimal("0.1")]
+
+    def test_single_step_is_single_leg(self):
+        # one lot -> whole size on the first target (old behaviour)
+        assert split_ladder(Decimal("0.1"), 3, Decimal("0.1")) == [Decimal("0.1")]
+
+    def test_zero_and_bad_inputs(self):
+        assert split_ladder(Decimal("0"), 3, Decimal("0.1")) == []
+        assert split_ladder(Decimal("5"), 0, Decimal("0.1")) == []
+        assert split_ladder(Decimal("5"), 3, Decimal("0")) == []
+
+    def test_whole_lot_asset(self):
+        legs = split_ladder(Decimal("10"), 3, Decimal("1"))
+        assert legs == [Decimal("4"), Decimal("3"), Decimal("3")]
+
+
+class TestLadderLegs:
+    def test_zips_prices_with_sizes(self):
+        legs = ladder_legs(Decimal("18.6"), [1.0, 2.0, 3.0], Decimal("0.1"))
+        assert legs == [(1.0, 6.2), (2.0, 6.2), (3.0, 6.2)]
+
+    def test_drops_furthest_prices_when_degraded(self):
+        legs = ladder_legs(Decimal("0.2"), [1.0, 2.0, 3.0], Decimal("0.1"))
+        assert legs == [(1.0, 0.1), (2.0, 0.1)]  # price 3.0 dropped
+
+    def test_single_price_full_size(self):
+        assert ladder_legs(Decimal("5"), [1.0], Decimal("1")) == [(1.0, 5.0)]
+
+    def test_no_prices(self):
+        assert ladder_legs(Decimal("5"), [], Decimal("1")) == []
 
 
 class TestCapLeverage:
@@ -126,29 +175,53 @@ class TestBlofinVenue:
         assert plan is None
 
     @pytest.mark.asyncio
-    async def test_place_sets_leverage_then_orders(self):
+    async def test_place_ladders_tps_and_full_stop(self):
         v, client, _ = _blofin_venue()
         plan = await v.plan(
             pair="XLM/USDT", direction="SHORT", collateral_usdc=20.0,
             requested_leverage=16, max_leverage=20,
         )
         res = await v.place(
-            uid=1, plan=plan, take_profit=0.19, stop_loss=0.21, slippage_bps=100,
+            uid=1, plan=plan, take_profits=[0.19, 0.18, 0.17],
+            stop_loss=0.21, slippage_bps=100,
         )
+        # leverage set, then a BARE market entry (no attached tp/sl)
         client.set_leverage.assert_awaited_once()
-        assert client.set_leverage.await_args.args[1] == "XLM-USDT"
-        assert client.set_leverage.await_args.args[2] == 16
         client.place_market_order.assert_awaited_once()
-        kw = client.place_market_order.await_args.kwargs
-        assert kw["inst_id"] == "XLM-USDT"
-        assert kw["side"] == "sell"
-        assert kw["size_contracts"] == Decimal("16")
-        assert kw["take_profit"] == 0.19 and kw["stop_loss"] == 0.21
+        entry = client.place_market_order.await_args.kwargs
+        assert entry["side"] == "sell"                     # short entry
+        assert entry["size_contracts"] == Decimal("16")
+        assert entry["take_profit"] is None and entry["stop_loss"] is None
+        # 1 full-size SL + 3 scaled TPs = 4 tpsl orders, all closing-side "buy"
+        assert client.place_tpsl_order.await_count == 4
+        calls = client.place_tpsl_order.await_args_list
+        assert all(c.kwargs["side"] == "buy" for c in calls)
+        sls = [c for c in calls if c.kwargs.get("sl_trigger") is not None]
+        tps = [c for c in calls if c.kwargs.get("tp_trigger") is not None]
+        assert len(sls) == 1 and sls[0].kwargs["size_contracts"] == Decimal("16")
+        assert len(tps) == 3
+        assert sum(c.kwargs["size_contracts"] for c in tps) == Decimal("16")
+        assert res.sl_ok and res.tp_ok
+        assert len(res.tp_legs) == 3
         assert res.ref == "oid1"
-        assert res.sl_ok is True and res.tp_ok is True
 
     @pytest.mark.asyncio
-    async def test_place_translates_blofin_error(self):
+    async def test_tp_failure_flagged_not_raised(self):
+        # A rejected TP leg must not abort: the position is already open.
+        v, client, _ = _blofin_venue()
+        plan = await v.plan(
+            pair="XLM/USDT", direction="SHORT", collateral_usdc=20.0,
+            requested_leverage=16, max_leverage=20,
+        )
+        client.place_tpsl_order = AsyncMock(side_effect=BlofinError("rejected", code="1"))
+        res = await v.place(
+            uid=1, plan=plan, take_profits=[0.19], stop_loss=0.21, slippage_bps=100,
+        )
+        assert res.sl_ok is False and res.tp_ok is False   # both flagged
+        assert res.ref == "oid1"                            # entry still succeeded
+
+    @pytest.mark.asyncio
+    async def test_place_translates_entry_error(self):
         v, client, _ = _blofin_venue()
         plan = await v.plan(
             pair="XLM/USDT", direction="LONG", collateral_usdc=20.0,
@@ -156,7 +229,7 @@ class TestBlofinVenue:
         )
         client.place_market_order = AsyncMock(side_effect=BlofinError("rejected", code="1"))
         with pytest.raises(VenueError):
-            await v.place(uid=1, plan=plan, take_profit=None, stop_loss=None, slippage_bps=100)
+            await v.place(uid=1, plan=plan, take_profits=[], stop_loss=None, slippage_bps=100)
 
     @pytest.mark.asyncio
     async def test_get_balance_requires_connection(self):
@@ -211,19 +284,22 @@ class TestHyperliquidVenue:
         assert plan.exec_payload.coin == "INJ"  # carries the native TradePlan
 
     @pytest.mark.asyncio
-    async def test_place_uses_key_and_master(self):
+    async def test_place_ladders_and_passes_creds(self):
         v, client, delegates = _hl_venue()
         plan = await v.plan(
             pair="INJ/USDT", direction="LONG", collateral_usdc=10.0,
             requested_leverage=5, max_leverage=20,
         )
         res = await v.place(
-            uid=1, plan=plan, take_profit=6.0, stop_loss=4.0, slippage_bps=100,
+            uid=1, plan=plan, take_profits=[6.0, 6.5, 7.0], stop_loss=4.0, slippage_bps=100,
         )
         kw = client.place_trade.await_args.kwargs
         assert kw["agent_private_key"] == "0xAGENT"
         assert kw["master_address"] == "0xMASTER"
+        # size 10, szDecimals 0 -> whole-unit lots -> thirds 4/3/3 across the TPs
+        assert kw["tp_legs"] == [(6.0, 4.0), (6.5, 3.0), (7.0, 3.0)]
         assert res.ref == "99"
+        assert res.tp_legs == [(6.0, 4.0), (6.5, 3.0), (7.0, 3.0)]
 
     @pytest.mark.asyncio
     async def test_place_translates_hl_error(self):
@@ -234,7 +310,7 @@ class TestHyperliquidVenue:
         )
         client.place_trade = AsyncMock(side_effect=HyperliquidError("boom"))
         with pytest.raises(VenueError):
-            await v.place(uid=1, plan=plan, take_profit=None, stop_loss=None, slippage_bps=100)
+            await v.place(uid=1, plan=plan, take_profits=[], stop_loss=None, slippage_bps=100)
 
     @pytest.mark.asyncio
     async def test_balance_reads_from_master(self):

@@ -29,6 +29,7 @@ _DEFAULT_PLAN = VenuePlan(
 )
 _DEFAULT_RESULT = VenueResult(
     coin="BTC", size=0.02, sl_ok=True, tp_ok=True, ref="1",
+    tp_legs=[(52000.0, 0.02)],
 )
 _SENTINEL = object()
 
@@ -182,6 +183,13 @@ class TestLive:
         assert "filled" in send_dm.await_args.args[1].lower()
         prefs = await prefs_db.get_or_default(UID)
         assert prefs.trades_today == 1
+
+    @pytest.mark.asyncio
+    async def test_passes_full_tp_ladder(self, prefs_db):
+        engine, venue, _ = _make_engine(prefs_db, dry_run=False)
+        await _opt_in(prefs_db)
+        await engine.on_new_signal(_signal(tp1=52000.0, tp2=54000.0, tp3=56000.0))
+        assert venue.place.await_args.kwargs["take_profits"] == [52000.0, 54000.0, 56000.0]
 
     @pytest.mark.asyncio
     async def test_balance_too_low_skips(self, prefs_db):

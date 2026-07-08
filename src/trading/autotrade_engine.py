@@ -140,7 +140,17 @@ class AutotradeEngine:
             return
 
         pair = getattr(signal, "pair", "") or ""
-        tp1 = getattr(signal, "tp1", None)
+        # The full take-profit ladder in order (tp1, tp2, tp3), skipping any
+        # the signal didn't set. The venue scales the size out across these.
+        take_profits = [
+            float(t)
+            for t in (
+                getattr(signal, "tp1", None),
+                getattr(signal, "tp2", None),
+                getattr(signal, "tp3", None),
+            )
+            if t is not None
+        ]
         stop_loss = getattr(signal, "stop_loss", None)
         req_leverage = getattr(signal, "leverage", None) or 0
 
@@ -194,7 +204,7 @@ class AutotradeEngine:
 
         # --- dry-run: preview only, no order, no daily-slot spend ---
         if self._config.dry_run:
-            preview = self._fmt_preview(plan, tp1, stop_loss)
+            preview = self._fmt_preview(plan, take_profits, stop_loss)
             if verdict is not None and not verdict.allowed:
                 preview += f"\nRISK GUARD would block this: {verdict.reason}"
             await self._dm(uid, preview)
@@ -220,7 +230,7 @@ class AutotradeEngine:
 
         try:
             result = await self._venue.place(
-                uid, plan, take_profit=tp1, stop_loss=stop_loss,
+                uid, plan, take_profits=take_profits, stop_loss=stop_loss,
                 slippage_bps=self._config.slippage_bps,
             )
         except VenueError as e:
@@ -236,7 +246,7 @@ class AutotradeEngine:
             return
 
         await self._venue.mark_success(uid)
-        await self._dm(uid, self._fmt_success(plan, result, tp1, stop_loss))
+        await self._dm(uid, self._fmt_success(plan, result, take_profits, stop_loss))
 
     # ---- DM formatting -----------------------------------------------------
 
@@ -245,7 +255,7 @@ class AutotradeEngine:
         return f"Manage the position on {url}."
 
     def _fmt_preview(
-        self, plan: VenuePlan, tp1: float | None, stop_loss: float | None,
+        self, plan: VenuePlan, take_profits: list[float], stop_loss: float | None,
     ) -> str:
         direction = "LONG" if plan.is_long else "SHORT"
         lines = [
@@ -254,15 +264,18 @@ class AutotradeEngine:
             f"Size {_fmt_num(plan.size)} {plan.coin} (~${plan.notional_usd:,.0f}) "
             f"at ~${_fmt_num(plan.price)}",
         ]
-        if tp1 is not None:
-            lines.append(f"TP {_fmt_num(tp1)}")
+        if take_profits:
+            tps = " / ".join(_fmt_num(t) for t in take_profits)
+            label = "TP ladder (scaled out)" if len(take_profits) > 1 else "TP"
+            lines.append(f"{label}: {tps}")
         if stop_loss is not None:
             lines.append(f"SL {_fmt_num(stop_loss)}")
         lines.append("No order placed (dry-run).")
         return "\n".join(lines)
 
     def _fmt_success(
-        self, plan: VenuePlan, result, tp1: float | None, stop_loss: float | None,
+        self, plan: VenuePlan, result, take_profits: list[float],
+        stop_loss: float | None,
     ) -> str:
         direction = "LONG" if plan.is_long else "SHORT"
         lines = [
@@ -272,9 +285,15 @@ class AutotradeEngine:
         ]
         sl_ok = getattr(result, "sl_ok", True)
         tp_ok = getattr(result, "tp_ok", True)
+        legs = getattr(result, "tp_legs", None) or []
         if stop_loss is not None:
             lines.append(f"SL {_fmt_num(stop_loss)}: {'set' if sl_ok else 'FAILED - set it manually'}")
-        if tp1 is not None:
-            lines.append(f"TP {_fmt_num(tp1)}: {'set' if tp_ok else 'FAILED - set it manually'}")
+        if legs:
+            parts = ", ".join(f"{_fmt_num(sz)}@{_fmt_num(px)}" for px, sz in legs)
+            status = "set" if tp_ok else "PARTIAL - check the exchange"
+            label = "TP ladder" if len(legs) > 1 else "TP"
+            lines.append(f"{label} ({parts}): {status}")
+        elif take_profits:
+            lines.append("TP: none placed - set them manually")
         lines.append(self._manage_hint())
         return "\n".join(lines)
