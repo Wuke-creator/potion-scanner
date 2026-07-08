@@ -34,6 +34,11 @@ from src.trading.hyperliquid_client import (
 
 logger = logging.getLogger(__name__)
 
+# Default scale-out weighting across TP1/TP2/TP3: front-loaded so the bulk of
+# the position is secured at the nearest, highest-probability target. Tunable
+# per deploy via AUTOTRADE_TP_SPLIT; auto-normalised, so 50/30/20 == 0.5/0.3/0.2.
+DEFAULT_TP_WEIGHTS = (0.5, 0.3, 0.2)
+
 
 class VenueError(Exception):
     """A venue call failed in a way the engine should report, not crash on."""
@@ -105,41 +110,50 @@ def cap_leverage(requested: int, asset_max: int, caller_max: int) -> int:
     return max(1, min(effective, ceiling))
 
 
-def split_ladder(total: Decimal, n_legs: int, step: Decimal) -> list[Decimal]:
-    """Split ``total`` into up to ``n_legs`` sizes for a scale-out ladder.
+def split_ladder(
+    total: Decimal, weights: list[float], step: Decimal,
+) -> list[Decimal]:
+    """Split ``total`` across ``weights`` for a scale-out ladder.
 
-    Each returned size is a positive multiple of ``step`` (the venue's lot /
-    size increment). The split is as even as possible, with any remainder
-    given to the EARLIEST legs (nearest take-profits fill slightly more, so
-    profit is secured sooner). The sizes always sum to ``total``.
+    Each returned size is a multiple of ``step`` (the venue's lot increment),
+    allocated proportionally to the (auto-normalised) weights, e.g. a 50/30/20
+    ladder puts half on the first target. Any leftover step from flooring goes
+    to the leg with the largest fractional shortfall (largest-remainder),
+    tie-broken toward the nearest target. Sizes sum to ``total`` in whole steps.
 
-    Degrades gracefully: if ``total`` can't fund ``n_legs`` whole steps, it
-    returns fewer legs (the nearest ones). One step -> one leg -> the whole
-    size goes to the first target, i.e. the old single-TP behaviour. Returns
-    [] when nothing tradeable.
-
-    The caller zips the result with the TP prices in order (tp1, tp2, tp3);
-    a shorter result drops the furthest targets.
+    Returns one size per weight, in order; a leg can be 0 when the size can't
+    fund it (the caller drops those). Empty / non-positive inputs return [].
+    One tradeable step lands entirely on the highest-weighted leg.
     """
-    if n_legs <= 0 or step <= 0 or total <= 0:
+    if not weights or step <= 0 or total <= 0:
+        return []
+    wsum = sum(weights)
+    if wsum <= 0:
         return []
     total_steps = int((total / step).to_integral_value(rounding=ROUND_DOWN))
     if total_steps <= 0:
         return []
-    k = min(n_legs, total_steps)
-    base, rem = divmod(total_steps, k)
-    return [Decimal(base + (1 if i < rem else 0)) * step for i in range(k)]
+    ideal = [(w / wsum) * total_steps for w in weights]
+    floors = [int(x) for x in ideal]  # floor, since ideal >= 0
+    remainder = total_steps - sum(floors)
+    # hand each leftover step to the largest fractional shortfall first
+    order = sorted(range(len(weights)), key=lambda i: (-(ideal[i] - floors[i]), i))
+    for i in order[:remainder]:
+        floors[i] += 1
+    return [Decimal(f) * step for f in floors]
 
 
 def ladder_legs(
-    total: Decimal, prices: list[float], step: Decimal,
+    total: Decimal, prices: list[float], step: Decimal, weights: list[float],
 ) -> list[tuple[float, float]]:
-    """Pair each TP price with its scaled-out size. Furthest prices are
-    dropped when the size can't fund every leg (see ``split_ladder``)."""
+    """Pair each TP price with its weighted scale-out size, dropping any leg
+    that rounds to zero (too small to fund). Weights align to the prices in
+    order; a shorter price list uses the leading weights (re-normalised)."""
     if not prices:
         return []
-    sizes = split_ladder(total, len(prices), step)
-    return [(float(p), float(s)) for p, s in zip(prices, sizes)]
+    w = list(weights[: len(prices)]) or [1.0] * len(prices)
+    sizes = split_ladder(total, w, step)
+    return [(float(p), float(s)) for p, s in zip(prices, sizes) if s > 0]
 
 
 # ---------------------------------------------------------------------------
@@ -153,9 +167,10 @@ class HyperliquidVenue:
     name = "hyperliquid"
     supports_risk_guard = True
 
-    def __init__(self, client: HyperliquidClient, delegates_db):
+    def __init__(self, client: HyperliquidClient, delegates_db, *, tp_weights=DEFAULT_TP_WEIGHTS):
         self._client = client
         self._delegates = delegates_db
+        self._tp_weights = list(tp_weights)
 
     async def get_connection(self, uid: int) -> VenueConnection | None:
         d = await self._delegates.get(uid)
@@ -198,7 +213,8 @@ class HyperliquidVenue:
         # size increment (10^-szDecimals). The client just places the legs.
         sz_decimals = int(getattr(plan.exec_payload, "sz_decimals", 0) or 0)
         tp_legs = ladder_legs(
-            Decimal(str(plan.size)), take_profits, Decimal(1).scaleb(-sz_decimals),
+            Decimal(str(plan.size)), take_profits,
+            Decimal(1).scaleb(-sz_decimals), self._tp_weights,
         )
         try:
             res = await self._client.place_trade(
@@ -242,10 +258,14 @@ class BlofinVenue:
     name = "blofin"
     supports_risk_guard = False   # account snapshot not wired for Blofin yet
 
-    def __init__(self, client, creds_db, *, margin_mode: str = "isolated"):
+    def __init__(
+        self, client, creds_db, *, margin_mode: str = "isolated",
+        tp_weights=DEFAULT_TP_WEIGHTS,
+    ):
         self._client = client
         self._creds = creds_db
         self._margin_mode = margin_mode
+        self._tp_weights = list(tp_weights)
 
     async def get_connection(self, uid: int) -> VenueConnection | None:
         rec = await self._creds.get(uid)
@@ -314,7 +334,10 @@ class BlofinVenue:
         lot = ep.get("lot_size") or Decimal(0)
         # Close side is the opposite of the entry: sell to close a long.
         close_side = "sell" if plan.is_long else "buy"
-        tp_legs = ladder_legs(total, take_profits, lot) if lot > 0 else []
+        tp_legs = (
+            ladder_legs(total, take_profits, lot, self._tp_weights)
+            if lot > 0 else []
+        )
 
         # 1. Bare market entry. A rejected entry is the only fatal failure.
         try:

@@ -316,6 +316,10 @@ class AutotradeConfig:
     max_per_day: int = 10              # per-user daily trade cap
     min_collateral_usdc: float = 5.0   # skip if computed size below this
     slippage_bps: int = 100            # IOC crossing slippage for market-in
+    # Scale-out weighting across TP1/TP2/TP3 (auto-normalised, front-loaded by
+    # default so the bulk is banked at the nearest target). AUTOTRADE_TP_SPLIT
+    # accepts "50/30/20" or "0.5,0.3,0.2".
+    tp_split_weights: tuple[float, ...] = (0.5, 0.3, 0.2)
     # Account-level risk guard (passivbot-derived; src/trading/autotrade_risk.py).
     # Only runs when risk_enabled AND the venue can supply an account snapshot
     # (Hyperliquid yes, Blofin not yet). Wallet exposure = notional / account
@@ -774,6 +778,22 @@ def load_config(
             raise ConfigError(
                 f"AUTOTRADE_ALLOWLIST entries must be integer Telegram IDs, got {part!r}"
             )
+    _split_raw = os.getenv("AUTOTRADE_TP_SPLIT", "").strip()
+    if _split_raw:
+        _split_parts = [
+            p for p in _split_raw.replace(",", "/").replace(" ", "/").split("/") if p
+        ]
+        try:
+            _tp_weights = tuple(float(p) for p in _split_parts)
+        except ValueError:
+            raise ConfigError(
+                f"AUTOTRADE_TP_SPLIT must be numbers like 50/30/20, got {_split_raw!r}"
+            )
+        if not _tp_weights or sum(_tp_weights) <= 0:
+            raise ConfigError("AUTOTRADE_TP_SPLIT must have a positive sum")
+    else:
+        _tp_weights = (0.5, 0.3, 0.2)
+
     autotrade_cfg = AutotradeConfig(
         enabled=os.getenv("AUTOTRADE_ENABLED", "").strip().lower()
         in ("1", "true", "yes"),
@@ -821,6 +841,7 @@ def load_config(
             "AUTOTRADE_SLIPPAGE_BPS",
             int(autotrade_yaml.get("slippage_bps", 100)),
         ),
+        tp_split_weights=_tp_weights,
         risk_enabled=os.getenv(
             "AUTOTRADE_RISK_ENABLED",
             str(autotrade_yaml.get("risk_enabled", "true")),

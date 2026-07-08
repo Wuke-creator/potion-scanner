@@ -37,50 +37,66 @@ from src.trading.venue import (
 
 
 class TestSplitLadder:
-    def test_even_thirds(self):
-        legs = split_ladder(Decimal("18.6"), 3, Decimal("0.1"))
-        assert legs == [Decimal("6.2"), Decimal("6.2"), Decimal("6.2")]
-        assert sum(legs) == Decimal("18.6")
+    W = [0.5, 0.3, 0.2]  # the default front-loaded ladder
 
-    def test_remainder_goes_to_earliest_legs(self):
-        # 160 steps / 3 = 53 r1 -> first leg gets the extra step
-        legs = split_ladder(Decimal("16"), 3, Decimal("0.1"))
-        assert legs == [Decimal("5.4"), Decimal("5.3"), Decimal("5.3")]
+    def test_weighted_50_30_20(self):
+        legs = split_ladder(Decimal("10"), self.W, Decimal("1"))
+        assert legs == [Decimal("5"), Decimal("3"), Decimal("2")]
+        assert sum(legs) == Decimal("10")
+
+    def test_equal_weights_are_even(self):
+        legs = split_ladder(Decimal("18.6"), [1, 1, 1], Decimal("0.1"))
+        assert legs == [Decimal("6.2"), Decimal("6.2"), Decimal("6.2")]
+
+    def test_percents_equal_fractions(self):
+        a = split_ladder(Decimal("100"), [50, 30, 20], Decimal("1"))
+        b = split_ladder(Decimal("100"), [0.5, 0.3, 0.2], Decimal("1"))
+        assert a == b == [Decimal("50"), Decimal("30"), Decimal("20")]
+
+    def test_remainder_to_largest_fraction(self):
+        # 7 steps @ 50/30/20 -> ideal 3.5/2.1/1.4 -> floors 3/2/1, +1 to leg0
+        legs = split_ladder(Decimal("7"), self.W, Decimal("1"))
+        assert legs == [Decimal("4"), Decimal("2"), Decimal("1")]
+        assert sum(legs) == Decimal("7")
+
+    def test_floors_to_step(self):
+        legs = split_ladder(Decimal("16"), self.W, Decimal("0.1"))
+        assert legs == [Decimal("8.0"), Decimal("4.8"), Decimal("3.2")]
         assert sum(legs) == Decimal("16")
 
-    def test_degrades_when_too_small_for_all_legs(self):
-        # only 2 steps but 3 targets -> 2 legs (nearest), furthest dropped
-        legs = split_ladder(Decimal("0.2"), 3, Decimal("0.1"))
-        assert legs == [Decimal("0.1"), Decimal("0.1")]
+    def test_one_step_goes_to_nearest(self):
+        assert split_ladder(Decimal("1"), self.W, Decimal("1")) == [
+            Decimal("1"), Decimal("0"), Decimal("0"),
+        ]
 
-    def test_single_step_is_single_leg(self):
-        # one lot -> whole size on the first target (old behaviour)
-        assert split_ladder(Decimal("0.1"), 3, Decimal("0.1")) == [Decimal("0.1")]
-
-    def test_zero_and_bad_inputs(self):
-        assert split_ladder(Decimal("0"), 3, Decimal("0.1")) == []
-        assert split_ladder(Decimal("5"), 0, Decimal("0.1")) == []
-        assert split_ladder(Decimal("5"), 3, Decimal("0")) == []
-
-    def test_whole_lot_asset(self):
-        legs = split_ladder(Decimal("10"), 3, Decimal("1"))
-        assert legs == [Decimal("4"), Decimal("3"), Decimal("3")]
+    def test_bad_inputs(self):
+        assert split_ladder(Decimal("0"), self.W, Decimal("1")) == []
+        assert split_ladder(Decimal("5"), [], Decimal("1")) == []
+        assert split_ladder(Decimal("5"), self.W, Decimal("0")) == []
+        assert split_ladder(Decimal("5"), [0, 0, 0], Decimal("1")) == []
 
 
 class TestLadderLegs:
-    def test_zips_prices_with_sizes(self):
-        legs = ladder_legs(Decimal("18.6"), [1.0, 2.0, 3.0], Decimal("0.1"))
-        assert legs == [(1.0, 6.2), (2.0, 6.2), (3.0, 6.2)]
+    W = [0.5, 0.3, 0.2]
 
-    def test_drops_furthest_prices_when_degraded(self):
-        legs = ladder_legs(Decimal("0.2"), [1.0, 2.0, 3.0], Decimal("0.1"))
-        assert legs == [(1.0, 0.1), (2.0, 0.1)]  # price 3.0 dropped
+    def test_weighted_zip(self):
+        legs = ladder_legs(Decimal("10"), [1.0, 2.0, 3.0], Decimal("1"), self.W)
+        assert legs == [(1.0, 5.0), (2.0, 3.0), (3.0, 2.0)]
+
+    def test_fewer_prices_reweights_leading(self):
+        # 2 TPs -> leading weights 0.5/0.3 renormalise to .625/.375 of 8 = 5/3
+        legs = ladder_legs(Decimal("8"), [1.0, 2.0], Decimal("1"), self.W)
+        assert legs == [(1.0, 5.0), (2.0, 3.0)]
 
     def test_single_price_full_size(self):
-        assert ladder_legs(Decimal("5"), [1.0], Decimal("1")) == [(1.0, 5.0)]
+        assert ladder_legs(Decimal("5"), [1.0], Decimal("1"), self.W) == [(1.0, 5.0)]
+
+    def test_drops_zero_legs(self):
+        legs = ladder_legs(Decimal("1"), [1.0, 2.0, 3.0], Decimal("1"), self.W)
+        assert legs == [(1.0, 1.0)]  # only the nearest is funded
 
     def test_no_prices(self):
-        assert ladder_legs(Decimal("5"), [], Decimal("1")) == []
+        assert ladder_legs(Decimal("5"), [], Decimal("1"), self.W) == []
 
 
 class TestCapLeverage:
@@ -244,7 +260,7 @@ class TestBlofinVenue:
             await v.get_account_snapshot(1)
 
 
-def _hl_venue():
+def _hl_venue(tp_weights=(0.5, 0.3, 0.2)):
     client = AsyncMock()
     client.get_available_usdc = AsyncMock(return_value=250.0)
     client.plan_trade = AsyncMock(return_value=TradePlan(
@@ -264,7 +280,7 @@ def _hl_venue():
     delegates.get_plaintext_key = AsyncMock(return_value="0xAGENT")
     delegates.mark_trade_success = AsyncMock()
     delegates.mark_trade_failure = AsyncMock()
-    return HyperliquidVenue(client, delegates), client, delegates
+    return HyperliquidVenue(client, delegates, tp_weights=tp_weights), client, delegates
 
 
 class TestHyperliquidVenue:
@@ -296,10 +312,25 @@ class TestHyperliquidVenue:
         kw = client.place_trade.await_args.kwargs
         assert kw["agent_private_key"] == "0xAGENT"
         assert kw["master_address"] == "0xMASTER"
-        # size 10, szDecimals 0 -> whole-unit lots -> thirds 4/3/3 across the TPs
-        assert kw["tp_legs"] == [(6.0, 4.0), (6.5, 3.0), (7.0, 3.0)]
+        # size 10, szDecimals 0 -> whole-unit lots -> 50/30/20 -> 5/3/2
+        assert kw["tp_legs"] == [(6.0, 5.0), (6.5, 3.0), (7.0, 2.0)]
         assert res.ref == "99"
-        assert res.tp_legs == [(6.0, 4.0), (6.5, 3.0), (7.0, 3.0)]
+        assert res.tp_legs == [(6.0, 5.0), (6.5, 3.0), (7.0, 2.0)]
+
+    @pytest.mark.asyncio
+    async def test_custom_weights_reconfigure_the_split(self):
+        # even weights (config override) -> thirds 4/3/3 instead of 5/3/2
+        v, client, _ = _hl_venue(tp_weights=(1, 1, 1))
+        plan = await v.plan(
+            pair="INJ/USDT", direction="LONG", collateral_usdc=10.0,
+            requested_leverage=5, max_leverage=20,
+        )
+        await v.place(
+            uid=1, plan=plan, take_profits=[6.0, 6.5, 7.0], stop_loss=4.0, slippage_bps=100,
+        )
+        assert client.place_trade.await_args.kwargs["tp_legs"] == [
+            (6.0, 4.0), (6.5, 3.0), (7.0, 3.0),
+        ]
 
     @pytest.mark.asyncio
     async def test_place_translates_hl_error(self):

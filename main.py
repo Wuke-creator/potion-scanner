@@ -435,7 +435,10 @@ async def run(config: Config) -> None:
                 db_path=config.autotrade.blofin_creds_db_path,
             )
             await blofin_creds_db.open()
-            autotrade_venue = BlofinVenue(blofin_client, blofin_creds_db)
+            autotrade_venue = BlofinVenue(
+                blofin_client, blofin_creds_db,
+                tp_weights=config.autotrade.tp_split_weights,
+            )
         else:
             from src.trading.delegates_db import DelegatesDB
             from src.trading.hyperliquid_client import HyperliquidClient
@@ -445,7 +448,10 @@ async def run(config: Config) -> None:
                 delegates_db = DelegatesDB(db_path=config.trading.delegates_db_path)
                 await delegates_db.open()
             hyperliquid_client = HyperliquidClient(network=config.autotrade.network)
-            autotrade_venue = HyperliquidVenue(hyperliquid_client, delegates_db)
+            autotrade_venue = HyperliquidVenue(
+                hyperliquid_client, delegates_db,
+                tp_weights=config.autotrade.tp_split_weights,
+            )
 
         autotrade_engine = AutotradeEngine(
             config=config.autotrade,
