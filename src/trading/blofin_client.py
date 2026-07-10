@@ -47,6 +47,12 @@ logger = logging.getLogger(__name__)
 PROD_BASE_URL = "https://openapi.blofin.com"
 DEMO_BASE_URL = "https://demo-trading-openapi.blofin.com"
 
+# CCXT's public Blofin broker tag. Keys created as "Connect to Third-Party
+# Applications -> CCXT" are bound to the CCXT app, and Blofin expects orders
+# from such keys to carry the app's brokerId (raw orders without it come back
+# "This operation is not supported").
+CCXT_BROKER_ID = "ec6dd3a7dd982d0b"
+
 
 class BlofinError(Exception):
     """Raised when a Blofin call fails or returns a non-zero code."""
@@ -338,7 +344,7 @@ class BlofinClient:
         *, margin_mode: str = "isolated",
     ) -> None:
         await self._private_request(
-            creds, "POST", "/api/v1/trade/set-leverage",
+            creds, "POST", "/api/v1/account/set-leverage",
             body_obj={
                 "instId": inst_id,
                 "leverage": str(int(leverage)),
@@ -365,9 +371,11 @@ class BlofinClient:
         body_obj: dict[str, Any] = {
             "instId": inst_id,
             "marginMode": margin_mode,
+            "positionSide": "net",
             "side": side,
             "orderType": "market",
             "size": _fmt_decimal(size_contracts),
+            "brokerId": CCXT_BROKER_ID,
         }
         if take_profit is not None:
             body_obj["tpTriggerPrice"] = str(take_profit)
@@ -420,6 +428,7 @@ class BlofinClient:
             "side": side,
             "size": _fmt_decimal(size_contracts),
             "reduceOnly": "true",
+            "brokerId": CCXT_BROKER_ID,
         }
         if tp_trigger is not None:
             body_obj["tpTriggerPrice"] = str(tp_trigger)
