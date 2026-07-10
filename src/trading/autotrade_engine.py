@@ -115,6 +115,61 @@ class AutotradeEngine:
             logger.exception("manual_fire crashed for user=%s", uid)
             await self._dm(uid, "Manual fire hit an unexpected error.")
 
+    async def apply_tps(
+        self, uid: int, *, pair: str, take_profits: list[float],
+    ) -> None:
+        """Lay the signal's TP ladder onto an existing open position (the
+        /autotrade tps command). Same eligibility gates as a fire, honors
+        dry-run, never raises into the caller."""
+        if uid not in self._config.allowlist:
+            return
+        verified = await self._verification_db.get_verified(uid)
+        if verified is None or not verified.is_active:
+            return
+        conn = await self._venue.get_connection(uid)
+        if conn is None or not conn.is_active:
+            await self._dm(uid, "Connect first: /autotrade connect")
+            return
+        prefs = await self._prefs_db.get_or_default(
+            uid, default_pct=self._config.default_size_pct,
+        )
+        if not prefs.ready:
+            await self._dm(uid, "Enable autotrade first: /autotrade on")
+            return
+        if not take_profits:
+            await self._dm(uid, "No take-profit prices to place.")
+            return
+
+        if self._config.dry_run:
+            tps = " / ".join(_fmt_num(t) for t in take_profits)
+            await self._dm(
+                uid,
+                f"[DRY RUN] Would ladder TPs on your open {pair} position "
+                f"at {tps}. Nothing placed.",
+            )
+            return
+
+        try:
+            result = await self._venue.place_tp_ladder(
+                uid, pair=pair, take_profits=take_profits,
+            )
+        except VenueError as e:
+            await self._dm(uid, f"TP ladder failed on {pair}: {e}")
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception("apply_tps crashed for user=%s", uid)
+            await self._dm(uid, f"TP ladder hit an unexpected error on {pair}.")
+            return
+
+        direction = "" if result.size <= 0 else f" ({_fmt_num(result.size)} contracts)"
+        parts = ", ".join(f"{_fmt_num(sz)}@{_fmt_num(px)}" for px, sz in result.tp_legs)
+        status = "" if result.tp_ok else "\nSome legs FAILED - check the exchange."
+        await self._dm(
+            uid,
+            f"TP ladder set on {result.coin}{direction}:\n{parts}{status}\n"
+            f"{self._manage_hint()}",
+        )
+
     async def _dm(self, user_id: int, text: str) -> None:
         try:
             await self._send_dm(user_id, text)

@@ -461,6 +461,9 @@ async def run(config: Config) -> None:
             verification_db=verification.db,
             send_dm=_autotrade_send_dm,
         )
+        _source_route = config.discord.channel_by_key(
+            config.autotrade.source_channel_key,
+        )
         AutotradeCommands(
             config=config,
             verification_db=verification.db,
@@ -469,6 +472,8 @@ async def run(config: Config) -> None:
             venue=autotrade_venue,
             delegates_db=delegates_db,
             blofin_creds_db=blofin_creds_db,
+            open_signals_db=open_signals_db,
+            signal_channel_id=_source_route.channel_id if _source_route else 0,
         ).register(verification.application)
         logger.info(
             "Autotrade enabled: venue=%s network=%s dry_run=%s allowlist=%d source=%s",

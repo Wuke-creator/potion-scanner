@@ -339,6 +339,23 @@ class BlofinClient:
                 return float(row.get("available", 0) or 0)
         return 0.0
 
+    async def get_position(self, creds: BlofinCreds, inst_id: str) -> Decimal:
+        """Signed open-position size in contracts for one instrument.
+
+        Net mode: positive = long, negative = short, 0 = no position.
+        """
+        body = await self._private_request(
+            creds, "GET", "/api/v1/account/positions",
+            query={"instId": inst_id},
+        )
+        for row in body.get("data") or []:
+            if row.get("instId") == inst_id:
+                try:
+                    return Decimal(str(row.get("positions", "0") or "0"))
+                except InvalidOperation:
+                    return Decimal("0")
+        return Decimal("0")
+
     async def set_leverage(
         self, creds: BlofinCreds, inst_id: str, leverage: int,
         *, margin_mode: str = "isolated",

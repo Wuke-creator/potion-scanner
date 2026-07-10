@@ -236,6 +236,49 @@ class TestLive:
         assert await prefs_db.try_claim_fire(UID, 7) is True
 
 
+class TestApplyTps:
+    @pytest.mark.asyncio
+    async def test_places_ladder_and_reports(self, prefs_db):
+        engine, venue, send_dm = _make_engine(prefs_db, dry_run=False)
+        venue.place_tp_ladder = AsyncMock(return_value=VenueResult(
+            coin="JUP", size=493.0, sl_ok=True, tp_ok=True,
+            tp_legs=[(0.2006, 246.5), (0.194, 147.9), (0.1832, 98.6)],
+        ))
+        await _opt_in(prefs_db)
+        await engine.apply_tps(UID, pair="JUP/USDT",
+                               take_profits=[0.2006, 0.194, 0.1832])
+        venue.place_tp_ladder.assert_awaited_once()
+        assert "TP ladder set" in send_dm.await_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_dry_run_previews_only(self, prefs_db):
+        engine, venue, send_dm = _make_engine(prefs_db, dry_run=True)
+        venue.place_tp_ladder = AsyncMock()
+        await _opt_in(prefs_db)
+        await engine.apply_tps(UID, pair="JUP/USDT", take_profits=[0.2])
+        venue.place_tp_ladder.assert_not_called()
+        assert "[DRY RUN]" in send_dm.await_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_venue_error_reported(self, prefs_db):
+        engine, venue, send_dm = _make_engine(prefs_db, dry_run=False)
+        venue.place_tp_ladder = AsyncMock(side_effect=VenueError("no open JUP position"))
+        await _opt_in(prefs_db)
+        await engine.apply_tps(UID, pair="JUP/USDT", take_profits=[0.2])
+        assert "failed" in send_dm.await_args.args[1].lower()
+
+    @pytest.mark.asyncio
+    async def test_not_allowlisted_silent(self, prefs_db):
+        engine, venue, send_dm = _make_engine(
+            prefs_db, allowlist=frozenset({999}), dry_run=False,
+        )
+        venue.place_tp_ladder = AsyncMock()
+        await _opt_in(prefs_db)
+        await engine.apply_tps(UID, pair="JUP/USDT", take_profits=[0.2])
+        venue.place_tp_ladder.assert_not_called()
+        send_dm.assert_not_called()
+
+
 class TestManualFire:
     @pytest.mark.asyncio
     async def test_manual_fire_places_for_invoker(self, prefs_db):

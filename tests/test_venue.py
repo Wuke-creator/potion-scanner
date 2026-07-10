@@ -126,10 +126,11 @@ def _xlm_info():
     )
 
 
-def _blofin_venue(*, price=0.2, creds=True):
+def _blofin_venue(*, price=0.2, creds=True, position=Decimal("0")):
     client = AsyncMock()
     client.resolve_inst_id = AsyncMock(return_value=_xlm_info())
     client.get_last_price = AsyncMock(return_value=price)
+    client.get_position = AsyncMock(return_value=position)
     client.set_leverage = AsyncMock()
     client.place_market_order = AsyncMock(
         return_value=OrderResult(order_id="oid1", raw={"code": "0"}),
@@ -252,6 +253,37 @@ class TestBlofinVenue:
         v, client, _ = _blofin_venue(creds=False)
         with pytest.raises(VenueError):
             await v.get_balance(1)
+
+    @pytest.mark.asyncio
+    async def test_tp_ladder_on_open_short(self):
+        # net short 493 contracts -> close side buy, 50/30/20 over lot 0.1
+        v, client, _ = _blofin_venue(position=Decimal("-493"))
+        res = await v.place_tp_ladder(
+            uid=1, pair="XLM/USDT", take_profits=[0.2006, 0.194, 0.1832],
+        )
+        assert client.place_tpsl_order.await_count == 3
+        calls = client.place_tpsl_order.await_args_list
+        assert all(c.kwargs["side"] == "buy" for c in calls)
+        assert all(c.kwargs.get("tp_trigger") is not None for c in calls)
+        total = sum(c.kwargs["size_contracts"] for c in calls)
+        assert total == Decimal("493")
+        assert [c.kwargs["size_contracts"] for c in calls] == [
+            Decimal("246.5"), Decimal("147.9"), Decimal("98.6"),
+        ]
+        assert res.tp_ok and len(res.tp_legs) == 3
+
+    @pytest.mark.asyncio
+    async def test_tp_ladder_requires_open_position(self):
+        v, _, _ = _blofin_venue(position=Decimal("0"))
+        with pytest.raises(VenueError):
+            await v.place_tp_ladder(uid=1, pair="XLM/USDT", take_profits=[0.2])
+
+    @pytest.mark.asyncio
+    async def test_tp_ladder_long_closes_sell(self):
+        v, client, _ = _blofin_venue(position=Decimal("10"))
+        await v.place_tp_ladder(uid=1, pair="XLM/USDT", take_profits=[0.25])
+        assert client.place_tpsl_order.await_args.kwargs["side"] == "sell"
+        assert client.place_tpsl_order.await_args.kwargs["size_contracts"] == Decimal("10")
 
     @pytest.mark.asyncio
     async def test_snapshot_not_supported(self):

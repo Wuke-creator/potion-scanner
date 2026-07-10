@@ -92,6 +92,9 @@ class Venue(Protocol):
         self, uid: int, plan: VenuePlan, *, take_profits: list[float],
         stop_loss: float | None, slippage_bps: int,
     ) -> VenueResult: ...
+    async def place_tp_ladder(
+        self, uid: int, *, pair: str, take_profits: list[float],
+    ) -> VenueResult: ...
     async def mark_success(self, uid: int) -> None: ...
     async def mark_failure(self, uid: int, reason: str) -> None: ...
     async def get_account_snapshot(self, uid: int) -> AccountSnapshot | None: ...
@@ -241,6 +244,11 @@ class HyperliquidVenue:
             return None
         return await self._client.get_account_snapshot(d.trader_address)
 
+    async def place_tp_ladder(
+        self, uid: int, *, pair: str, take_profits: list[float],
+    ) -> VenueResult:
+        raise VenueError("manual TP ladder is not supported on hyperliquid yet")
+
 
 # ---------------------------------------------------------------------------
 # Blofin
@@ -381,6 +389,53 @@ class BlofinVenue:
         return VenueResult(
             coin=plan.coin, size=plan.size, sl_ok=sl_ok, tp_ok=tp_ok,
             ref=res.order_id, tp_legs=placed,
+        )
+
+    async def place_tp_ladder(
+        self, uid: int, *, pair: str, take_profits: list[float],
+    ) -> VenueResult:
+        """Lay the weighted TP ladder onto an EXISTING open position.
+
+        Reads the live position size and splits THAT (not a planned size), so
+        it works on any position however it was opened (manual fire, the app,
+        or an auto signal whose TPs failed). Reduce-only per leg; the venue
+        rejects a ladder with no open position.
+        """
+        from src.trading.blofin_client import BlofinError
+
+        if not take_profits:
+            raise VenueError("no take-profit prices to place")
+        c = await self._creds_or_raise(uid)
+        base = pair.split("/")[0].strip().upper()
+        info = await self._client.resolve_inst_id(base)
+        if info is None:
+            raise VenueError(f"{base} is not listed on Blofin")
+        pos = await self._client.get_position(c, info.inst_id)
+        if pos == 0:
+            raise VenueError(f"no open {base} position to ladder")
+        close_side = "sell" if pos > 0 else "buy"
+        legs = ladder_legs(abs(pos), take_profits, info.lot_size, self._tp_weights)
+        if not legs:
+            raise VenueError(f"{base} position too small to split across TPs")
+
+        placed: list[tuple[float, float]] = []
+        all_ok = True
+        for tp_price, tp_size in legs:
+            try:
+                await self._client.place_tpsl_order(
+                    c, inst_id=info.inst_id, side=close_side,
+                    size_contracts=Decimal(str(tp_size)),
+                    tp_trigger=tp_price, margin_mode=self._margin_mode,
+                )
+                placed.append((tp_price, tp_size))
+            except BlofinError as e:
+                logger.warning("TP ladder leg %s failed for %s: %s", tp_price, base, e)
+                all_ok = False
+        if not placed:
+            raise VenueError("every TP order was rejected")
+        return VenueResult(
+            coin=base, size=float(abs(pos)), sl_ok=True, tp_ok=all_ok,
+            tp_legs=placed,
         )
 
     async def mark_success(self, uid: int) -> None:

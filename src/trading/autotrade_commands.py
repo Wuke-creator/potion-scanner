@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 _STATE_KEY = "autotrade_state"
 _STATE_AWAITING = "awaiting_connect_paste"
 _FIRE_PENDING = "autotrade_fire_pending"
+_TPS_PENDING = "autotrade_tps_pending"
 _FIRE_TTL_SEC = 120
 
 _ADDR_RE = re.compile(
@@ -110,6 +111,8 @@ class AutotradeCommands:
         venue=None,
         delegates_db: DelegatesDB | None = None,
         blofin_creds_db=None,
+        open_signals_db=None,
+        signal_channel_id: int = 0,
     ):
         self._config = config
         self._verification_db = verification_db
@@ -118,6 +121,8 @@ class AutotradeCommands:
         self._venue = venue
         self._delegates_db = delegates_db
         self._blofin_creds_db = blofin_creds_db
+        self._open_signals_db = open_signals_db
+        self._signal_channel_id = signal_channel_id
 
     def _venue_name(self) -> str:
         return getattr(self._config.autotrade, "venue", "hyperliquid")
@@ -212,6 +217,8 @@ class AutotradeCommands:
             logger.info("autotrade disabled for user=%d", uid)
         elif sub == "fire":
             await self._fire(uid, args, ctx, reply)
+        elif sub == "tps":
+            await self._tps(uid, args, ctx, reply)
         elif sub == "size":
             await self._set_size(uid, args, reply)
         elif sub == "disconnect":
@@ -231,6 +238,7 @@ class AutotradeCommands:
                 "/autotrade agree - accept + enable\n"
                 "/autotrade size <pct> - set percent of balance per trade\n"
                 "/autotrade fire <coin> <long|short> [lev] [sl] - manually place one trade\n"
+                "/autotrade tps <coin> [px1 px2 px3] - ladder TPs onto an open position\n"
                 "/autotrade off - stop\n"
                 "/autotrade disconnect - wipe key + stop"
             )
@@ -308,6 +316,83 @@ class AutotradeCommands:
             + (f", SL {sl}" if sl is not None else ", no stop")
             + f"\nSized at your {prefs.size_pct:g}% of balance.\n\n"
             "Reply <code>/autotrade fire confirm</code> within 2 minutes to place it.",
+            parse_mode="HTML",
+        )
+
+    async def _tps(self, uid, args, ctx, reply) -> None:
+        """Lay the signal's TP ladder onto an existing open position.
+
+        `/autotrade tps <coin>` pulls the latest open signal's TP1/2/3 for
+        that coin; `/autotrade tps <coin> <px1> [px2] [px3]` uses explicit
+        prices. Both preview first; `/autotrade tps confirm` places the
+        reduce-only orders on the CURRENT position size.
+        """
+        import time
+
+        if self._engine is None:
+            await reply("TP ladder is not available on this bot.")
+            return
+        if not await self._is_connected(uid):
+            await reply("Connect first: /autotrade connect")
+            return
+
+        # --- confirm step ---
+        if len(args) >= 2 and args[1] == "confirm":
+            pend = (ctx.user_data or {}).get(_TPS_PENDING)
+            if not pend or (time.time() - pend["ts"]) > _FIRE_TTL_SEC:
+                await reply("Nothing pending (or it expired). Start with "
+                            "/autotrade tps <coin>.")
+                return
+            ctx.user_data.pop(_TPS_PENDING, None)
+            await reply(f"Placing TP ladder on {pend['coin']}...")
+            await self._engine.apply_tps(
+                uid, pair=pend["pair"], take_profits=pend["tps"],
+            )
+            return
+
+        if len(args) < 2:
+            await reply("Usage: /autotrade tps <coin> [px1 px2 px3]\n"
+                        "e.g. /autotrade tps JUP  (uses the signal's targets)")
+            return
+        coin = args[1].upper()
+        pair = f"{coin}/USDT"
+
+        # --- resolve TP prices: explicit args beat the signal lookup ---
+        tps: list[float] = []
+        if len(args) > 2:
+            try:
+                tps = [float(a) for a in args[2:5]]
+            except ValueError:
+                await reply("TP prices must be numbers, e.g. "
+                            "/autotrade tps JUP 0.2006 0.194 0.1832")
+                return
+        elif self._open_signals_db is not None and self._signal_channel_id:
+            sig = await self._open_signals_db.find_latest_open(
+                channel_id=self._signal_channel_id, pair_or_base=coin,
+            )
+            if sig is not None:
+                tps = [float(t) for t in (sig.tp1, sig.tp2, sig.tp3)
+                       if t is not None]
+        if not tps:
+            await reply(
+                f"No open {coin} signal with TP targets found. Give prices "
+                f"explicitly: /autotrade tps {coin} <px1> [px2] [px3]"
+            )
+            return
+
+        if ctx.user_data is not None:
+            ctx.user_data[_TPS_PENDING] = {
+                "pair": pair, "coin": coin, "tps": tps, "ts": time.time(),
+            }
+        weights = "/".join(
+            f"{w:g}" for w in self._config.autotrade.tp_split_weights[: len(tps)]
+        )
+        await reply(
+            f"<b>Confirm TP ladder</b>\n"
+            f"{coin}: split your OPEN position {weights} across "
+            + " / ".join(f"{t:g}" for t in tps)
+            + " (reduce-only).\n\n"
+            "Reply <code>/autotrade tps confirm</code> within 2 minutes to place.",
             parse_mode="HTML",
         )
 
