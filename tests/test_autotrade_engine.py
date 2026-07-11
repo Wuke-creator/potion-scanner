@@ -330,8 +330,8 @@ class TestCopyProposals:
         engine, venue, send_dm = _make_engine(prefs_db, dry_run=False)
         await _opt_in(prefs_db)
         await engine.propose_copy(self._cabal_sig())
-        sig, _ = engine._pending_copies[UID]
-        engine._pending_copies[UID] = (sig, _time.time() - 1)  # force expiry
+        sig, _, meta = engine._pending_copies[UID]
+        engine._pending_copies[UID] = (sig, _time.time() - 1, meta)  # force expiry
         ok = await engine.confirm_copy(UID)
         assert ok is False
         venue.place.assert_not_called()

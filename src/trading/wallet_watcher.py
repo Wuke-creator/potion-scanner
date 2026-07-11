@@ -158,6 +158,7 @@ class WalletWatcher:
         config: WalletCopyConfig,
         send_dm: SendDM,
         allowlist: frozenset[int],
+        venue=None,                          # trading venue; reconciler only
     ):
         self._info = info_client
         self._db = metrics_db
@@ -166,6 +167,8 @@ class WalletWatcher:
         self._cfg = config
         self._send_dm = send_dm
         self._allowlist = allowlist
+        self._venue = venue
+        self._polls_since_reconcile = 0
         # (address, coin) -> monotonic seconds of the last proposal
         self._last_proposal: dict[tuple[str, str], float] = {}
         # addresses baselined since THIS process started; a fresh boot
@@ -193,6 +196,14 @@ class WalletWatcher:
                                short_addr(w.address), e)
             except Exception:
                 logger.exception("watcher crashed on %s", short_addr(w.address))
+        # reconcile linked copy positions every ~20 polls (5 min at 15s)
+        self._polls_since_reconcile += 1
+        if self._polls_since_reconcile >= 20:
+            self._polls_since_reconcile = 0
+            try:
+                await self._reconcile_copy_trades(tracked)
+            except Exception:  # noqa: BLE001 - bookkeeping never kills polling
+                logger.exception("copy-trade reconciler crashed")
 
     async def _poll_wallet(self, address: str) -> None:
         state = await self._info.get_clearinghouse_state(address)
@@ -277,9 +288,15 @@ class WalletWatcher:
                 f"side, it is now against the wallet you follow."
             )
 
+        # Every gate skip is shadow-logged: without skip records we cannot
+        # tell later whether a wallet's edge died or our guards ate it.
+
         # gate: scalper wallets' intraday churn is not copyable
         tw = await self._db.get_tracked_wallet(address)
         if tw is not None and tw.is_scalper:
+            await self._db.log_event(address, d.coin, "skip_scalper", {
+                "side": side, "notional": d.notional,
+            })
             return
 
         # gate: conviction floor (their margin in this trade vs their equity)
@@ -288,6 +305,10 @@ class WalletWatcher:
             if state.account_value > 0 and d.margin_used > 0 else 0.0
         )
         if conviction < self._cfg.conviction_floor:
+            await self._db.log_event(address, d.coin, "skip_conviction", {
+                "side": side, "conviction": round(conviction, 4),
+                "floor": self._cfg.conviction_floor, "px": d.entry_px,
+            })
             return
 
         # gate: listed on Blofin
@@ -298,6 +319,9 @@ class WalletWatcher:
             logger.warning("blofin resolve failed for %s", base)
             return
         if info is None:
+            await self._db.log_event(address, d.coin, "skip_unlisted", {
+                "side": side, "notional": d.notional,
+            })
             await self._notify_all(
                 f"{label} opened {d.coin} {side} (~${d.notional:,.0f}, "
                 f"{conviction * 100:.0f}% of their equity) but {base} is not "
@@ -310,6 +334,9 @@ class WalletWatcher:
         now = time.monotonic()
         last = self._last_proposal.get(key)
         if last is not None and now - last < self._cfg.proposal_cooldown_min * 60:
+            await self._db.log_event(address, d.coin, "skip_cooldown", {
+                "side": side, "px": d.entry_px,
+            })
             return
         self._last_proposal[key] = now
 
@@ -355,22 +382,49 @@ class WalletWatcher:
             size_pct_override=size_pct,
             note="\n".join(note_lines),
         )
-        await self._engine.propose_copy(sig, source=f"wallet {label}")
+        # meta arms the engine's confirm-time deviation gate and writes the
+        # attribution row that links a filled copy back to this leader.
+        proposal_id = await self._engine.propose_copy(
+            sig, source=f"wallet {label}",
+            meta={
+                "leader_address": address,
+                "coin": d.coin,
+                "inst_id": getattr(info, "inst_id", ""),
+                "proposal_price": entry if entry > 0 else None,
+                "atr": atr,
+                "max_deviation_atr": self._cfg.copy_max_deviation_atr,
+            },
+        )
         await self._db.log_event(address, d.coin, "proposed", {
             "side": side, "size_pct": size_pct, "stop": stop, "tps": tps,
+            "proposal_id": proposal_id,
         })
+
+    async def _linked_note(self, address: str, coin: str) -> str:
+        """One line naming any of OUR open positions linked to this leader's
+        coin, so an exit DM lands with full context."""
+        try:
+            links = await self._db.open_copy_trades(address, coin)
+        except Exception:  # noqa: BLE001
+            return ""
+        if not links:
+            return ""
+        refs = ", ".join(
+            f"order {t.order_ref or '?'} ({t.size_base:g} {coin})"
+            if t.size_base else f"order {t.order_ref or '?'}"
+            for t in links
+        )
+        return f"\nYou hold a linked copy: {refs}."
 
     async def _notify_exit(self, address: str, d: PositionDelta) -> None:
         label = short_addr(address)
         side = "long" if d.prev_szi > 0 else "short"
+        linked = await self._linked_note(address, d.coin)
         if d.kind == "close":
-            frac = (
-                abs(d.prev_szi) - abs(d.curr_szi)
-            ) / abs(d.prev_szi) if d.prev_szi else 1.0
             await self._notify_all(
                 f"{label} CLOSED their {d.coin} {side}. If you copied it, "
                 f"consider closing yours (confirm-gated; nothing was done "
-                f"automatically)."
+                f"automatically).{linked}"
             )
             return
         frac = (
@@ -382,8 +436,42 @@ class WalletWatcher:
         await self._notify_all(
             f"{label} reduced their {d.coin} {side} by {frac * 100:.0f}%. "
             f"If you copied it, consider scaling out (nothing was done "
-            f"automatically)."
+            f"automatically).{linked}"
         )
+
+    async def _reconcile_copy_trades(self, tracked) -> None:
+        """Mark linked copies whose venue position vanished without a
+        recorded close as closed_unreconciled (manual close). Their pnl is
+        unknown and they are EXCLUDED from per-leader stop sums rather than
+        guessed."""
+        if self._venue is None:
+            return
+        for w in tracked:
+            links = await self._db.open_copy_trades(w.address)
+            for t in links:
+                pair = f"{hl_coin_to_blofin_base(t.coin)}/USDT"
+                try:
+                    pos = await self._venue.get_open_position(
+                        t.telegram_user_id, pair,
+                    )
+                except Exception:  # noqa: BLE001 - unreadable = try next cycle
+                    continue
+                if pos == 0:
+                    await self._db.close_copy_trade(
+                        t.id, close_reason="manual",
+                        realized_pnl=None, status="closed_unreconciled",
+                    )
+                    await self._db.log_event(
+                        w.address, t.coin, "copy_unreconciled",
+                        {"order_ref": t.order_ref},
+                    )
+                    await self._notify_all(
+                        f"Linked {t.coin} copy (order {t.order_ref or '?'}) "
+                        f"is no longer open on the exchange and no close was "
+                        f"recorded here; marked closed_unreconciled. Its pnl "
+                        f"is unknown and won't count toward the leader's "
+                        f"running total."
+                    )
 
     async def _notify_all(self, text: str) -> None:
         for uid in self._allowlist:

@@ -91,6 +91,32 @@ CREATE TABLE IF NOT EXISTS watcher_events (
   detail     TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS copy_trades (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  leader_address   TEXT NOT NULL,
+  coin             TEXT NOT NULL,
+  inst_id          TEXT NOT NULL DEFAULT '',
+  telegram_user_id INTEGER NOT NULL,
+  side             TEXT NOT NULL,
+  proposal_id      INTEGER NOT NULL,
+  proposed_at      INTEGER NOT NULL,
+  proposal_price   REAL,
+  atr_at_proposal  REAL,
+  confirmed_at     INTEGER,
+  order_ref        TEXT NOT NULL DEFAULT '',
+  entry_price      REAL,
+  size_base        REAL,
+  leverage         INTEGER,
+  status           TEXT NOT NULL DEFAULT 'proposed',
+  closed_at        INTEGER,
+  realized_pnl     REAL,
+  close_reason     TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_copy_trades_leader
+  ON copy_trades(leader_address, status);
+CREATE INDEX IF NOT EXISTS idx_copy_trades_proposal
+  ON copy_trades(proposal_id, telegram_user_id);
 """
 
 
@@ -138,6 +164,37 @@ class StoredPosition:
     entry_px: float = 0.0
     leverage: float = 0.0
     notional: float = 0.0
+
+
+@dataclass
+class CopyTrade:
+    """One proposed/placed copy of a tracked wallet's trade.
+
+    Lifecycle: proposed -> filled -> closed
+                        -> expired | cancelled_deviation | cancelled
+               filled  -> closed_unreconciled (position gone without a
+                          recorded close; excluded from leader-stop sums)
+    """
+
+    id: int
+    leader_address: str
+    coin: str
+    inst_id: str
+    telegram_user_id: int
+    side: str
+    proposal_id: int
+    proposed_at: int
+    proposal_price: float | None = None
+    atr_at_proposal: float | None = None
+    confirmed_at: int | None = None
+    order_ref: str = ""
+    entry_price: float | None = None
+    size_base: float | None = None
+    leverage: int | None = None
+    status: str = "proposed"
+    closed_at: int | None = None
+    realized_pnl: float | None = None
+    close_reason: str = ""
 
 
 class WalletMetricsDB:
@@ -346,6 +403,109 @@ class WalletMetricsDB:
             (address, now),
         )
         await self._conn.commit()
+
+    # ---- copy-trade attribution ---------------------------------------------
+
+    @staticmethod
+    def _copy_trade_from_row(row) -> CopyTrade:
+        return CopyTrade(**{k: row[k] for k in row.keys()})
+
+    async def insert_copy_trade(
+        self, *, leader_address: str, coin: str, inst_id: str,
+        telegram_user_id: int, side: str, proposal_id: int,
+        proposal_price: float | None, atr_at_proposal: float | None,
+    ) -> int:
+        cur = await self._conn.execute(
+            "INSERT INTO copy_trades (leader_address, coin, inst_id, "
+            "telegram_user_id, side, proposal_id, proposed_at, "
+            "proposal_price, atr_at_proposal) VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                leader_address.lower(), coin, inst_id, telegram_user_id,
+                side, proposal_id, int(time.time()), proposal_price,
+                atr_at_proposal,
+            ),
+        )
+        await self._conn.commit()
+        return int(cur.lastrowid)
+
+    async def get_copy_trade(
+        self, proposal_id: int, telegram_user_id: int,
+    ) -> CopyTrade | None:
+        cur = await self._conn.execute(
+            "SELECT * FROM copy_trades WHERE proposal_id=? AND "
+            "telegram_user_id=? ORDER BY id DESC LIMIT 1",
+            (proposal_id, telegram_user_id),
+        )
+        row = await cur.fetchone()
+        return self._copy_trade_from_row(row) if row else None
+
+    async def set_copy_trade_status(
+        self, proposal_id: int, telegram_user_id: int, status: str,
+    ) -> None:
+        await self._conn.execute(
+            "UPDATE copy_trades SET status=? WHERE proposal_id=? AND "
+            "telegram_user_id=? AND status='proposed'",
+            (status, proposal_id, telegram_user_id),
+        )
+        await self._conn.commit()
+
+    async def mark_copy_trade_filled(
+        self, proposal_id: int, telegram_user_id: int, *,
+        order_ref: str, size_base: float | None, leverage: int | None,
+        entry_price: float | None = None,
+    ) -> None:
+        await self._conn.execute(
+            "UPDATE copy_trades SET status='filled', confirmed_at=?, "
+            "order_ref=?, size_base=?, leverage=?, entry_price=? "
+            "WHERE proposal_id=? AND telegram_user_id=? AND status='proposed'",
+            (
+                int(time.time()), order_ref, size_base, leverage,
+                entry_price, proposal_id, telegram_user_id,
+            ),
+        )
+        await self._conn.commit()
+
+    async def open_copy_trades(
+        self, leader_address: str, coin: str | None = None,
+    ) -> list[CopyTrade]:
+        if coin is None:
+            cur = await self._conn.execute(
+                "SELECT * FROM copy_trades WHERE leader_address=? AND "
+                "status='filled' ORDER BY id",
+                (leader_address.lower(),),
+            )
+        else:
+            cur = await self._conn.execute(
+                "SELECT * FROM copy_trades WHERE leader_address=? AND "
+                "coin=? AND status='filled' ORDER BY id",
+                (leader_address.lower(), coin),
+            )
+        return [self._copy_trade_from_row(r) for r in await cur.fetchall()]
+
+    async def close_copy_trade(
+        self, trade_id: int, *, close_reason: str,
+        realized_pnl: float | None, status: str = "closed",
+    ) -> None:
+        await self._conn.execute(
+            "UPDATE copy_trades SET status=?, closed_at=?, realized_pnl=?, "
+            "close_reason=? WHERE id=?",
+            (status, int(time.time()), realized_pnl, close_reason, trade_id),
+        )
+        await self._conn.commit()
+
+    async def leader_realized_pnl(
+        self, leader_address: str, *, since_ts: int = 0,
+    ) -> float:
+        """Sum of recorded realized pnl for closed copies of this leader.
+        closed_unreconciled rows (NULL pnl) are deliberately excluded."""
+        cur = await self._conn.execute(
+            "SELECT COALESCE(SUM(realized_pnl), 0) AS s FROM copy_trades "
+            "WHERE leader_address=? AND status='closed' AND closed_at>=? "
+            "AND realized_pnl IS NOT NULL",
+            (leader_address.lower(), since_ts),
+        )
+        row = await cur.fetchone()
+        return float(row["s"] if row else 0.0)
 
     # ---- audit log ---------------------------------------------------------
 

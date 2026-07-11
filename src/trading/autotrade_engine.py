@@ -56,6 +56,7 @@ class AutotradeEngine:
         prefs_db,
         verification_db,
         send_dm: SendDM,
+        copy_store=None,   # WalletMetricsDB; attribution for wallet copies
     ):
         self._config = config
         self._max_collateral_usdc = max_collateral_usdc
@@ -63,6 +64,7 @@ class AutotradeEngine:
         self._prefs_db = prefs_db
         self._verification_db = verification_db
         self._send_dm = send_dm
+        self._copy_store = copy_store
         # The risk guard only runs when explicitly enabled AND the venue can
         # supply an account snapshot. Blofin can't yet, so it's off there.
         self._guard_on = bool(
@@ -70,10 +72,17 @@ class AutotradeEngine:
             and getattr(venue, "supports_risk_guard", False)
         )
         self._risk = AutotradeRiskGuard(config=config, venue=venue, prefs_db=prefs_db)
-        # uid -> (synthetic signal, expires_at). Confirm-gated copy proposals
-        # from discretionary channels (cabal). In-memory by design: a restart
-        # drops pending proposals rather than firing stale ones.
-        self._pending_copies: dict[int, tuple[object, float]] = {}
+        # uid -> (synthetic signal, expires_at, meta). Confirm-gated copy
+        # proposals from discretionary channels (cabal) and the wallet
+        # watcher. In-memory by design: a restart drops pending proposals
+        # rather than firing stale ones. meta (wallet copies only) carries
+        # leader/price/ATR context for the confirm-time deviation gate and
+        # attribution; cabal proposals have meta=None and skip both.
+        self._pending_copies: dict[int, tuple[object, float, dict | None]] = {}
+
+    def attach_copy_store(self, copy_store) -> None:
+        """Late-bind the attribution store (built after the engine)."""
+        self._copy_store = copy_store
 
     async def on_new_signal(self, signal) -> None:
         """Entry point from the router. Never raises into the caller."""
@@ -123,20 +132,27 @@ class AutotradeEngine:
             logger.exception("manual_fire crashed for user=%s", uid)
             await self._dm(uid, "Manual fire hit an unexpected error.")
 
-    async def propose_copy(self, sig, *, source: str = "cabal") -> None:
-        """Confirm-gated copy for discretionary calls (cabal-chat).
+    async def propose_copy(
+        self, sig, *, source: str = "cabal", meta: dict | None = None,
+    ) -> int | None:
+        """Confirm-gated copy for discretionary calls and wallet copies.
 
         Human-typed calls parse tolerantly, so nothing fires by itself: each
         eligible user gets a DM preview and must reply /autotrade copy
         confirm within the TTL. Never raises into the router.
+
+        Wallet-watcher proposals pass ``meta`` (leader_address, coin,
+        inst_id, proposal_price, atr, max_deviation_atr): it arms the
+        confirm-time price-deviation gate and writes attribution rows.
+        Returns the proposal id when at least one user was DM'd.
         """
         import time
 
         if not self._config.enabled or not self._config.allowlist:
-            return
+            return None
         side = (getattr(sig, "side", "") or "").strip().upper()
         if side not in ("LONG", "SHORT"):
-            return
+            return None
         leverage = getattr(sig, "leverage", None) or self._config.copy_default_leverage
         tps = list(getattr(sig, "take_profits", None) or [])
         from types import SimpleNamespace
@@ -155,12 +171,27 @@ class AutotradeEngine:
             # own size prefs, so it can only ever shrink a trade.
             size_pct_override=getattr(sig, "size_pct_override", None),
         )
+        proposed_any = False
         for uid in self._config.allowlist:
             try:
                 prefs = await self._copy_eligible(uid)
                 if prefs is None:
                     continue
-                self._pending_copies[uid] = (synthetic, time.time() + _COPY_TTL_SEC)
+                self._pending_copies[uid] = (
+                    synthetic, time.time() + _COPY_TTL_SEC, meta,
+                )
+                if meta is not None and self._copy_store is not None:
+                    await self._copy_store.insert_copy_trade(
+                        leader_address=str(meta.get("leader_address", "")),
+                        coin=str(meta.get("coin", "")),
+                        inst_id=str(meta.get("inst_id", "")),
+                        telegram_user_id=uid,
+                        side=side,
+                        proposal_id=int(synthetic.id),
+                        proposal_price=meta.get("proposal_price"),
+                        atr_at_proposal=meta.get("atr"),
+                    )
+                proposed_any = True
                 override = getattr(sig, "size_pct_override", None)
                 shown_pct = (
                     min(float(override), prefs.size_pct)
@@ -171,28 +202,115 @@ class AutotradeEngine:
                 )
             except Exception:  # noqa: BLE001 - isolate per user
                 logger.exception("propose_copy failed for user=%s", uid)
+        return int(synthetic.id) if proposed_any else None
 
     async def confirm_copy(self, uid: int) -> bool:
-        """Fire the pending copy proposal for this user. True if placed."""
+        """Fire the pending copy proposal for this user. True if placed.
+
+        Wallet-copy proposals (meta present) pass a price-deviation gate
+        first: with 0-15 minutes between proposal and confirm, an entry
+        that already ran k x ATR against the proposal price is adverse
+        selection, not a fill. Cancel beats chase. A price that cannot be
+        READ keeps the proposal pending (retryable) but never fires: the
+        gate fails closed on unreadable state, matching the risk guard.
+        """
         import time
 
         pend = self._pending_copies.get(uid)
         if pend is None:
             await self._dm(uid, "No pending call to copy (or it expired).")
             return False
-        synthetic, expires = pend
+        synthetic, expires, meta = pend
         if time.time() > expires:
             self._pending_copies.pop(uid, None)
+            await self._mark_copy(uid, synthetic, "expired")
             await self._dm(uid, "That call expired (15 min limit). Not placed.")
             return False
+
+        if meta is not None:
+            gate = await self._deviation_gate(uid, synthetic, meta)
+            if gate == "cancel":
+                self._pending_copies.pop(uid, None)
+                return False
+            if gate == "retry":
+                return False   # pending kept; user can confirm again
+
         self._pending_copies.pop(uid, None)
         try:
-            await self._maybe_fire(uid, synthetic, int(synthetic.id), synthetic.side)
+            result = await self._maybe_fire(
+                uid, synthetic, int(synthetic.id), synthetic.side,
+            )
+            if result is not None and meta is not None:
+                await self._mark_copy_filled(uid, synthetic, result)
             return True
         except Exception:  # noqa: BLE001
             logger.exception("confirm_copy crashed for user=%s", uid)
             await self._dm(uid, "Copy hit an unexpected error.")
             return False
+
+    async def _deviation_gate(self, uid: int, synthetic, meta: dict) -> str:
+        """'pass' | 'cancel' | 'retry' (price unreadable, kept pending)."""
+        proposal_price = meta.get("proposal_price")
+        atr = meta.get("atr")
+        max_dev = float(meta.get("max_deviation_atr") or 0.0)
+        if not proposal_price or not atr or max_dev <= 0:
+            return "pass"   # nothing to gate against (no ATR at proposal)
+        try:
+            current = await self._venue.get_price(synthetic.pair)
+        except Exception:  # noqa: BLE001 - unreadable price = do not fire
+            logger.warning("deviation gate could not read price for %s",
+                           synthetic.pair)
+            await self._dm(
+                uid,
+                "Could not verify the current price; NOT placed. The "
+                "proposal is still pending, try /autotrade copy confirm "
+                "again in a moment.",
+            )
+            return "retry"
+        is_long = synthetic.side == "LONG"
+        adverse = (
+            current - float(proposal_price) if is_long
+            else float(proposal_price) - current
+        )
+        moved_atr = adverse / float(atr) if atr else 0.0
+        if moved_atr > max_dev:
+            await self._mark_copy(uid, synthetic, "cancelled_deviation")
+            await self._dm(
+                uid,
+                f"Auto-cancelled: {synthetic.pair} moved "
+                f"{moved_atr:.2f}x ATR against the entry since the proposal "
+                f"(limit {max_dev:g}x). Chasing an entry that already ran "
+                f"is how copy latency turns into losses.",
+            )
+            logger.info(
+                "deviation gate cancelled %s for user=%s (%.2fx ATR)",
+                synthetic.pair, uid, moved_atr,
+            )
+            return "cancel"
+        return "pass"
+
+    async def _mark_copy(self, uid: int, synthetic, status: str) -> None:
+        if self._copy_store is None:
+            return
+        try:
+            await self._copy_store.set_copy_trade_status(
+                int(synthetic.id), uid, status,
+            )
+        except Exception:  # noqa: BLE001 - bookkeeping never blocks trading
+            logger.warning("copy_trades status update failed", exc_info=True)
+
+    async def _mark_copy_filled(self, uid: int, synthetic, result) -> None:
+        if self._copy_store is None:
+            return
+        try:
+            await self._copy_store.mark_copy_trade_filled(
+                int(synthetic.id), uid,
+                order_ref=str(getattr(result, "ref", "") or ""),
+                size_base=float(getattr(result, "size", 0.0) or 0.0),
+                leverage=None,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("copy_trades fill update failed", exc_info=True)
 
     async def _copy_eligible(self, uid: int):
         """Prefs for an eligible user, else None."""
@@ -300,7 +418,12 @@ class AutotradeEngine:
         except Exception:  # noqa: BLE001 - a DM failure must not break the flow
             logger.warning("autotrade DM to %s failed", user_id, exc_info=True)
 
-    async def _maybe_fire(self, uid: int, signal, signal_id: int, side: str) -> None:
+    async def _maybe_fire(
+        self, uid: int, signal, signal_id: int, side: str,
+    ):
+        """Runs the full gate + place path. Returns the VenueResult when an
+        order was actually placed, else None (skips, dry-run, failures).
+        Callers that don't care (signals, manual fire) ignore the value."""
         # --- eligibility ---
         verified = await self._verification_db.get_verified(uid)
         if verified is None or not verified.is_active:
@@ -432,6 +555,7 @@ class AutotradeEngine:
 
         await self._venue.mark_success(uid)
         await self._dm(uid, self._fmt_success(plan, result, take_profits, stop_loss))
+        return result
 
     # ---- DM formatting -----------------------------------------------------
 

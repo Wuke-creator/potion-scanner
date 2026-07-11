@@ -98,6 +98,8 @@ class Venue(Protocol):
     async def mark_success(self, uid: int) -> None: ...
     async def mark_failure(self, uid: int, reason: str) -> None: ...
     async def get_account_snapshot(self, uid: int) -> AccountSnapshot | None: ...
+    async def get_price(self, pair: str) -> float: ...
+    async def get_open_position(self, uid: int, pair: str) -> float: ...
 
 
 def cap_leverage(requested: int, asset_max: int, caller_max: int) -> int:
@@ -248,6 +250,16 @@ class HyperliquidVenue:
         self, uid: int, *, pair: str, take_profits: list[float],
     ) -> VenueResult:
         raise VenueError("manual TP ladder is not supported on hyperliquid yet")
+
+    async def get_price(self, pair: str) -> float:
+        coin = pair.split("/")[0].strip().upper()
+        px = await self._client.get_mid_price(coin)
+        if px is None or px <= 0:
+            raise VenueError(f"no price for {coin}")
+        return float(px)
+
+    async def get_open_position(self, uid: int, pair: str) -> float:
+        raise VenueError("position lookup not supported on hyperliquid yet")
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +455,23 @@ class BlofinVenue:
 
     async def mark_failure(self, uid: int, reason: str) -> None:
         await self._creds.mark_trade_failure(uid, reason)
+
+    async def get_price(self, pair: str) -> float:
+        base = pair.split("/")[0].strip().upper()
+        info = await self._client.resolve_inst_id(base)
+        if info is None:
+            raise VenueError(f"{base} is not listed on Blofin")
+        return await self._client.get_last_price(info.inst_id)
+
+    async def get_open_position(self, uid: int, pair: str) -> float:
+        """Signed live position in CONTRACTS (0 = flat). Used by the
+        copy-trade reconciler to detect manual closes."""
+        c = await self._creds_or_raise(uid)
+        base = pair.split("/")[0].strip().upper()
+        info = await self._client.resolve_inst_id(base)
+        if info is None:
+            return 0.0
+        return float(await self._client.get_position(c, info.inst_id))
 
     async def get_account_snapshot(self, uid: int) -> AccountSnapshot | None:
         # Not wired for Blofin; supports_risk_guard is False so the engine

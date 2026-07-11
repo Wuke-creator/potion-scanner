@@ -510,6 +510,11 @@ async def run(config: Config) -> None:
         wallet_metrics_db = WalletMetricsDB(db_path=config.wallet_copy.db_path)
         await wallet_metrics_db.open()
 
+        # Wallet-copy attribution: the engine records proposed/filled copy
+        # trades per leader (deviation gate + per-leader stops read these).
+        if autotrade_engine is not None:
+            autotrade_engine.attach_copy_store(wallet_metrics_db)
+
         # Blofin listing checks are public reads; reuse the autotrade client
         # when it exists, otherwise run a key-less one. Only the scout and
         # watcher need it; the snapshot job reads Hyperliquid alone.
@@ -601,6 +606,7 @@ async def run(config: Config) -> None:
                     config=config.wallet_copy,
                     send_dm=_wallet_send_dm,
                     allowlist=config.autotrade.allowlist,
+                    venue=autotrade_venue,
                 )
         logger.info(
             "Wallet copy stack: scout=%s watcher=%s poll=%.0fs max_tracked=%d",

@@ -328,6 +328,10 @@ class AutotradeConfig:
     copy_channel_key: str = "cabal"
     copy_authors: frozenset[str] = field(default_factory=frozenset)
     copy_default_leverage: int = 5   # when the call says "low lev" w/o a number
+    # When True, parsed CABAL entries fire immediately (no confirm DM). Only
+    # applies to channel-call proposals; wallet-watcher proposals always stay
+    # confirm-gated because their deviation gate runs at confirm time.
+    copy_auto_fire: bool = False
     # Account-level risk guard (passivbot-derived; src/trading/autotrade_risk.py).
     # Only runs when risk_enabled AND the venue can supply an account snapshot
     # (Hyperliquid yes, Blofin not yet). Wallet exposure = notional / account
@@ -381,6 +385,10 @@ class WalletCopyConfig:
     # watcher gates
     conviction_floor: float = 0.05     # their margin/equity below this = skip
     proposal_cooldown_min: float = 30.0
+    # confirm-time price-deviation gate: cancel the copy if price moved
+    # more than this many ATRs AGAINST the entry between proposal and
+    # confirm. 0 disables the gate.
+    copy_max_deviation_atr: float = 0.6
     # derived protective levels (their stops are invisible)
     atr_period: int = 14
     atr_interval: str = "1h"
@@ -1025,6 +1033,12 @@ def load_config(
             os.getenv(
                 "WALLET_PROPOSAL_COOLDOWN_MIN",
                 wallet_yaml.get("proposal_cooldown_min", 30.0),
+            )
+        ),
+        copy_max_deviation_atr=float(
+            os.getenv(
+                "WALLET_COPY_MAX_DEVIATION_ATR",
+                wallet_yaml.get("copy_max_deviation_atr", 0.6),
             )
         ),
         atr_period=int(wallet_yaml.get("atr_period", 14)),
