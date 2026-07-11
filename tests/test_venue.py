@@ -148,9 +148,11 @@ def _blofin_venue(*, price=0.2, creds=True, position=Decimal("0")):
 
 
 class TestBlofinVenue:
-    def test_does_not_support_risk_guard(self):
+    def test_supports_risk_guard_since_phase5(self):
+        # Phase 5 wired get_account_snapshot via /account/positions, so the
+        # passivbot-derived guard can now run on Blofin.
         v, _, _ = _blofin_venue()
-        assert v.supports_risk_guard is False
+        assert v.supports_risk_guard is True
         assert v.name == "blofin"
 
     @pytest.mark.asyncio
@@ -286,10 +288,16 @@ class TestBlofinVenue:
         assert client.place_tpsl_order.await_args.kwargs["size_contracts"] == Decimal("10")
 
     @pytest.mark.asyncio
-    async def test_snapshot_not_supported(self):
-        v, _, _ = _blofin_venue()
-        with pytest.raises(NotImplementedError):
-            await v.get_account_snapshot(1)
+    async def test_snapshot_returns_equity_and_positions(self):
+        v, client, _ = _blofin_venue()
+        client.get_available_usdt = AsyncMock(return_value=100.0)
+        client.get_all_positions = AsyncMock(return_value=[
+            {"instId": "XLM-USDT", "positions": "10", "margin": "20",
+             "unrealizedPnl": "5", "markPrice": "0.2", "leverage": "5"},
+        ])
+        snap = await v.get_account_snapshot(1)
+        assert snap.account_value == pytest.approx(125.0)
+        assert "XLM" in snap.positions
 
 
 def _hl_venue(tp_weights=(0.5, 0.3, 0.2)):
