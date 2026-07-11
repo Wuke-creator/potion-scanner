@@ -52,6 +52,23 @@ def short_addr(address: str) -> str:
     return f"{a[:6]}..{a[-4:]}" if len(a) > 12 else a
 
 
+def blofin_usdt_bases(instruments) -> set[str]:
+    """Set of base symbols that have a LIVE USDT perp on Blofin.
+
+    instruments is keyed by full instId. A base counts as covered only
+    when "{BASE}-USDT" exists and is live, matching resolve_inst_id, so
+    the scout's coverage metric never disagrees with what can be traded.
+    """
+    bases: set[str] = set()
+    for inst_id, info in (instruments or {}).items():
+        if not str(inst_id).endswith("-USDT"):
+            continue
+        if getattr(info, "state", "live") not in ("", "live"):
+            continue
+        bases.add(str(inst_id).split("-")[0])
+    return bases
+
+
 def hl_coin_to_blofin_base(coin: str) -> str:
     """Map a Hyperliquid coin symbol to the Blofin base symbol.
 
@@ -590,12 +607,20 @@ class WalletScout:
             )
 
     async def _blofin_bases(self) -> set[str]:
+        """Base symbols with a LIVE USDT perp on Blofin, for coverage.
+
+        get_instruments is keyed by full instId ("BTC-USDT", "ETH-USDC"),
+        so the raw key set never matches a base symbol like "BTC". Mirror
+        resolve_inst_id's contract (base -> "{BASE}-USDT", state == live)
+        so coverage scoring agrees with what the watcher can actually
+        trade.
+        """
         try:
             instruments = await self._blofin.get_instruments()
         except Exception:
             logger.warning("blofin instrument fetch failed; coverage unknown")
             return set()
-        return set(instruments or {})
+        return blofin_usdt_bases(instruments or {})
 
     async def _btc_daily_returns(self) -> dict[str, float]:
         """BTC daily close-to-close returns keyed by date (beta discount)."""

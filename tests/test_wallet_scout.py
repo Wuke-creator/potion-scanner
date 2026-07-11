@@ -603,3 +603,41 @@ class TestFillStatsV2:
         assert pearson_corr(xs, [-x for x in xs]) == pytest.approx(-1.0)
         assert pearson_corr(xs[:5], xs[:5]) is None
         assert pearson_corr(xs, [3.0] * 12) is None
+
+
+class TestBlofinCoverageMapping:
+    def test_maps_inst_ids_to_usdt_bases(self):
+        from types import SimpleNamespace
+
+        from src.trading.wallet_scout import blofin_usdt_bases
+
+        instruments = {
+            "BTC-USDT": SimpleNamespace(state="live"),
+            "ETH-USDC": SimpleNamespace(state="live"),   # not USDT -> skip
+            "HYPE-USDT": SimpleNamespace(state="live"),
+            "DEAD-USDT": SimpleNamespace(state="suspend"),  # not live -> skip
+            "1000PEPE-USDT": SimpleNamespace(state="live"),
+        }
+        bases = blofin_usdt_bases(instruments)
+        assert bases == {"BTC", "HYPE", "1000PEPE"}
+
+    def test_empty_and_none(self):
+        from src.trading.wallet_scout import blofin_usdt_bases
+
+        assert blofin_usdt_bases({}) == set()
+        assert blofin_usdt_bases(None) == set()
+
+    def test_coverage_now_matches_base_symbols(self):
+        # regression: coverage used the raw inst-id keys, so a wallet
+        # trading BTC/HYPE scored 0 coverage. It must now score 1.0.
+        from types import SimpleNamespace
+
+        from src.trading.wallet_scout import blofin_usdt_bases, hl_coin_to_blofin_base
+
+        bases = blofin_usdt_bases({
+            "BTC-USDT": SimpleNamespace(state="live"),
+            "HYPE-USDT": SimpleNamespace(state="live"),
+        })
+        traded = {"BTC", "HYPE"}
+        listed = sum(1 for c in traded if hl_coin_to_blofin_base(c) in bases)
+        assert listed / len(traded) == 1.0
