@@ -53,13 +53,13 @@ def _make_engine(
     prefs_db, *, enabled=True, dry_run=True, allowlist=frozenset({UID}),
     max_per_day=10, balance=1000.0, plan=_SENTINEL, place_result=None,
     place_error=None, verified=True, connected=True, risk_enabled=True,
-    venue_name="hyperliquid",
+    venue_name="hyperliquid", copy_auto_fire=False,
 ):
     cfg = AutotradeConfig(
         enabled=enabled, dry_run=dry_run, venue=venue_name, network="testnet",
         allowlist=allowlist, default_size_pct=5.0, max_leverage=20,
         max_per_day=max_per_day, min_collateral_usdc=5.0, slippage_bps=100,
-        risk_enabled=risk_enabled,
+        risk_enabled=risk_enabled, copy_auto_fire=copy_auto_fire,
     )
     venue = AsyncMock()
     venue.name = venue_name
@@ -289,6 +289,31 @@ class TestCopyProposals:
         )
         base.update(kw)
         return CabalSignal(**base)
+
+    @pytest.mark.asyncio
+    async def test_auto_fire_places_without_confirm(self, prefs_db):
+        engine, venue, send_dm = _make_engine(
+            prefs_db, dry_run=False, copy_auto_fire=True,
+        )
+        await _opt_in(prefs_db)
+        await engine.propose_copy(self._cabal_sig(), source="Cabal Chat")
+        venue.place.assert_awaited_once()               # fired immediately
+        assert UID not in engine._pending_copies        # nothing left pending
+        texts = [c.args[1] for c in send_dm.await_args_list]
+        assert any("Auto-copying" in t for t in texts)
+
+    @pytest.mark.asyncio
+    async def test_auto_fire_never_applies_to_wallet_proposals(self, prefs_db):
+        engine, venue, send_dm = _make_engine(
+            prefs_db, dry_run=False, copy_auto_fire=True,
+        )
+        await _opt_in(prefs_db)
+        await engine.propose_copy(
+            self._cabal_sig(), source="wallet",
+            meta={"leader_address": "0xabc", "coin": "RUNE"},
+        )
+        venue.place.assert_not_called()                 # still confirm-gated
+        assert UID in engine._pending_copies
 
     @pytest.mark.asyncio
     async def test_propose_dms_and_confirm_places(self, prefs_db):

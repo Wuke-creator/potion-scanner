@@ -957,6 +957,10 @@ def load_config(
             "AUTOTRADE_COPY_DEFAULT_LEVERAGE",
             int(autotrade_yaml.get("copy_default_leverage", 5)),
         ),
+        copy_auto_fire=os.getenv(
+            "AUTOTRADE_COPY_AUTO_FIRE",
+            str(autotrade_yaml.get("copy_auto_fire", "false")),
+        ).strip().lower() in ("1", "true", "yes"),
         risk_enabled=os.getenv(
             "AUTOTRADE_RISK_ENABLED",
             str(autotrade_yaml.get("risk_enabled", "true")),

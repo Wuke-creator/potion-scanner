@@ -171,6 +171,30 @@ class AutotradeEngine:
             # own size prefs, so it can only ever shrink a trade.
             size_pct_override=getattr(sig, "size_pct_override", None),
         )
+        # Channel-call auto-fire: when enabled, cabal entries place straight
+        # away (the fire path DMs the fill or failure). Wallet proposals
+        # (meta present) are NEVER auto-fired: their price-deviation gate is
+        # designed to run at confirm time, so skipping confirm would skip it.
+        if self._config.copy_auto_fire and meta is None:
+            fired_any = False
+            for uid in self._config.allowlist:
+                try:
+                    prefs = await self._copy_eligible(uid)
+                    if prefs is None:
+                        continue
+                    fired_any = True
+                    await self._dm(
+                        uid,
+                        f"Auto-copying {source} call: {synthetic.pair} {side} "
+                        f"{synthetic.leverage}x...",
+                    )
+                    await self._maybe_fire(
+                        uid, synthetic, int(synthetic.id), side,
+                    )
+                except Exception:  # noqa: BLE001 - isolate per user
+                    logger.exception("auto copy failed for user=%s", uid)
+            return int(synthetic.id) if fired_any else None
+
         proposed_any = False
         for uid in self._config.allowlist:
             try:
