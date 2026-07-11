@@ -548,10 +548,13 @@ async def run(config: Config) -> None:
                 config.backtest.cache_db_path,
             )
 
+        from src.trading.backtest.walkforward import WalkForward
+
+        _backtest_feed = BacktestDataFeed(
+            info_client=hl_info_client, store=backtest_store,
+        )
         backtest_runner = BacktestRunner(
-            feed=BacktestDataFeed(
-                info_client=hl_info_client, store=backtest_store,
-            ),
+            feed=_backtest_feed,
             store=backtest_store,
             wallet_cfg=config.wallet_copy,
             backtest_cfg=config.backtest,
@@ -561,6 +564,12 @@ async def run(config: Config) -> None:
             config=config,
             runner=backtest_runner,
             metrics_db=wallet_metrics_db,
+            walkforward=WalkForward(
+                feed=_backtest_feed,
+                store=backtest_store,
+                wallet_cfg=config.wallet_copy,
+                backtest_cfg=config.backtest,
+            ),
         ).register(verification.application)
         logger.info("Backtest /backtest command registered")
 

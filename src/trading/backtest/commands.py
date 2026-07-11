@@ -4,6 +4,7 @@
   /backtest <0xaddr> [days]          backtest one wallet
   /backtest tracked [days]           backtest the tracked set
   /backtest all [days]               tracked + candidates
+  /backtest walkforward              point-in-time scout validation
   /backtest cancel                   cancel the running job
 
 Runs take minutes: the handler spawns the job through the application's
@@ -39,6 +40,7 @@ _HELP = (
     "/backtest 0x... [days]   one wallet (default 60 days)\n"
     "/backtest tracked [days] the tracked set\n"
     "/backtest all [days]     tracked + candidates\n"
+    "/backtest walkforward    point-in-time scout validation\n"
     "/backtest cancel         stop the running job\n\n"
     "Simulates the COPIER's PnL: confirm-delay grid, realistic/pessimistic "
     "fill bounds, ATR-ladder vs mirror vs hop exits, fees + funding. "
@@ -92,10 +94,12 @@ class BacktestCommands:
         config: Config,
         runner: BacktestRunner,
         metrics_db: WalletMetricsDB,
+        walkforward=None,          # WalkForward; optional until wired
     ):
         self._config = config
         self._runner = runner
         self._metrics_db = metrics_db
+        self._walkforward = walkforward
         self._manager = BacktestJobManager()
 
     def register(self, application: Application) -> None:
@@ -121,6 +125,28 @@ class BacktestCommands:
                 await msg.reply_text("Cancelling the running backtest.")
             else:
                 await msg.reply_text("No backtest is running.")
+            return
+
+        if args[0].lower() == "walkforward":
+            if self._walkforward is None:
+                await msg.reply_text("Walk-forward is not wired up.")
+                return
+            status_msg = await msg.reply_text(
+                "Walk-forward validation started (needs an aged snapshot "
+                "archive; report follows).",
+            )
+            started = self._manager.try_start(
+                context.application,
+                self._run_walkforward_job(
+                    context, chat_id=msg.chat_id,
+                    status_message_id=status_msg.message_id,
+                ),
+                label="walkforward", owner=user.id,
+            )
+            if not started:
+                await msg.reply_text(
+                    f"A backtest is already running: {self._manager.status}.",
+                )
             return
 
         # target + days
@@ -235,6 +261,47 @@ class BacktestCommands:
 
         for chunk in format_report(result):
             await self._safe_send(bot, chat_id, chunk)
+
+    async def _run_walkforward_job(
+        self, context: ContextTypes.DEFAULT_TYPE, *, chat_id: int,
+        status_message_id: int,
+    ) -> None:
+        from src.trading.backtest.walkforward import format_walkforward
+
+        bot = context.bot
+        last_edit = 0.0
+
+        async def progress(text: str) -> None:
+            nonlocal last_edit
+            now = time.monotonic()
+            if now - last_edit < _PROGRESS_MIN_INTERVAL_SEC:
+                return
+            last_edit = now
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id, message_id=status_message_id,
+                    text=f"Walk-forward\n{text}",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        timeout = self._config.backtest.job_timeout_min * 60
+        try:
+            result = await asyncio.wait_for(
+                self._walkforward.run(progress), timeout=timeout,
+            )
+        except asyncio.CancelledError:
+            await self._safe_send(bot, chat_id, "Walk-forward cancelled.")
+            raise
+        except asyncio.TimeoutError:
+            await self._safe_send(bot, chat_id, "Walk-forward timed out.")
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception("walkforward job crashed")
+            await self._safe_send(bot, chat_id,
+                                  "Walk-forward crashed; check the logs.")
+            return
+        await self._safe_send(bot, chat_id, format_walkforward(result))
 
     @staticmethod
     async def _safe_send(bot, chat_id: int, text: str) -> None:

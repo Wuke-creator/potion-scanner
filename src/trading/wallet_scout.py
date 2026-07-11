@@ -310,6 +310,27 @@ def copyability_score(
     return round(score, 2)
 
 
+def score_wallet_asof(
+    row: LeaderboardRow, fills: list[dict], *, as_of_ms: int,
+    blofin_coverage: float, cfg: WalletCopyConfig,
+) -> tuple[float, FillStats]:
+    """Score a wallet as it would have been scored at as_of_ms.
+
+    Point-in-time discipline for walk-forward validation: only fills at or
+    before as_of_ms exist, and "now" (for dormancy) IS as_of_ms. The live
+    scout is the degenerate case as_of_ms = now, so both paths share one
+    scorer and cannot drift.
+    """
+    past_fills = [f for f in fills if int(f.get("time", 0)) <= as_of_ms]
+    stats = compute_fill_stats(
+        past_fills, account_value=row.account_value, now_ms=as_of_ms,
+    )
+    score = copyability_score(
+        row, stats, blofin_coverage=blofin_coverage, cfg=cfg,
+    )
+    return score, stats
+
+
 # ---------------------------------------------------------------------------
 # 5. hysteresis
 # ---------------------------------------------------------------------------
@@ -498,17 +519,20 @@ class WalletScout:
             except HLInfoError as e:
                 logger.warning("userFills failed for %s: %s", short_addr(addr), e)
                 continue
-            stats = compute_fill_stats(fills, account_value=row.account_value)
-            if blofin_bases and stats.coins:
+            # First pass just needs coins; the shared as-of scorer re-runs
+            # the stats so live scoring and walk-forward CANNOT drift.
+            probe = compute_fill_stats(fills, account_value=row.account_value)
+            if blofin_bases and probe.coins:
                 listed = sum(
-                    1 for c in stats.coins
+                    1 for c in probe.coins
                     if hl_coin_to_blofin_base(c) in blofin_bases
                 )
-                coverage = listed / len(stats.coins)
+                coverage = listed / len(probe.coins)
             else:
                 coverage = 0.0 if blofin_bases else 0.5  # unknown: neutral-ish
-            score = copyability_score(
-                row, stats, blofin_coverage=coverage, cfg=self._cfg,
+            score, stats = score_wallet_asof(
+                row, fills, as_of_ms=int(time.time() * 1000),
+                blofin_coverage=coverage, cfg=self._cfg,
             )
             is_scalper = stats.fills_per_day > self._cfg.scalper_fills_per_day
             today[addr] = (score, is_scalper)
