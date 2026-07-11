@@ -212,6 +212,11 @@ async def run(config: Config) -> None:
     autotrade_prefs_db = None
     blofin_client = None
     blofin_creds_db = None
+    wallet_scout = None
+    wallet_watcher = None
+    wallet_metrics_db = None
+    hl_info_client = None
+    wallet_blofin_client = None
     if config.trading.enabled:
         from src.trading.commands import TradingCommands
         from src.trading.delegates_db import DelegatesDB
@@ -482,6 +487,71 @@ async def run(config: Config) -> None:
             config.autotrade.dry_run,
             len(config.autotrade.allowlist),
             config.autotrade.source_channel_key,
+        )
+
+    # --- Wallet copy stack (scout + watcher; dark by default) ---
+    # WALLET_SCOUT_ENABLED: nightly leaderboard screen + trade-level verify,
+    # maintains the tracked wallet set with hysteresis, DMs a change digest.
+    # WALLET_WATCH_ENABLED: polls tracked wallets' open positions; copyable
+    # opens become confirm-gated propose_copy proposals (needs autotrade on),
+    # exits DM immediately. Public Hyperliquid data only; read-only clients.
+    if config.wallet_copy.scout_enabled or config.wallet_copy.watch_enabled:
+        from src.trading.hl_info_client import HyperliquidInfoClient
+        from src.trading.wallet_metrics_db import WalletMetricsDB
+
+        hl_info_client = HyperliquidInfoClient()
+        await hl_info_client.open()
+        wallet_metrics_db = WalletMetricsDB(db_path=config.wallet_copy.db_path)
+        await wallet_metrics_db.open()
+
+        # Blofin listing checks are public reads; reuse the autotrade client
+        # when it exists, otherwise run a key-less one.
+        if blofin_client is not None:
+            wallet_blofin_client = blofin_client
+        else:
+            from src.trading.blofin_client import PROD_BASE_URL, BlofinClient
+
+            wallet_blofin_client = BlofinClient(base_url=PROD_BASE_URL)
+            await wallet_blofin_client.open()
+
+        async def _wallet_send_dm(user_id: int, text: str) -> None:
+            await telegram_bot.send_message(chat_id=user_id, text=text)
+
+        if config.wallet_copy.scout_enabled:
+            from src.trading.wallet_scout import WalletScout
+
+            wallet_scout = WalletScout(
+                info_client=hl_info_client,
+                metrics_db=wallet_metrics_db,
+                blofin_client=wallet_blofin_client,
+                config=config.wallet_copy,
+                send_dm=_wallet_send_dm,
+                allowlist=config.autotrade.allowlist,
+            )
+        if config.wallet_copy.watch_enabled:
+            if autotrade_engine is None:
+                logger.warning(
+                    "WALLET_WATCH_ENABLED but autotrade is off; watcher "
+                    "needs the engine for confirm-gated proposals. Skipping.",
+                )
+            else:
+                from src.trading.wallet_watcher import WalletWatcher
+
+                wallet_watcher = WalletWatcher(
+                    info_client=hl_info_client,
+                    metrics_db=wallet_metrics_db,
+                    engine=autotrade_engine,
+                    blofin_client=wallet_blofin_client,
+                    config=config.wallet_copy,
+                    send_dm=_wallet_send_dm,
+                    allowlist=config.autotrade.allowlist,
+                )
+        logger.info(
+            "Wallet copy stack: scout=%s watcher=%s poll=%.0fs max_tracked=%d",
+            config.wallet_copy.scout_enabled,
+            wallet_watcher is not None,
+            config.wallet_copy.poll_sec,
+            config.wallet_copy.max_tracked,
         )
 
     # --- Router: classify + parse + format, enqueue to dispatcher ---
@@ -964,6 +1034,16 @@ async def run(config: Config) -> None:
     consumer_task = asyncio.create_task(
         _consume_queue(queue, router, shutdown), name="queue_consumer",
     )
+    wallet_scout_task = None
+    wallet_watcher_task = None
+    if wallet_scout is not None:
+        wallet_scout_task = asyncio.create_task(
+            wallet_scout.run_forever(), name="wallet_scout",
+        )
+    if wallet_watcher is not None:
+        wallet_watcher_task = asyncio.create_task(
+            wallet_watcher.run_forever(), name="wallet_watcher",
+        )
 
     # --- Track-record backfill: one-off walk of recent closes at startup ---
     # Waits for the Discord client to be ready (so fetch_channel works) and
@@ -1014,6 +1094,13 @@ async def run(config: Config) -> None:
         await shutdown.wait()
     finally:
         logger.info("Shutdown requested")
+        for wtask in (wallet_scout_task, wallet_watcher_task):
+            if wtask is not None:
+                wtask.cancel()
+                try:
+                    await wtask
+                except (asyncio.CancelledError, Exception):
+                    pass
         consumer_task.cancel()
         try:
             await listener.stop()
@@ -1136,6 +1223,21 @@ async def run(config: Config) -> None:
                 await blofin_client.close()
             except Exception:
                 logger.exception("Blofin client close error")
+        if wallet_blofin_client is not None and wallet_blofin_client is not blofin_client:
+            try:
+                await wallet_blofin_client.close()
+            except Exception:
+                logger.exception("Wallet Blofin client close error")
+        if wallet_metrics_db is not None:
+            try:
+                await wallet_metrics_db.close()
+            except Exception:
+                logger.exception("Wallet metrics DB close error")
+        if hl_info_client is not None:
+            try:
+                await hl_info_client.close()
+            except Exception:
+                logger.exception("HL info client close error")
         try:
             await verification.stop()
         except Exception:

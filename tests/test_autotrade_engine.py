@@ -378,3 +378,55 @@ class TestManualFire:
         await _opt_in(prefs_db)
         await engine.manual_fire(UID, pair="XLM/USDT", side="short", leverage=5)
         venue.place.assert_not_called()
+
+
+class TestWalletCopyProposals:
+    """Wallet-watcher proposals: size_pct_override + note passthrough."""
+
+    def _wallet_sig(self, **kw):
+        base = dict(
+            pair="HYPE/USDT", side="LONG", leverage=10, entry=25.0,
+            take_profits=[28.0, 31.0, 34.0], stop_loss=22.0,
+            size_pct_override=2.0,
+            note="SL/TPs are OURS, derived from recent volatility (ATR).",
+        )
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    @pytest.mark.asyncio
+    async def test_override_shrinks_collateral(self, prefs_db):
+        engine, venue, send_dm = _make_engine(prefs_db, dry_run=False)
+        await _opt_in(prefs_db)
+        await engine.propose_copy(self._wallet_sig(), source="wallet 0xadd1..5e0d")
+        ok = await engine.confirm_copy(UID)
+        assert ok is True
+        # balance 1000, override 2% < pref 5% -> $20 collateral
+        assert venue.plan.await_args.kwargs["collateral_usdc"] == pytest.approx(20.0)
+
+    @pytest.mark.asyncio
+    async def test_override_capped_at_user_pref(self, prefs_db):
+        engine, venue, send_dm = _make_engine(prefs_db, dry_run=False)
+        await _opt_in(prefs_db)
+        await engine.propose_copy(self._wallet_sig(size_pct_override=50.0))
+        await engine.confirm_copy(UID)
+        # override 50% capped at the 5% pref -> $50 of the $1000 balance
+        assert venue.plan.await_args.kwargs["collateral_usdc"] == pytest.approx(50.0)
+
+    @pytest.mark.asyncio
+    async def test_preview_shows_note_and_capped_pct(self, prefs_db):
+        engine, venue, send_dm = _make_engine(prefs_db, dry_run=False)
+        await _opt_in(prefs_db)
+        await engine.propose_copy(self._wallet_sig(), source="wallet 0xadd1..5e0d")
+        preview = send_dm.await_args.args[1]
+        assert "wallet 0xadd1..5e0d" in preview
+        assert "ATR" in preview
+        assert "at your 2% size" in preview
+
+    @pytest.mark.asyncio
+    async def test_no_override_keeps_pref_sizing(self, prefs_db):
+        engine, venue, send_dm = _make_engine(prefs_db, dry_run=False)
+        await _opt_in(prefs_db)
+        await engine.propose_copy(self._wallet_sig(size_pct_override=None))
+        await engine.confirm_copy(UID)
+        assert venue.plan.await_args.kwargs["collateral_usdc"] == pytest.approx(50.0)
+        assert "at your 5% size" in send_dm.await_args_list[0].args[1]

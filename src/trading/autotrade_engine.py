@@ -150,6 +150,10 @@ class AutotradeEngine:
             tp2=tps[1] if len(tps) > 1 else None,
             tp3=tps[2] if len(tps) > 2 else None,
             stop_loss=getattr(sig, "stop_loss", None),
+            # optional per-proposal sizing (wallet copies mirror the tracked
+            # wallet's equity fraction); the fire path caps it at the user's
+            # own size prefs, so it can only ever shrink a trade.
+            size_pct_override=getattr(sig, "size_pct_override", None),
         )
         for uid in self._config.allowlist:
             try:
@@ -157,8 +161,13 @@ class AutotradeEngine:
                 if prefs is None:
                     continue
                 self._pending_copies[uid] = (synthetic, time.time() + _COPY_TTL_SEC)
+                override = getattr(sig, "size_pct_override", None)
+                shown_pct = (
+                    min(float(override), prefs.size_pct)
+                    if override else prefs.size_pct
+                )
                 await self._dm(
-                    uid, self._fmt_copy_preview(sig, leverage, source, prefs.size_pct),
+                    uid, self._fmt_copy_preview(sig, leverage, source, shown_pct),
                 )
             except Exception:  # noqa: BLE001 - isolate per user
                 logger.exception("propose_copy failed for user=%s", uid)
@@ -221,6 +230,9 @@ class AutotradeEngine:
             lines.append("TPs: none stated - entry + stop only")
         if getattr(sig, "side_inferred", False):
             lines.append("(direction inferred from the stop vs entry)")
+        note = getattr(sig, "note", "") or ""
+        if note:
+            lines.append(note)
         lines.append(
             "\nReply /autotrade copy confirm within 15 min to place it "
             f"at your {size_pct:g}% size."
@@ -328,7 +340,13 @@ class AutotradeEngine:
             await self._prefs_db.release_fire(uid, signal_id)
             await self._dm(uid, f"Autotrade skipped {pair}: could not read balance ({e}).")
             return
-        collateral = balance * (prefs.size_pct / 100.0)
+        # Wallet-copy proposals carry the tracked wallet's equity fraction;
+        # it can only shrink the trade, never exceed the user's own pref.
+        size_pct = prefs.size_pct
+        override = getattr(signal, "size_pct_override", None)
+        if override is not None and float(override) > 0:
+            size_pct = min(float(override), prefs.size_pct)
+        collateral = balance * (size_pct / 100.0)
         if self._max_collateral_usdc and self._max_collateral_usdc > 0:
             collateral = min(collateral, self._max_collateral_usdc)
         collateral = min(collateral, balance)

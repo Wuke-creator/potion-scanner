@@ -340,6 +340,63 @@ class AutotradeConfig:
 
 
 @dataclass
+class WalletCopyConfig:
+    """Hyperliquid wallet scout + copy watcher (dark by default).
+
+    Two independent flags:
+
+      WALLET_SCOUT_ENABLED  nightly leaderboard screen + trade-level
+                            verification + tracked-set hysteresis + DM digest
+      WALLET_WATCH_ENABLED  10-20s clearinghouseState poller over the tracked
+                            set; copyable opens become confirm-gated
+                            engine.propose_copy proposals, exits DM instantly
+
+    Nothing fires without /autotrade copy confirm. The watcher needs the
+    autotrade stack (AUTOTRADE_ENABLED) for proposals; the scout runs alone.
+    Both read only public Hyperliquid data; no keys involved.
+    """
+
+    scout_enabled: bool = False
+    watch_enabled: bool = False
+    db_path: str = "data/wallet_scout.db"
+    poll_sec: float = 15.0             # watcher cadence (10-20s sensible)
+    scout_hour_utc: int = 2            # nightly scout run (UTC hour)
+    max_tracked: int = 5               # tracked-set size cap
+    max_finalists: int = 20            # screened wallets verified per night
+    # screen thresholds (from the discovery pass that found 495 candidates)
+    min_account_value: float = 30_000.0
+    max_account_value: float = 20_000_000.0
+    max_volume_ratio: float = 150.0    # allTime volume / account, MM filter
+    alltime_month_factor: float = 1.5  # allTime pnl >= factor * month pnl
+    # verification / scoring
+    min_episodes: int = 5              # closed round-trips needed to score
+    scalper_fills_per_day: float = 25.0
+    dormant_hours: float = 96.0
+    # hysteresis (streaks are consecutive nightly runs)
+    promote_score: float = 60.0
+    promote_streak: int = 2
+    demote_score: float = 45.0
+    demote_streak: int = 3
+    swap_margin: float = 10.0          # candidate must beat worst tracked by this
+    # watcher gates
+    conviction_floor: float = 0.05     # their margin/equity below this = skip
+    proposal_cooldown_min: float = 30.0
+    # derived protective levels (their stops are invisible)
+    atr_period: int = 14
+    atr_interval: str = "1h"
+    atr_mult: float = 1.5
+    # reserved: auto-reduce when the wallet exits. NOT implemented; exits
+    # are DM-only until Luke explicitly asks for the feature.
+    mirror_exits: bool = False
+    # first-run seed: the manually vetted wallets, tracked from day one
+    seed_addresses: tuple[str, ...] = (
+        "0xadd12adbbd5db87674b38af99b6dd34dd2a45e0d",
+        "0x1f7b0d0c259f599536037b9c6c782c04a2aec71d",
+        "0x9cbf099ff424979439dfba03f00b5961784c06ce",
+    )
+
+
+@dataclass
 class ImageArchiveConfig:
     """Permanent image archive on Telegram's CDN.
 
@@ -406,6 +463,7 @@ class Config:
     ops_capture: OpsCaptureConfig = field(default_factory=OpsCaptureConfig)
     trading: TradingConfig = field(default_factory=TradingConfig)
     autotrade: AutotradeConfig = field(default_factory=AutotradeConfig)
+    wallet_copy: WalletCopyConfig = field(default_factory=WalletCopyConfig)
     image_archive: ImageArchiveConfig = field(
         default_factory=ImageArchiveConfig,
     )
@@ -890,6 +948,65 @@ def load_config(
         ).strip().lower() != "false",
     )
 
+    wallet_yaml = yaml_data.get("wallet_copy", {})
+    _seed_raw = os.getenv("WALLET_SEED_ADDRESSES", "").strip()
+    if _seed_raw:
+        _seed = tuple(
+            a.strip().lower() for a in _seed_raw.split(",") if a.strip()
+        )
+    else:
+        _seed = WalletCopyConfig.seed_addresses
+    wallet_copy_cfg = WalletCopyConfig(
+        scout_enabled=os.getenv("WALLET_SCOUT_ENABLED", "").strip().lower()
+        in ("1", "true", "yes"),
+        watch_enabled=os.getenv("WALLET_WATCH_ENABLED", "").strip().lower()
+        in ("1", "true", "yes"),
+        db_path=wallet_yaml.get("db_path", "data/wallet_scout.db"),
+        poll_sec=float(
+            os.getenv("WALLET_POLL_SEC", wallet_yaml.get("poll_sec", 15.0))
+        ),
+        scout_hour_utc=_env_int(
+            "WALLET_SCOUT_HOUR_UTC", int(wallet_yaml.get("scout_hour_utc", 2)),
+        ),
+        max_tracked=_env_int(
+            "WALLET_MAX_TRACKED", int(wallet_yaml.get("max_tracked", 5)),
+        ),
+        max_finalists=int(wallet_yaml.get("max_finalists", 20)),
+        min_account_value=float(wallet_yaml.get("min_account_value", 30_000.0)),
+        max_account_value=float(wallet_yaml.get("max_account_value", 20_000_000.0)),
+        max_volume_ratio=float(wallet_yaml.get("max_volume_ratio", 150.0)),
+        alltime_month_factor=float(wallet_yaml.get("alltime_month_factor", 1.5)),
+        min_episodes=int(wallet_yaml.get("min_episodes", 5)),
+        scalper_fills_per_day=float(
+            wallet_yaml.get("scalper_fills_per_day", 25.0)
+        ),
+        dormant_hours=float(wallet_yaml.get("dormant_hours", 96.0)),
+        promote_score=float(wallet_yaml.get("promote_score", 60.0)),
+        promote_streak=int(wallet_yaml.get("promote_streak", 2)),
+        demote_score=float(wallet_yaml.get("demote_score", 45.0)),
+        demote_streak=int(wallet_yaml.get("demote_streak", 3)),
+        swap_margin=float(wallet_yaml.get("swap_margin", 10.0)),
+        conviction_floor=float(
+            os.getenv(
+                "WALLET_CONVICTION_FLOOR",
+                wallet_yaml.get("conviction_floor", 0.05),
+            )
+        ),
+        proposal_cooldown_min=float(
+            os.getenv(
+                "WALLET_PROPOSAL_COOLDOWN_MIN",
+                wallet_yaml.get("proposal_cooldown_min", 30.0),
+            )
+        ),
+        atr_period=int(wallet_yaml.get("atr_period", 14)),
+        atr_interval=str(wallet_yaml.get("atr_interval", "1h")),
+        atr_mult=float(
+            os.getenv("WALLET_ATR_MULT", wallet_yaml.get("atr_mult", 1.5))
+        ),
+        mirror_exits=False,   # reserved; intentionally not env-readable yet
+        seed_addresses=_seed,
+    )
+
     image_archive_cfg = ImageArchiveConfig(
         archive_chat_id=_env_int("IMAGE_ARCHIVE_CHAT_ID", 0),
     )
@@ -928,6 +1045,7 @@ def load_config(
         ops_capture=ops_cfg,
         trading=trading_cfg,
         autotrade=autotrade_cfg,
+        wallet_copy=wallet_copy_cfg,
         image_archive=image_archive_cfg,
         track_record=track_record_cfg,
     )
