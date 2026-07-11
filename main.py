@@ -217,6 +217,8 @@ async def run(config: Config) -> None:
     wallet_metrics_db = None
     hl_info_client = None
     wallet_blofin_client = None
+    backtest_store = None
+    snapshot_job = None
     if config.trading.enabled:
         from src.trading.commands import TradingCommands
         from src.trading.delegates_db import DelegatesDB
@@ -495,7 +497,11 @@ async def run(config: Config) -> None:
     # WALLET_WATCH_ENABLED: polls tracked wallets' open positions; copyable
     # opens become confirm-gated propose_copy proposals (needs autotrade on),
     # exits DM immediately. Public Hyperliquid data only; read-only clients.
-    if config.wallet_copy.scout_enabled or config.wallet_copy.watch_enabled:
+    if (
+        config.wallet_copy.scout_enabled
+        or config.wallet_copy.watch_enabled
+        or config.backtest.snapshot_enabled
+    ):
         from src.trading.hl_info_client import HyperliquidInfoClient
         from src.trading.wallet_metrics_db import WalletMetricsDB
 
@@ -505,10 +511,11 @@ async def run(config: Config) -> None:
         await wallet_metrics_db.open()
 
         # Blofin listing checks are public reads; reuse the autotrade client
-        # when it exists, otherwise run a key-less one.
+        # when it exists, otherwise run a key-less one. Only the scout and
+        # watcher need it; the snapshot job reads Hyperliquid alone.
         if blofin_client is not None:
             wallet_blofin_client = blofin_client
-        else:
+        elif config.wallet_copy.scout_enabled or config.wallet_copy.watch_enabled:
             from src.trading.blofin_client import PROD_BASE_URL, BlofinClient
 
             wallet_blofin_client = BlofinClient(base_url=PROD_BASE_URL)
@@ -516,6 +523,25 @@ async def run(config: Config) -> None:
 
         async def _wallet_send_dm(user_id: int, text: str) -> None:
             await telegram_bot.send_message(chat_id=user_id, text=text)
+
+        if config.backtest.snapshot_enabled:
+            from src.trading.backtest.data_store import BacktestStore
+            from src.trading.backtest.snapshot_job import SnapshotJob
+
+            backtest_store = BacktestStore(db_path=config.backtest.cache_db_path)
+            await backtest_store.open()
+            snapshot_job = SnapshotJob(
+                info_client=hl_info_client,
+                store=backtest_store,
+                metrics_db=wallet_metrics_db,
+                wallet_cfg=config.wallet_copy,
+                backtest_cfg=config.backtest,
+            )
+            logger.info(
+                "Backtest snapshot job enabled: hour=%02d:00 UTC db=%s",
+                config.backtest.snapshot_hour_utc,
+                config.backtest.cache_db_path,
+            )
 
         if config.wallet_copy.scout_enabled:
             from src.trading.wallet_scout import WalletScout
@@ -1036,6 +1062,7 @@ async def run(config: Config) -> None:
     )
     wallet_scout_task = None
     wallet_watcher_task = None
+    snapshot_job_task = None
     if wallet_scout is not None:
         wallet_scout_task = asyncio.create_task(
             wallet_scout.run_forever(), name="wallet_scout",
@@ -1043,6 +1070,10 @@ async def run(config: Config) -> None:
     if wallet_watcher is not None:
         wallet_watcher_task = asyncio.create_task(
             wallet_watcher.run_forever(), name="wallet_watcher",
+        )
+    if snapshot_job is not None:
+        snapshot_job_task = asyncio.create_task(
+            snapshot_job.run_forever(), name="backtest_snapshot_job",
         )
 
     # --- Track-record backfill: one-off walk of recent closes at startup ---
@@ -1094,7 +1125,7 @@ async def run(config: Config) -> None:
         await shutdown.wait()
     finally:
         logger.info("Shutdown requested")
-        for wtask in (wallet_scout_task, wallet_watcher_task):
+        for wtask in (wallet_scout_task, wallet_watcher_task, snapshot_job_task):
             if wtask is not None:
                 wtask.cancel()
                 try:
@@ -1228,6 +1259,11 @@ async def run(config: Config) -> None:
                 await wallet_blofin_client.close()
             except Exception:
                 logger.exception("Wallet Blofin client close error")
+        if backtest_store is not None:
+            try:
+                await backtest_store.close()
+            except Exception:
+                logger.exception("Backtest store close error")
         if wallet_metrics_db is not None:
             try:
                 await wallet_metrics_db.close()

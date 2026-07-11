@@ -397,6 +397,34 @@ class WalletCopyConfig:
 
 
 @dataclass
+class BacktestConfig:
+    """Backtesting layer for the wallet copy stack (dark by default).
+
+    BACKTEST_SNAPSHOT_ENABLED starts the nightly archiver (leaderboard
+    JSON + candles + funding + wallet states into data/backtest_cache.db).
+    Data-only: no DMs, no trades. Meant to be flipped ON immediately, since
+    Hyperliquid keeps only 5000 candles per interval and no leaderboard
+    history: whatever isn't archived nightly is permanently gone.
+    """
+
+    snapshot_enabled: bool = False
+    snapshot_hour_utc: int = 3          # after the 02:00 scout
+    cache_db_path: str = "data/backtest_cache.db"
+    max_snapshot_coins: int = 40
+    # retention (days)
+    candle_1m_keep_days: int = 90
+    candle_15m_keep_days: int = 400
+    fills_keep_days: int = 180
+    # /backtest job surface (Phase 2)
+    job_timeout_min: int = 30
+    # simulation defaults (Phase 1/2): confirm-delay grid incl. a 15s
+    # bot-speed rung for the hop-mode experiment; costs per side.
+    delay_grid_sec: tuple[int, ...] = (15, 0, 120, 300, 900)
+    taker_fee_bps: float = 6.0
+    slippage_bps: float = 10.0
+
+
+@dataclass
 class ImageArchiveConfig:
     """Permanent image archive on Telegram's CDN.
 
@@ -464,6 +492,7 @@ class Config:
     trading: TradingConfig = field(default_factory=TradingConfig)
     autotrade: AutotradeConfig = field(default_factory=AutotradeConfig)
     wallet_copy: WalletCopyConfig = field(default_factory=WalletCopyConfig)
+    backtest: BacktestConfig = field(default_factory=BacktestConfig)
     image_archive: ImageArchiveConfig = field(
         default_factory=ImageArchiveConfig,
     )
@@ -1007,6 +1036,27 @@ def load_config(
         seed_addresses=_seed,
     )
 
+    backtest_yaml = yaml_data.get("backtest", {})
+    backtest_cfg = BacktestConfig(
+        snapshot_enabled=os.getenv("BACKTEST_SNAPSHOT_ENABLED", "").strip().lower()
+        in ("1", "true", "yes"),
+        snapshot_hour_utc=_env_int(
+            "BACKTEST_SNAPSHOT_HOUR_UTC",
+            int(backtest_yaml.get("snapshot_hour_utc", 3)),
+        ),
+        cache_db_path=backtest_yaml.get("cache_db_path", "data/backtest_cache.db"),
+        max_snapshot_coins=int(backtest_yaml.get("max_snapshot_coins", 40)),
+        candle_1m_keep_days=int(backtest_yaml.get("candle_1m_keep_days", 90)),
+        candle_15m_keep_days=int(backtest_yaml.get("candle_15m_keep_days", 400)),
+        fills_keep_days=int(backtest_yaml.get("fills_keep_days", 180)),
+        job_timeout_min=_env_int(
+            "BACKTEST_JOB_TIMEOUT_MIN",
+            int(backtest_yaml.get("job_timeout_min", 30)),
+        ),
+        taker_fee_bps=float(backtest_yaml.get("taker_fee_bps", 6.0)),
+        slippage_bps=float(backtest_yaml.get("slippage_bps", 10.0)),
+    )
+
     image_archive_cfg = ImageArchiveConfig(
         archive_chat_id=_env_int("IMAGE_ARCHIVE_CHAT_ID", 0),
     )
@@ -1046,6 +1096,7 @@ def load_config(
         trading=trading_cfg,
         autotrade=autotrade_cfg,
         wallet_copy=wallet_copy_cfg,
+        backtest=backtest_cfg,
         image_archive=image_archive_cfg,
         track_record=track_record_cfg,
     )
