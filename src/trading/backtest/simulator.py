@@ -109,11 +109,25 @@ class SkippedEvent:
 
 @dataclass
 class MarketData:
-    """Pre-fetched, per-coin market history the simulator reads from."""
+    """Pre-fetched, per-coin market history the simulator reads from.
+
+    candles_1m may be a SPLICED series: native 1m where archived, 15m
+    candles filling older gaps (the archive only accumulates 1m going
+    forward). coarse_ranges lists the [start, end) spans that came from
+    15m so trades entered there are honesty-flagged resolution='15m'
+    (wider candles = more SL-first conservatism, not more precision).
+    """
 
     candles_1m: dict[str, list[Candle]] = field(default_factory=dict)
     candles_1h: dict[str, list[Candle]] = field(default_factory=dict)
     funding: dict[str, list[tuple[int, float]]] = field(default_factory=dict)
+    coarse_ranges: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
+
+    def is_coarse(self, coin: str, ts_ms: int) -> bool:
+        for start, end in self.coarse_ranges.get(coin) or []:
+            if start <= ts_ms < end:
+                return True
+        return False
 
 
 def _first_at_or_after(candles: list[Candle], ts_ms: int) -> int:
@@ -331,6 +345,7 @@ def simulate_wallet(
             event_ts=e.ts_ms, entry_ts=entry_candle.ts, entry_px=entry_px,
             stop_px=stop_px, tp_prices=[p for p, _ in tp_legs],
             params_id=params.params_id,
+            resolution="15m" if market.is_coarse(e.coin, entry_candle.ts) else "1m",
         )
         state = _OpenState(
             is_long=is_long, entry_px=entry_px, stop_px=stop_px,

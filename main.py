@@ -524,12 +524,17 @@ async def run(config: Config) -> None:
         async def _wallet_send_dm(user_id: int, text: str) -> None:
             await telegram_bot.send_message(chat_id=user_id, text=text)
 
+        from src.trading.backtest.commands import BacktestCommands
+        from src.trading.backtest.data_feed import BacktestDataFeed
+        from src.trading.backtest.data_store import BacktestStore
+        from src.trading.backtest.runner import BacktestRunner
+
+        backtest_store = BacktestStore(db_path=config.backtest.cache_db_path)
+        await backtest_store.open()
+
         if config.backtest.snapshot_enabled:
-            from src.trading.backtest.data_store import BacktestStore
             from src.trading.backtest.snapshot_job import SnapshotJob
 
-            backtest_store = BacktestStore(db_path=config.backtest.cache_db_path)
-            await backtest_store.open()
             snapshot_job = SnapshotJob(
                 info_client=hl_info_client,
                 store=backtest_store,
@@ -542,6 +547,22 @@ async def run(config: Config) -> None:
                 config.backtest.snapshot_hour_utc,
                 config.backtest.cache_db_path,
             )
+
+        backtest_runner = BacktestRunner(
+            feed=BacktestDataFeed(
+                info_client=hl_info_client, store=backtest_store,
+            ),
+            store=backtest_store,
+            wallet_cfg=config.wallet_copy,
+            backtest_cfg=config.backtest,
+            blofin_client=wallet_blofin_client,
+        )
+        BacktestCommands(
+            config=config,
+            runner=backtest_runner,
+            metrics_db=wallet_metrics_db,
+        ).register(verification.application)
+        logger.info("Backtest /backtest command registered")
 
         if config.wallet_copy.scout_enabled:
             from src.trading.wallet_scout import WalletScout
