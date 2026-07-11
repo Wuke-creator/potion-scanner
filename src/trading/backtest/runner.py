@@ -121,12 +121,14 @@ class BacktestRunner:
         wallet_cfg: WalletCopyConfig,
         backtest_cfg: BacktestConfig,
         blofin_client=None,          # optional: enables the listing gate
+        metrics_db=None,             # optional: feeds scout scoring v2
     ):
         self._feed = feed
         self._store = store
         self._wallet_cfg = wallet_cfg
         self._cfg = backtest_cfg
         self._blofin = blofin_client
+        self._metrics_db = metrics_db
 
     async def run(self, spec: BacktestSpec, progress: Progress) -> RunResult:
         started = time.monotonic()
@@ -154,6 +156,21 @@ class BacktestRunner:
 
         self._aggregate(result)
         await self._persist(result)
+        # feed the scout's latency-fitness gate: each backtested wallet
+        # gets its replayed copier verdict attached for scoring v2
+        if self._metrics_db is not None:
+            for wr in result.wallets:
+                if wr.error or not wr.net_by_delay:
+                    continue
+                try:
+                    await self._metrics_db.record_backtest_fitness(
+                        wr.address,
+                        latency_ratio=latency_robustness(wr.net_by_delay),
+                        copier_net=wr.net_by_delay.get(PRIMARY_DELAY_SEC),
+                    )
+                except Exception:  # noqa: BLE001 - bookkeeping only
+                    logger.warning("backtest fitness writeback failed",
+                                   exc_info=True)
         result.elapsed_sec = time.monotonic() - started
         return result
 

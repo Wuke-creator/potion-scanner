@@ -450,3 +450,156 @@ class TestScoutRunOnce:
         assert len(dms) == 1
         assert "now tracking" in dms[0][1]
         assert "No positions were opened or closed" in dms[0][1]
+
+
+class TestScoreV2:
+    def _stats(self, **kw):
+        from src.trading.wallet_scout import FillStats
+
+        base = dict(
+            n_fills=40, span_days=30.0, fills_per_day=2.0, win_rate=0.6,
+            profit_factor=2.0, max_drawdown_usd=3000.0, median_hold_min=300.0,
+            conviction_median=0.15, top_trade_share=0.3, hours_since_fill=5.0,
+            n_episodes=20,
+        )
+        base.update(kw)
+        return FillStats(**base)
+
+    def test_liquidation_veto(self):
+        s = copyability_score(
+            _row(), self._stats(liquidation_count=1),
+            blofin_coverage=1.0, cfg=CFG,
+        )
+        assert s == 0.0
+
+    def test_hold_time_hard_gate(self):
+        s = copyability_score(
+            _row(), self._stats(median_hold_min=90.0),   # 1.5h < 4h gate
+            blofin_coverage=1.0, cfg=CFG,
+        )
+        assert s == 0.0
+
+    def test_hard_fills_gate_below_scalper_threshold(self):
+        # 15/day is under the old 25 scalper line but over the v2 hard gate
+        s = copyability_score(
+            _row(), self._stats(fills_per_day=15.0),
+            blofin_coverage=1.0, cfg=CFG,
+        )
+        assert s == 0.0
+
+    def test_high_wr_trap_discount(self):
+        base = copyability_score(
+            _row(), self._stats(win_rate=0.75, avg_win=100.0, avg_loss=50.0),
+            blofin_coverage=1.0, cfg=CFG,
+        )
+        trap = copyability_score(
+            _row(), self._stats(win_rate=0.75, avg_win=50.0, avg_loss=200.0),
+            blofin_coverage=1.0, cfg=CFG,
+        )
+        assert trap < base
+
+    def test_negative_skew_discount(self):
+        base = copyability_score(
+            _row(), self._stats(pnl_skew=0.5), blofin_coverage=1.0, cfg=CFG,
+        )
+        skewed = copyability_score(
+            _row(), self._stats(pnl_skew=-2.0), blofin_coverage=1.0, cfg=CFG,
+        )
+        assert skewed == pytest.approx(base * 0.8, rel=0.01)
+
+    def test_btc_beta_discount(self):
+        base = copyability_score(
+            _row(), self._stats(), blofin_coverage=1.0, cfg=CFG,
+        )
+        beta = copyability_score(
+            _row(), self._stats(), blofin_coverage=1.0, cfg=CFG,
+            btc_corr=0.9,
+        )
+        assert beta == pytest.approx(base * 0.8, rel=0.01)
+
+    def test_delta_neutral_discount(self):
+        base = copyability_score(
+            _row(), self._stats(), blofin_coverage=1.0, cfg=CFG,
+        )
+        neutral = copyability_score(
+            _row(), self._stats(), blofin_coverage=1.0, cfg=CFG,
+            net_direction_ratio=0.1,
+        )
+        assert neutral == pytest.approx(base * 0.5, rel=0.01)
+
+    def test_latency_unfit_discount(self):
+        base = copyability_score(
+            _row(), self._stats(), blofin_coverage=1.0, cfg=CFG,
+        )
+        unfit = copyability_score(
+            _row(), self._stats(), blofin_coverage=1.0, cfg=CFG,
+            latency_fit=(-50.0, 0.9),
+        )
+        decayed = copyability_score(
+            _row(), self._stats(), blofin_coverage=1.0, cfg=CFG,
+            latency_fit=(100.0, 0.3),
+        )
+        fit = copyability_score(
+            _row(), self._stats(), blofin_coverage=1.0, cfg=CFG,
+            latency_fit=(100.0, 0.9),
+        )
+        assert unfit == pytest.approx(base * 0.2, rel=0.01)
+        assert decayed == pytest.approx(base * 0.2, rel=0.01)
+        assert fit == pytest.approx(base, rel=0.01)
+
+    def test_subwindow_consistency_lifts_and_drops(self):
+        steady = copyability_score(
+            _row(), self._stats(subwindow_pfs=[1.5, 1.8, 1.4]),
+            blofin_coverage=1.0, cfg=CFG,
+        )
+        lumpy = copyability_score(
+            _row(), self._stats(subwindow_pfs=[6.0, 0.4, 0.6]),
+            blofin_coverage=1.0, cfg=CFG,
+        )
+        assert steady > lumpy
+
+    def test_sortino_replaces_wr_weight_when_present(self):
+        # same wr/pf, better downside profile scores higher
+        low = copyability_score(
+            _row(), self._stats(sortino_like=0.1), blofin_coverage=1.0, cfg=CFG,
+        )
+        high = copyability_score(
+            _row(), self._stats(sortino_like=2.0), blofin_coverage=1.0, cfg=CFG,
+        )
+        assert high > low
+
+
+class TestFillStatsV2:
+    def test_liquidation_fills_counted(self):
+        fills = _round_trip("A", T0)
+        fills[1]["dir"] = "Market Liquidation"
+        s = compute_fill_stats(fills, account_value=10_000.0, now_ms=T0 + DAY_MS)
+        assert s.liquidation_count == 1
+
+    def test_daily_pnl_series(self):
+        fills = _round_trip("A", T0) + _round_trip("B", T0 + DAY_MS)
+        s = compute_fill_stats(fills, account_value=10_000.0,
+                               now_ms=T0 + 2 * DAY_MS)
+        assert len(s.daily_pnl) == 2
+        assert sum(s.daily_pnl.values()) == pytest.approx(100.0)
+
+    def test_avg_win_loss_and_skew(self):
+        fills = []
+        for i in range(12):
+            fills += _round_trip("A", T0 + i * DAY_MS, win=(i % 3 != 0))
+        s = compute_fill_stats(fills, account_value=10_000.0,
+                               now_ms=T0 + 13 * DAY_MS)
+        assert s.avg_win == pytest.approx(50.0)
+        assert s.avg_loss == pytest.approx(40.0)
+        assert s.pnl_skew is not None
+        assert s.sortino_like is not None
+        assert len(s.subwindow_pfs) == 3
+
+    def test_pearson_corr_helper(self):
+        from src.trading.wallet_scout import pearson_corr
+
+        xs = [float(i) for i in range(12)]
+        assert pearson_corr(xs, xs) == pytest.approx(1.0)
+        assert pearson_corr(xs, [-x for x in xs]) == pytest.approx(-1.0)
+        assert pearson_corr(xs[:5], xs[:5]) is None
+        assert pearson_corr(xs, [3.0] * 12) is None

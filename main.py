@@ -564,6 +564,7 @@ async def run(config: Config) -> None:
             wallet_cfg=config.wallet_copy,
             backtest_cfg=config.backtest,
             blofin_client=wallet_blofin_client,
+            metrics_db=wallet_metrics_db,
         )
         BacktestCommands(
             config=config,

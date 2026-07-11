@@ -156,6 +156,10 @@ class TrackedWallet:
     is_scalper: bool = False
     promoted_at: int | None = None
     demoted_at: int | None = None
+    # latest /backtest verdict for this wallet (scoring v2 latency gate)
+    bt_latency_ratio: float | None = None
+    bt_copier_net: float | None = None
+    bt_at: int = 0
 
 
 @dataclass
@@ -209,8 +213,13 @@ class WalletMetricsDB:
         self._db = await aiosqlite.connect(self._db_path)
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(_DDL)
-        # additive migration for dbs created before the column existed
+        # additive migrations for dbs created before these columns existed
         await self._ensure_column("copy_trades", "stop_price", "REAL")
+        await self._ensure_column("tracked_wallets", "bt_latency_ratio", "REAL")
+        await self._ensure_column("tracked_wallets", "bt_copier_net", "REAL")
+        await self._ensure_column(
+            "tracked_wallets", "bt_at", "INTEGER NOT NULL DEFAULT 0",
+        )
         await self._db.commit()
 
     async def _ensure_column(self, table: str, column: str, decl: str) -> None:
@@ -328,12 +337,20 @@ class WalletMetricsDB:
 
     @staticmethod
     def _tracked_from_row(row) -> TrackedWallet:
+        keys = row.keys()
         return TrackedWallet(
             address=row["address"], status=row["status"],
             score=row["score"], streak_above=row["streak_above"],
             streak_below=row["streak_below"],
             is_scalper=bool(row["is_scalper"]),
             promoted_at=row["promoted_at"], demoted_at=row["demoted_at"],
+            bt_latency_ratio=(
+                row["bt_latency_ratio"] if "bt_latency_ratio" in keys else None
+            ),
+            bt_copier_net=(
+                row["bt_copier_net"] if "bt_copier_net" in keys else None
+            ),
+            bt_at=int(row["bt_at"] or 0) if "bt_at" in keys else 0,
         )
 
     async def save_tracked_wallet(self, w: TrackedWallet) -> None:
@@ -357,6 +374,22 @@ class WalletMetricsDB:
                 1 if w.is_scalper else 0, w.promoted_at, w.demoted_at,
                 int(time.time()),
             ),
+        )
+        await self._conn.commit()
+
+    async def record_backtest_fitness(
+        self, address: str, *, latency_ratio: float | None,
+        copier_net: float | None,
+    ) -> None:
+        """Attach the latest /backtest verdict to a wallet (creating a
+        candidate row if the scout has never seen it)."""
+        existing = await self.get_tracked_wallet(address)
+        if existing is None:
+            await self.save_tracked_wallet(TrackedWallet(address=address))
+        await self._conn.execute(
+            "UPDATE tracked_wallets SET bt_latency_ratio=?, bt_copier_net=?, "
+            "bt_at=? WHERE address=?",
+            (latency_ratio, copier_net, int(time.time()), address),
         )
         await self._conn.commit()
 

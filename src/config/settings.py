@@ -376,6 +376,11 @@ class WalletCopyConfig:
     min_episodes: int = 5              # closed round-trips needed to score
     scalper_fills_per_day: float = 25.0
     dormant_hours: float = 96.0
+    # scoring v2 hard gates: minutes-scale confirm latency cannot harvest
+    # intraday edge, and a liquidated wallet has no stop discipline to copy
+    min_median_hold_min: float = 240.0   # < 4h median hold scores zero
+    hard_max_fills_per_day: float = 10.0
+    latency_ratio_min: float = 0.7       # replayed PnL@15m/PnL@0m below this = unfit
     # hysteresis (streaks are consecutive nightly runs)
     promote_score: float = 60.0
     promote_streak: int = 2
@@ -1033,6 +1038,13 @@ def load_config(
             wallet_yaml.get("scalper_fills_per_day", 25.0)
         ),
         dormant_hours=float(wallet_yaml.get("dormant_hours", 96.0)),
+        min_median_hold_min=float(
+            wallet_yaml.get("min_median_hold_min", 240.0)
+        ),
+        hard_max_fills_per_day=float(
+            wallet_yaml.get("hard_max_fills_per_day", 10.0)
+        ),
+        latency_ratio_min=float(wallet_yaml.get("latency_ratio_min", 0.7)),
         promote_score=float(wallet_yaml.get("promote_score", 60.0)),
         promote_streak=int(wallet_yaml.get("promote_streak", 2)),
         demote_score=float(wallet_yaml.get("demote_score", 45.0)),

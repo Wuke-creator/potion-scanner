@@ -120,6 +120,14 @@ class FillStats:
     hours_since_fill: float = 0.0
     coins: set[str] = field(default_factory=set)
     n_episodes: int = 0
+    # ---- scoring v2 inputs ----
+    liquidation_count: int = 0         # fills marked as liquidations
+    avg_win: float = 0.0
+    avg_loss: float = 0.0              # positive magnitude
+    pnl_skew: float | None = None      # standardized 3rd moment (>=10 eps)
+    sortino_like: float | None = None  # mean episode pnl / downside stdev
+    subwindow_pfs: list[float] = field(default_factory=list)  # 3 spans
+    daily_pnl: dict[str, float] = field(default_factory=dict)  # date -> net
 
 
 def _fill_signed_size(fill: dict) -> float:
@@ -233,10 +241,53 @@ def compute_fill_stats(
             peak = max(peak, cum)
             max_dd = max(max_dd, peak - cum)
         stats.max_drawdown_usd = max_dd
+        stats.avg_win = gross_win / len(wins) if wins else 0.0
+        stats.avg_loss = gross_loss / len(losses) if losses else 0.0
+        if len(episode_pnls) >= 10:
+            mean = sum(episode_pnls) / len(episode_pnls)
+            var = sum((p - mean) ** 2 for p in episode_pnls) / len(episode_pnls)
+            if var > 0:
+                stats.pnl_skew = (
+                    sum((p - mean) ** 3 for p in episode_pnls)
+                    / len(episode_pnls) / var ** 1.5
+                )
+            downside = [min(0.0, p - mean) for p in episode_pnls]
+            dvar = sum(d ** 2 for d in downside) / len(episode_pnls)
+            if dvar > 0:
+                stats.sortino_like = mean / dvar ** 0.5
     if episode_holds_min:
         stats.median_hold_min = statistics.median(episode_holds_min)
     if convictions:
         stats.conviction_median = statistics.median(convictions)
+
+    # ---- v2: liquidation fills, daily pnl series, sub-window PFs ----
+    for f in fills:
+        if "liquidat" in str(f.get("dir", "")).lower():
+            stats.liquidation_count += 1
+        try:
+            closed = float(f.get("closedPnl", 0.0))
+            fee = float(f.get("fee", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if closed or fee:
+            from datetime import datetime, timezone
+
+            day = datetime.fromtimestamp(
+                int(f.get("time", 0)) / 1000, tz=timezone.utc,
+            ).strftime("%Y-%m-%d")
+            stats.daily_pnl[day] = stats.daily_pnl.get(day, 0.0) + closed - fee
+    if len(episode_pnls) >= 9 and times[-1] > times[0]:
+        # 3 equal time sub-windows over the span; PF per window. Episodes
+        # are attributed by their close time order (episode_pnls is built
+        # per coin, so re-derive an approximate time order by thirds).
+        third = len(episode_pnls) // 3
+        for i in range(3):
+            chunk = episode_pnls[i * third:(i + 1) * third or None]
+            gw = sum(p for p in chunk if p > 0)
+            gl = abs(sum(p for p in chunk if p < 0))
+            stats.subwindow_pfs.append(
+                gw / gl if gl > 0 else (10.0 if gw > 0 else 0.0),
+            )
     return stats
 
 
@@ -252,25 +303,49 @@ def _clamp01(x: float) -> float:
 def copyability_score(
     row: LeaderboardRow, stats: FillStats, *, blofin_coverage: float,
     cfg: WalletCopyConfig,
+    btc_corr: float | None = None,
+    net_direction_ratio: float | None = None,
+    latency_fit: tuple[float, float] | None = None,   # (copier_net, ratio)
 ) -> float:
     """0-100. How copyable is this wallet, not how profitable.
 
-    Weighted components; then hard multiplicative penalties for the two
-    patterns that make copying structurally bad (scalping: our confirm
-    latency eats the edge; dormancy: nothing to copy).
+    v2: hard gates first (uncopyable patterns score zero outright), then
+    weighted components with downside/consistency metrics doing the work
+    and raw ROI/win-rate demoted to tie-breaker roles, then multiplicative
+    discounts for patterns that transfer badly to a copier (lucky skew,
+    high-WR trap, BTC beta in disguise, delta-neutral books, and simulated
+    copier PnL that dies at our confirm latency).
     """
     if stats.n_episodes < cfg.min_episodes:
         return 0.0
+    # ---- hard gates: structurally uncopyable at minutes-scale latency ----
+    if stats.liquidation_count > 0:
+        return 0.0   # a liquidated copy has no stop discipline to inherit
+    if (
+        stats.median_hold_min > 0
+        and stats.median_hold_min < cfg.min_median_hold_min
+    ):
+        return 0.0   # intraday edge cannot survive the confirm gate
+    if stats.fills_per_day > cfg.hard_max_fills_per_day:
+        return 0.0
 
-    # consistency across pnl windows (20)
+    # consistency (20): leaderboard windows + sub-window profit factors
     windows = [row.pnl.get("day", 0.0), row.pnl.get("week", 0.0),
                row.pnl.get("month", 0.0)]
     consistency = sum(1.0 for w in windows if w > 0) / len(windows)
+    if len(stats.subwindow_pfs) == 3:
+        pf_consistency = sum(1.0 for p in stats.subwindow_pfs if p > 1.0) / 3
+        consistency = 0.5 * consistency + 0.5 * pf_consistency
 
-    # trade quality: win rate + profit factor (25)
+    # trade quality (25): profit factor + downside-adjusted return;
+    # win rate only fills in when no sortino is computable (tie-breaker)
     wr = _clamp01((stats.win_rate - 0.40) / 0.25)          # 40% -> 0, 65% -> 1
     pf = _clamp01((stats.profit_factor - 1.0) / 1.5)       # 1.0 -> 0, 2.5 -> 1
-    quality = 0.5 * wr + 0.5 * pf
+    if stats.sortino_like is not None:
+        sortino = _clamp01(stats.sortino_like / 1.0)       # >=1.0 -> full
+        quality = 0.45 * pf + 0.35 * sortino + 0.20 * wr
+    else:
+        quality = 0.5 * wr + 0.5 * pf
 
     # drawdown vs account (15): 0% -> 1, >= 30% of account -> 0
     dd_pct = (
@@ -307,19 +382,37 @@ def copyability_score(
         score *= 0.3
     if stats.hours_since_fill > cfg.dormant_hours:
         score *= 0.5
+    # ---- v2 discounts ----
+    if stats.win_rate > 0.70 and stats.avg_loss > stats.avg_win > 0:
+        score *= 0.5   # high-WR trap: many small wins, occasional big loss
+    if stats.pnl_skew is not None and stats.pnl_skew < -1.0:
+        score *= 0.8   # left-tailed pnl: the loss that matters is rare + big
+    if btc_corr is not None and abs(btc_corr) > 0.7:
+        score *= 0.8   # leveraged beta dressed up as skill
+    if net_direction_ratio is not None and net_direction_ratio < 0.3:
+        score *= 0.5   # delta-neutral-ish book: one visible leg is not a trade
+    if latency_fit is not None:
+        copier_net, ratio = latency_fit
+        if copier_net <= 0 or ratio < cfg.latency_ratio_min:
+            score *= 0.2   # replay says OUR copy of them loses or decays
     return round(score, 2)
 
 
 def score_wallet_asof(
     row: LeaderboardRow, fills: list[dict], *, as_of_ms: int,
     blofin_coverage: float, cfg: WalletCopyConfig,
+    btc_corr: float | None = None,
+    net_direction_ratio: float | None = None,
+    latency_fit: tuple[float, float] | None = None,
 ) -> tuple[float, FillStats]:
     """Score a wallet as it would have been scored at as_of_ms.
 
     Point-in-time discipline for walk-forward validation: only fills at or
     before as_of_ms exist, and "now" (for dormancy) IS as_of_ms. The live
     scout is the degenerate case as_of_ms = now, so both paths share one
-    scorer and cannot drift.
+    scorer and cannot drift. The optional v2 signals (BTC correlation,
+    delta-neutral ratio, replayed latency fitness) are live-only extras:
+    when absent (walk-forward) the score simply skips those discounts.
     """
     past_fills = [f for f in fills if int(f.get("time", 0)) <= as_of_ms]
     stats = compute_fill_stats(
@@ -327,8 +420,25 @@ def score_wallet_asof(
     )
     score = copyability_score(
         row, stats, blofin_coverage=blofin_coverage, cfg=cfg,
+        btc_corr=btc_corr, net_direction_ratio=net_direction_ratio,
+        latency_fit=latency_fit,
     )
     return score, stats
+
+
+def pearson_corr(xs: list[float], ys: list[float]) -> float | None:
+    """Plain Pearson correlation; None below 10 points or zero variance."""
+    n = min(len(xs), len(ys))
+    if n < 10:
+        return None
+    xs, ys = xs[:n], ys[:n]
+    mx, my = sum(xs) / n, sum(ys) / n
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    vx = sum((x - mx) ** 2 for x in xs)
+    vy = sum((y - my) ** 2 for y in ys)
+    if vx <= 0 or vy <= 0:
+        return None
+    return cov / (vx * vy) ** 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +597,54 @@ class WalletScout:
             return set()
         return set(instruments or {})
 
+    async def _btc_daily_returns(self) -> dict[str, float]:
+        """BTC daily close-to-close returns keyed by date (beta discount)."""
+        import time as _time
+        from datetime import datetime, timezone
+
+        now_ms = int(_time.time() * 1000)
+        try:
+            candles = await self._info.get_candles(
+                "BTC", interval="1d",
+                start_ms=now_ms - 45 * 86_400_000, end_ms=now_ms,
+            )
+        except Exception:  # noqa: BLE001 - discount simply doesn't run
+            return {}
+        out: dict[str, float] = {}
+        prev_close = None
+        for c in candles:
+            try:
+                ts, close = int(c["t"]), float(c["c"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if prev_close and prev_close > 0:
+                day = datetime.fromtimestamp(
+                    ts / 1000, tz=timezone.utc,
+                ).strftime("%Y-%m-%d")
+                out[day] = close / prev_close - 1.0
+            prev_close = close
+        return out
+
+    async def _net_direction_ratio(self, address: str) -> float | None:
+        """|net signed notional| / gross notional over the wallet's live
+        positions. Near 0 with 2+ positions = delta-neutral-ish book; a
+        copier of one visible leg inherits naked directional risk the
+        leader doesn't have."""
+        try:
+            state = await self._info.get_clearinghouse_state(address)
+        except Exception:  # noqa: BLE001
+            return None
+        if len(state.positions) < 2:
+            return None
+        gross = sum(p.notional for p in state.positions.values())
+        if gross <= 0:
+            return None
+        net = sum(
+            p.notional * (1 if p.szi > 0 else -1)
+            for p in state.positions.values()
+        )
+        return abs(net) / gross
+
     async def run_once(self) -> dict:
         """One nightly pass. Returns a summary dict (also used by tests)."""
         await self._seed_if_empty()
@@ -499,6 +657,7 @@ class WalletScout:
         # Finalists: top screened + every current tracked/candidate wallet
         # (tracked wallets are ALWAYS re-verified so demotion works).
         known = await self._db.list_wallets()
+        existing_lookup = {w.address: w for w in known}
         finalist_addrs: list[str] = []
         for r in screened[: self._cfg.max_finalists]:
             finalist_addrs.append(r.address)
@@ -507,6 +666,7 @@ class WalletScout:
                 finalist_addrs.append(w.address)
 
         blofin_bases = await self._blofin_bases()
+        btc_daily = await self._btc_daily_returns()
         today: dict[str, tuple[float, bool]] = {}
         for addr in finalist_addrs:
             row = by_addr.get(addr.lower())
@@ -530,9 +690,36 @@ class WalletScout:
                 coverage = listed / len(probe.coins)
             else:
                 coverage = 0.0 if blofin_bases else 0.5  # unknown: neutral-ish
+            # v2 signals: BTC beta, delta-neutral book, replayed latency fit
+            probe_for_beta = compute_fill_stats(
+                fills, account_value=row.account_value,
+            )
+            btc_corr = None
+            if btc_daily and probe_for_beta.daily_pnl:
+                common = sorted(
+                    set(btc_daily) & set(probe_for_beta.daily_pnl),
+                )
+                btc_corr = pearson_corr(
+                    [probe_for_beta.daily_pnl[d] for d in common],
+                    [btc_daily[d] for d in common],
+                )
+            net_ratio = await self._net_direction_ratio(addr)
+            latency_fit = None
+            known_w = existing_lookup.get(addr)
+            if (
+                known_w is not None
+                and known_w.bt_at > time.time() - 30 * 86_400
+                and known_w.bt_copier_net is not None
+            ):
+                latency_fit = (
+                    float(known_w.bt_copier_net),
+                    float(known_w.bt_latency_ratio or 0.0),
+                )
             score, stats = score_wallet_asof(
                 row, fills, as_of_ms=int(time.time() * 1000),
                 blofin_coverage=coverage, cfg=self._cfg,
+                btc_corr=btc_corr, net_direction_ratio=net_ratio,
+                latency_fit=latency_fit,
             )
             is_scalper = stats.fills_per_day > self._cfg.scalper_fills_per_day
             today[addr] = (score, is_scalper)
