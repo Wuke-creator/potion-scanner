@@ -356,6 +356,65 @@ class BlofinClient:
                     return Decimal("0")
         return Decimal("0")
 
+    async def get_all_positions(self, creds: BlofinCreds) -> list[dict]:
+        """Every open position row on the account (risk guard + heat cap)."""
+        body = await self._private_request(
+            creds, "GET", "/api/v1/account/positions",
+        )
+        data = body.get("data") or []
+        return [r for r in data if isinstance(r, dict)]
+
+    async def get_funding_rate(self, inst_id: str) -> float | None:
+        """Current funding rate for one instrument (fraction per interval).
+        None when unavailable; the funding gate then simply doesn't run."""
+        try:
+            body = await self._public_get(
+                "/api/v1/market/funding-rate", params={"instId": inst_id},
+            )
+        except BlofinError:
+            return None
+        data = body.get("data") or []
+        row = data[0] if isinstance(data, list) and data else (
+            data if isinstance(data, dict) else {}
+        )
+        try:
+            return float(row.get("fundingRate"))
+        except (TypeError, ValueError):
+            return None
+
+    async def close_position_market(
+        self, creds: BlofinCreds, *, inst_id: str, side: str,
+        size_contracts: Decimal, margin_mode: str = "isolated",
+    ) -> OrderResult:
+        """Reduce-only market order: can only shrink/close a position,
+        never open or flip one. The mirror-exit path uses ONLY this."""
+        body_obj: dict[str, Any] = {
+            "instId": inst_id,
+            "marginMode": margin_mode,
+            "positionSide": "net",
+            "side": side,
+            "orderType": "market",
+            "size": _fmt_decimal(size_contracts),
+            "reduceOnly": "true",
+            "brokerId": CCXT_BROKER_ID,
+        }
+        body = await self._private_request(
+            creds, "POST", "/api/v1/trade/order", body_obj=body_obj,
+        )
+        data = body.get("data")
+        row = data[0] if isinstance(data, list) and data else (data or {})
+        if isinstance(row, dict):
+            inner_code = str(row.get("code", "0"))
+            if inner_code and inner_code != "0":
+                raise BlofinError(
+                    row.get("msg") or f"close code {inner_code}",
+                    code=inner_code,
+                )
+            order_id = str(row.get("orderId", ""))
+        else:
+            order_id = ""
+        return OrderResult(order_id=order_id, raw=body)
+
     async def set_leverage(
         self, creds: BlofinCreds, inst_id: str, leverage: int,
         *, margin_mode: str = "isolated",

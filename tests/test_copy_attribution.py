@@ -292,6 +292,7 @@ class TestWatcherPhase4:
         blofin.resolve_inst_id = AsyncMock(
             return_value=SimpleNamespace(inst_id="HYPE-USDT"),
         )
+        blofin.get_funding_rate = AsyncMock(return_value=None)
         dms: list[str] = []
 
         async def _dm(uid, text):

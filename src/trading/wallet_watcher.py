@@ -188,20 +188,27 @@ class WalletWatcher:
 
     async def poll_once(self) -> None:
         tracked = await self._db.list_wallets(status="tracked")
-        for w in tracked:
+        addresses = [w.address for w in tracked]
+        # Wind-down set: demoted/stopped leaders we still hold copies of.
+        # Their exits keep being mirrored/DM'd until we're flat, but the
+        # proposal path refuses them (stop-copy semantics, no orphans).
+        for leader in await self._db.leaders_with_open_copies():
+            if leader not in addresses:
+                addresses.append(leader)
+        for address in addresses:
             try:
-                await self._poll_wallet(w.address)
+                await self._poll_wallet(address)
             except HLInfoError as e:
                 logger.warning("watcher fetch failed for %s: %s",
-                               short_addr(w.address), e)
+                               short_addr(address), e)
             except Exception:
-                logger.exception("watcher crashed on %s", short_addr(w.address))
+                logger.exception("watcher crashed on %s", short_addr(address))
         # reconcile linked copy positions every ~20 polls (5 min at 15s)
         self._polls_since_reconcile += 1
         if self._polls_since_reconcile >= 20:
             self._polls_since_reconcile = 0
             try:
-                await self._reconcile_copy_trades(tracked)
+                await self._reconcile_copy_trades()
             except Exception:  # noqa: BLE001 - bookkeeping never kills polling
                 logger.exception("copy-trade reconciler crashed")
 
@@ -259,6 +266,10 @@ class WalletWatcher:
             "prev": d.prev_szi, "curr": d.curr_szi, "notional": d.notional,
         })
         if d.kind in ("open", "flip"):
+            if d.kind == "flip":
+                # the old side is gone: mirror it out before considering
+                # the new side (which stays confirm-gated as usual)
+                await self._mirror_close(address, d, reason="leader_flip")
             await self._maybe_propose_open(address, state, d)
         elif d.kind == "add":
             frac = (
@@ -271,7 +282,13 @@ class WalletWatcher:
                     f"{d.coin} {'long' if d.curr_szi > 0 else 'short'} "
                     f"(now ~${d.notional:,.0f}). FYI only, no proposal."
                 )
-        elif d.kind in ("reduce", "close"):
+        elif d.kind == "close":
+            mirrored = await self._mirror_close(
+                address, d, reason="leader_exit_mirror",
+            )
+            if not mirrored:
+                await self._notify_exit(address, d)
+        elif d.kind == "reduce":
             await self._notify_exit(address, d)
 
     async def _maybe_propose_open(
@@ -291,8 +308,16 @@ class WalletWatcher:
         # Every gate skip is shadow-logged: without skip records we cannot
         # tell later whether a wallet's edge died or our guards ate it.
 
-        # gate: scalper wallets' intraday churn is not copyable
+        # gate: only TRACKED wallets get proposals. Wind-down leaders (still
+        # polled because we hold their copies) mirror exits but never open.
         tw = await self._db.get_tracked_wallet(address)
+        if tw is None or tw.status != "tracked":
+            await self._db.log_event(address, d.coin, "skip_untracked", {
+                "side": side,
+            })
+            return
+
+        # gate: scalper wallets' intraday churn is not copyable
         if tw is not None and tw.is_scalper:
             await self._db.log_event(address, d.coin, "skip_scalper", {
                 "side": side, "notional": d.notional,
@@ -338,6 +363,46 @@ class WalletWatcher:
                 "side": side, "px": d.entry_px,
             })
             return
+
+        # gate: daily circuit breaker (realized copy losses today)
+        if self._cfg.daily_loss_stop_usd > 0:
+            midnight = int(time.time()) // 86_400 * 86_400
+            today_pnl = await self._db.realized_pnl_since(midnight)
+            if today_pnl <= -self._cfg.daily_loss_stop_usd:
+                await self._db.log_event(address, d.coin, "skip_breaker", {
+                    "side": side, "today_pnl": round(today_pnl, 2),
+                })
+                return
+
+        # gate: same-direction cluster cap (five alts long = one levered bet)
+        if self._cfg.max_same_direction > 0:
+            same = await self._db.open_same_direction_count(side)
+            if same >= self._cfg.max_same_direction:
+                await self._db.log_event(address, d.coin, "skip_direction", {
+                    "side": side, "open_same_direction": same,
+                })
+                return
+
+        # gate: portfolio heat cap (total open entry-to-stop risk)
+        if self._cfg.heat_cap_pct > 0 and self._venue is not None:
+            try:
+                heat = await self._db.open_copy_heat_usd()
+                if heat > 0:
+                    uid = next(iter(self._allowlist), None)
+                    if uid is not None:
+                        balance = await self._venue.get_balance(uid)
+                        cap = balance * self._cfg.heat_cap_pct / 100.0
+                        if heat >= cap > 0:
+                            await self._db.log_event(
+                                address, d.coin, "skip_heat", {
+                                    "side": side, "heat_usd": round(heat, 2),
+                                    "cap_usd": round(cap, 2),
+                                },
+                            )
+                            return
+            except Exception:  # noqa: BLE001 - heat check is best-effort
+                logger.warning("heat-cap check failed", exc_info=True)
+
         self._last_proposal[key] = now
 
         # derive our own protective levels from volatility
@@ -359,7 +424,6 @@ class WalletWatcher:
                 atr_mult=self._cfg.atr_mult,
             )
 
-        size_pct = round(conviction * 100.0, 2)
         leverage = int(d.leverage) if d.leverage and d.leverage > 0 else 0
         note_lines = [
             f"Their size: ~${d.notional:,.0f} "
@@ -372,6 +436,80 @@ class WalletWatcher:
                 "Could not compute ATR levels; NO stop attached. Set one "
                 "manually if you confirm."
             )
+
+        # ---- sizing: vol-targeted risk budget when enabled, else mirror
+        # the leader's equity fraction (both capped by user prefs downstream)
+        size_pct = round(conviction * 100.0, 2)
+        stop_frac = (
+            abs(entry - stop) / entry if (stop is not None and entry > 0) else 0.0
+        )
+        if self._cfg.risk_budget_pct > 0 and stop_frac > 0:
+            lev_used = leverage or self._cfg.copy_default_leverage or 1
+            budget_pct = self._cfg.risk_budget_pct
+            # leader conviction scales the budget, not the notional
+            conv_mult = min(2.0, max(0.5, conviction / 0.10))
+            budget_pct *= conv_mult
+            # quarter-Kelly cap from the wallet's replayed stats, when known
+            kelly = await self._kelly_fraction(address)
+            if kelly is not None and self._cfg.kelly_cap > 0:
+                budget_pct = min(budget_pct, self._cfg.kelly_cap * kelly * 100)
+            size_pct = round(
+                max(0.1, budget_pct / (lev_used * stop_frac * 100) * 100), 2,
+            )
+            note_lines.append(
+                f"Sized by risk budget: ~{budget_pct:.2f}% of balance at "
+                f"risk to the stop (not notional).",
+            )
+
+        # ---- volume-protection clamp: a punt far above the leader's own
+        # recent sizing is the revenge-trade pattern; cap, don't mirror it
+        if self._cfg.volume_clamp_mult > 0:
+            recent = await self._db.recent_proposal_sizes(address, limit=10)
+            if len(recent) >= 3:
+                cap_pct = self._cfg.volume_clamp_mult * (
+                    sum(recent) / len(recent)
+                )
+                if size_pct > cap_pct:
+                    note_lines.append(
+                        f"Size clamped from {size_pct:g}% to {cap_pct:.2f}% "
+                        f"({self._cfg.volume_clamp_mult:g}x their recent "
+                        "average): this open is far above their normal size.",
+                    )
+                    size_pct = round(cap_pct, 2)
+
+        # ---- funding gate: entering against strongly adverse funding
+        # bleeds a large share of the 1R target before price moves at all
+        if self._cfg.funding_gate_ratio > 0 and stop_frac > 0:
+            rate = None
+            try:
+                rate = await self._blofin.get_funding_rate(
+                    getattr(info, "inst_id", ""),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            if isinstance(rate, (int, float)):
+                adverse_rate = rate if is_long else -rate
+                hold_min = await self._expected_hold_min(address)
+                # Blofin funding settles every 8h
+                expected_frac = adverse_rate * (hold_min / (8 * 60.0))
+                threshold = self._cfg.funding_gate_ratio * stop_frac
+                if expected_frac > 2 * threshold:
+                    await self._db.log_event(address, d.coin, "skip_funding", {
+                        "side": side, "rate": rate,
+                        "expected_frac": round(expected_frac, 5),
+                    })
+                    return
+                if expected_frac > threshold:
+                    size_pct = round(size_pct / 2, 2)
+                    note_lines.append(
+                        f"Funding is adverse ({rate * 100:.3f}%/8h): size "
+                        "halved.",
+                    )
+                elif adverse_rate > 0:
+                    note_lines.append(
+                        f"Funding: {rate * 100:.3f}%/8h against this side "
+                        "over the hold.",
+                    )
         sig = SimpleNamespace(
             pair=f"{base}/USDT",
             side=side,
@@ -439,15 +577,111 @@ class WalletWatcher:
             f"automatically).{linked}"
         )
 
-    async def _reconcile_copy_trades(self, tracked) -> None:
+    async def _kelly_fraction(self, address: str) -> float | None:
+        """Kelly f from the wallet's latest verified stats; None unknown.
+        payoff b = avg win / avg loss, recovered from PF and win rate."""
+        m = await self._db.latest_metrics(address)
+        if m is None or not (0 < m.win_rate < 1) or m.profit_factor <= 0:
+            return None
+        b = m.profit_factor * (1 - m.win_rate) / m.win_rate
+        if b <= 0:
+            return None
+        f = m.win_rate - (1 - m.win_rate) / b
+        return max(0.0, min(1.0, f)) if f > 0 else None
+
+    async def _expected_hold_min(self, address: str) -> float:
+        m = await self._db.latest_metrics(address)
+        if m is not None and m.median_hold_min > 0:
+            return m.median_hold_min
+        return 480.0   # unknown: assume an 8h swing hold
+
+    async def _mirror_close(
+        self, address: str, d: PositionDelta, *, reason: str,
+    ) -> bool:
+        """Auto-close our linked copies when the leader fully exits.
+
+        Only runs behind WALLET_MIRROR_EXITS and only ever places
+        REDUCE-ONLY market orders (can shrink, can never open or flip).
+        Returns True when at least one copy was closed, so the caller can
+        swap the "consider closing" DM for the fill report. A failed close
+        falls back to an urgent DM: never silent."""
+        if not self._cfg.mirror_exits or self._venue is None:
+            return False
+        links = await self._db.open_copy_trades(address, d.coin)
+        if not links:
+            return False
+        label = short_addr(address)
+        closed_any = False
+        for t in links:
+            pair = f"{hl_coin_to_blofin_base(t.coin)}/USDT"
+            try:
+                res = await self._venue.close_position(
+                    t.telegram_user_id, pair=pair, fraction=1.0,
+                )
+            except Exception as e:  # noqa: BLE001 - always surface, never silent
+                await self._notify_all(
+                    f"MIRROR CLOSE FAILED for your {t.coin} copy "
+                    f"(order {t.order_ref or '?'}): {e}. Close it manually.",
+                )
+                continue
+            pnl = None
+            close_px = float(getattr(res, "entry_price", 0.0) or 0.0)
+            if close_px > 0 and t.entry_price and t.size_base:
+                direction = 1.0 if t.side == "LONG" else -1.0
+                pnl = (close_px - float(t.entry_price)) * float(t.size_base) * direction
+            await self._db.close_copy_trade(
+                t.id, close_reason=reason, realized_pnl=pnl,
+            )
+            await self._db.log_event(address, t.coin, "mirror_close", {
+                "ref": res.ref, "pnl": pnl, "reason": reason,
+            })
+            pnl_txt = f", est. pnl ${pnl:+,.2f}" if pnl is not None else ""
+            await self._notify_all(
+                f"Mirror exit: closed your {t.coin} copy at market "
+                f"(order {res.ref}{pnl_txt}) because {label} exited.",
+            )
+            closed_any = True
+        if closed_any:
+            await self._check_leader_stop(address)
+        return closed_any
+
+    async def _check_leader_stop(self, address: str) -> None:
+        """Cumulative copy-loss stop per leader: breach -> auto-untrack.
+        New copies stop; open ones keep being mirrored until flat."""
+        if self._cfg.leader_stop_usd <= 0:
+            return
+        tw = await self._db.get_tracked_wallet(address)
+        if tw is None or tw.status != "tracked":
+            return
+        since = tw.promoted_at or 0
+        pnl = await self._db.leader_realized_pnl(address, since_ts=since)
+        if pnl > -self._cfg.leader_stop_usd:
+            return
+        tw.status = "candidate"
+        tw.demoted_at = int(time.time())
+        tw.streak_above = 0
+        await self._db.save_tracked_wallet(tw)
+        await self._db.log_event(address, "*", "leader_stop", {
+            "realized_pnl": round(pnl, 2),
+            "stop_usd": self._cfg.leader_stop_usd,
+        })
+        await self._notify_all(
+            f"LEADER STOP: copies of {short_addr(address)} have lost "
+            f"${-pnl:,.2f} since tracking began (limit "
+            f"${self._cfg.leader_stop_usd:,.0f}). Stopped copying them: no "
+            f"new proposals; any open copies keep being mirrored/DM'd until "
+            f"flat. The scout can re-promote later only on fresh evidence.",
+        )
+
+    async def _reconcile_copy_trades(self) -> None:
         """Mark linked copies whose venue position vanished without a
         recorded close as closed_unreconciled (manual close). Their pnl is
         unknown and they are EXCLUDED from per-leader stop sums rather than
         guessed."""
         if self._venue is None:
             return
-        for w in tracked:
-            links = await self._db.open_copy_trades(w.address)
+        for leader in await self._db.leaders_with_open_copies():
+            links = await self._db.open_copy_trades(leader)
             for t in links:
                 pair = f"{hl_coin_to_blofin_base(t.coin)}/USDT"
                 try:
@@ -462,7 +696,7 @@ class WalletWatcher:
                         realized_pnl=None, status="closed_unreconciled",
                     )
                     await self._db.log_event(
-                        w.address, t.coin, "copy_unreconciled",
+                        leader, t.coin, "copy_unreconciled",
                         {"order_ref": t.order_ref},
                     )
                     await self._notify_all(

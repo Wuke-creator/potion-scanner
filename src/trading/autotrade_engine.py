@@ -214,6 +214,7 @@ class AutotradeEngine:
                         proposal_id=int(synthetic.id),
                         proposal_price=meta.get("proposal_price"),
                         atr_at_proposal=meta.get("atr"),
+                        stop_price=getattr(synthetic, "stop_loss", None),
                     )
                 proposed_any = True
                 override = getattr(sig, "size_pct_override", None)
@@ -327,11 +328,13 @@ class AutotradeEngine:
         if self._copy_store is None:
             return
         try:
+            entry_price = float(getattr(result, "entry_price", 0.0) or 0.0)
             await self._copy_store.mark_copy_trade_filled(
                 int(synthetic.id), uid,
                 order_ref=str(getattr(result, "ref", "") or ""),
                 size_base=float(getattr(result, "size", 0.0) or 0.0),
                 leverage=None,
+                entry_price=entry_price if entry_price > 0 else None,
             )
         except Exception:  # noqa: BLE001
             logger.warning("copy_trades fill update failed", exc_info=True)

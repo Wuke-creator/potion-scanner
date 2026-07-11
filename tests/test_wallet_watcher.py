@@ -157,6 +157,7 @@ def _make_watcher(db, *, states, listed=True, cfg=None, candles=None):
     blofin.resolve_inst_id = AsyncMock(
         return_value=object() if listed else None,
     )
+    blofin.get_funding_rate = AsyncMock(return_value=None)
     dms: list[str] = []
 
     async def _dm(uid, text):

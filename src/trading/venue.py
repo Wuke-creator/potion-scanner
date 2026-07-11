@@ -75,6 +75,7 @@ class VenueResult:
     tp_ok: bool = True
     ref: str = ""         # order id / oid for the DM
     tp_legs: list = field(default_factory=list)   # (price, size) legs actually placed
+    entry_price: float = 0.0   # plan price at placement (attribution/pnl est.)
 
 
 @runtime_checkable
@@ -100,6 +101,9 @@ class Venue(Protocol):
     async def get_account_snapshot(self, uid: int) -> AccountSnapshot | None: ...
     async def get_price(self, pair: str) -> float: ...
     async def get_open_position(self, uid: int, pair: str) -> float: ...
+    async def close_position(
+        self, uid: int, *, pair: str, fraction: float,
+    ) -> VenueResult: ...
 
 
 def cap_leverage(requested: int, asset_max: int, caller_max: int) -> int:
@@ -232,6 +236,7 @@ class HyperliquidVenue:
         return VenueResult(
             coin=res.coin, size=res.size, sl_ok=res.sl_ok, tp_ok=res.tp_ok,
             ref=str(res.entry_oid or ""), tp_legs=tp_legs,
+            entry_price=plan.price,
         )
 
     async def mark_success(self, uid: int) -> None:
@@ -261,6 +266,11 @@ class HyperliquidVenue:
     async def get_open_position(self, uid: int, pair: str) -> float:
         raise VenueError("position lookup not supported on hyperliquid yet")
 
+    async def close_position(
+        self, uid: int, *, pair: str, fraction: float,
+    ) -> VenueResult:
+        raise VenueError("mirror close not supported on hyperliquid yet")
+
 
 # ---------------------------------------------------------------------------
 # Blofin
@@ -276,7 +286,7 @@ class BlofinVenue:
     """
 
     name = "blofin"
-    supports_risk_guard = False   # account snapshot not wired for Blofin yet
+    supports_risk_guard = True    # account snapshot via /account/positions
 
     def __init__(
         self, client, creds_db, *, margin_mode: str = "isolated",
@@ -400,7 +410,7 @@ class BlofinVenue:
 
         return VenueResult(
             coin=plan.coin, size=plan.size, sl_ok=sl_ok, tp_ok=tp_ok,
-            ref=res.order_id, tp_legs=placed,
+            ref=res.order_id, tp_legs=placed, entry_price=plan.price,
         )
 
     async def place_tp_ladder(
@@ -473,11 +483,95 @@ class BlofinVenue:
             return 0.0
         return float(await self._client.get_position(c, info.inst_id))
 
+    async def close_position(
+        self, uid: int, *, pair: str, fraction: float,
+    ) -> VenueResult:
+        """Reduce-only market close of `fraction` of the live position.
+
+        Reads the CURRENT venue position (not our records) so it works
+        whatever else happened to the position, and floors to the lot so
+        it can never oversize. Raises VenueError when flat.
+        """
+        from src.trading.blofin_client import BlofinError
+
+        fraction = max(0.0, min(1.0, float(fraction)))
+        if fraction <= 0:
+            raise VenueError("nothing to close (fraction 0)")
+        c = await self._creds_or_raise(uid)
+        base = pair.split("/")[0].strip().upper()
+        info = await self._client.resolve_inst_id(base)
+        if info is None:
+            raise VenueError(f"{base} is not listed on Blofin")
+        pos = await self._client.get_position(c, info.inst_id)
+        if pos == 0:
+            raise VenueError(f"no open {base} position to close")
+        lot = info.lot_size if info.lot_size > 0 else Decimal("1")
+        contracts = (abs(pos) * Decimal(str(fraction)) / lot).to_integral_value(
+            rounding=ROUND_DOWN,
+        ) * lot
+        if fraction >= 0.999:      # full close: never leave lot dust behind
+            contracts = abs(pos)
+        if contracts <= 0:
+            raise VenueError(f"{base} close size rounds to zero")
+        close_side = "sell" if pos > 0 else "buy"
+        try:
+            res = await self._client.close_position_market(
+                c, inst_id=info.inst_id, side=close_side,
+                size_contracts=contracts, margin_mode=self._margin_mode,
+            )
+        except BlofinError as e:
+            raise VenueError(str(e)) from e
+        px = 0.0
+        try:
+            px = await self._client.get_last_price(info.inst_id)
+        except Exception:  # noqa: BLE001 - price is informational here
+            pass
+        return VenueResult(
+            coin=base, size=float(contracts * info.contract_value),
+            ref=res.order_id, entry_price=px,
+        )
+
     async def get_account_snapshot(self, uid: int) -> AccountSnapshot | None:
-        # Not wired for Blofin; supports_risk_guard is False so the engine
-        # never calls this. Explicit rather than a misleading empty snapshot.
-        raise NotImplementedError(
-            "Blofin account snapshot not implemented; risk guard is off for Blofin"
+        """Equity + per-coin open notional from the positions endpoint.
+
+        equity ~= available USDT + sum(position margin) + sum(unrealized
+        pnl). Tolerant of missing fields; a row that cannot be priced
+        contributes margin but no notional (conservative for exposure
+        limits would be the opposite, so unpriceable rows fall back to
+        margin x leverage as a notional estimate).
+        """
+        c = await self._creds_or_raise(uid)
+        available = await self._client.get_available_usdt(c)
+        rows = await self._client.get_all_positions(c)
+
+        def _f(v, d=0.0):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return d
+
+        positions: dict[str, float] = {}
+        margin_total = 0.0
+        upl_total = 0.0
+        for r in rows:
+            inst = str(r.get("instId", ""))
+            coin = inst.split("-")[0] if inst else ""
+            contracts = abs(_f(r.get("positions")))
+            if not coin or contracts == 0:
+                continue
+            margin = _f(r.get("margin")) or _f(r.get("initialMargin"))
+            upl = _f(r.get("unrealizedPnl"))
+            mark = _f(r.get("markPrice")) or _f(r.get("averagePrice"))
+            lev = _f(r.get("leverage"), 1.0) or 1.0
+            info = await self._client.resolve_inst_id(coin)
+            cv = float(info.contract_value) if info is not None else 0.0
+            notional = contracts * cv * mark if (cv and mark) else margin * lev
+            positions[coin] = positions.get(coin, 0.0) + abs(notional)
+            margin_total += margin
+            upl_total += upl
+        return AccountSnapshot(
+            account_value=max(0.0, available + margin_total + upl_total),
+            positions=positions,
         )
 
 

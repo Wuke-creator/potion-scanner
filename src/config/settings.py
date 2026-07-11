@@ -393,9 +393,20 @@ class WalletCopyConfig:
     atr_period: int = 14
     atr_interval: str = "1h"
     atr_mult: float = 1.5
-    # reserved: auto-reduce when the wallet exits. NOT implemented; exits
-    # are DM-only until Luke explicitly asks for the feature.
+    # Auto-mirror exits (WALLET_MIRROR_EXITS): when the tracked wallet fully
+    # closes/flips a coin we hold a linked copy of, close ours reduce-only
+    # at market within one poll tick. Partial reduces stay DM-only. Default
+    # OFF: exits are DMs until Luke explicitly flips the flag.
     mirror_exits: bool = False
+    # ---- automated risk layer (each 0/off by default where marked) ----
+    leader_stop_usd: float = 0.0        # cum. copy loss per leader -> untrack (0=off)
+    daily_loss_stop_usd: float = 0.0    # sleeve realized loss today -> no new proposals (0=off)
+    heat_cap_pct: float = 6.0           # total open entry-to-stop risk vs balance
+    max_same_direction: int = 3         # open copies pointing the same way
+    volume_clamp_mult: float = 3.0      # cap size vs leader's own recent sizing (0=off)
+    funding_gate_ratio: float = 0.25    # expected funding vs 1R: halve above 1x, skip above 2x (0=off)
+    risk_budget_pct: float = 0.0        # vol-targeted sizing: risk this % of balance per trade (0=legacy conviction sizing)
+    kelly_cap: float = 0.25             # cap risk budget at this fraction of Kelly f
     # first-run seed: the manually vetted wallets, tracked from day one
     seed_addresses: tuple[str, ...] = (
         "0xadd12adbbd5db87674b38af99b6dd34dd2a45e0d",
@@ -1050,7 +1061,31 @@ def load_config(
         atr_mult=float(
             os.getenv("WALLET_ATR_MULT", wallet_yaml.get("atr_mult", 1.5))
         ),
-        mirror_exits=False,   # reserved; intentionally not env-readable yet
+        mirror_exits=os.getenv("WALLET_MIRROR_EXITS", "").strip().lower()
+        in ("1", "true", "yes"),
+        leader_stop_usd=float(
+            os.getenv("WALLET_LEADER_STOP_USD",
+                      wallet_yaml.get("leader_stop_usd", 0.0))
+        ),
+        daily_loss_stop_usd=float(
+            os.getenv("WALLET_DAILY_LOSS_STOP_USD",
+                      wallet_yaml.get("daily_loss_stop_usd", 0.0))
+        ),
+        heat_cap_pct=float(
+            os.getenv("WALLET_HEAT_CAP_PCT",
+                      wallet_yaml.get("heat_cap_pct", 6.0))
+        ),
+        max_same_direction=int(wallet_yaml.get("max_same_direction", 3)),
+        volume_clamp_mult=float(wallet_yaml.get("volume_clamp_mult", 3.0)),
+        funding_gate_ratio=float(
+            os.getenv("WALLET_FUNDING_GATE_RATIO",
+                      wallet_yaml.get("funding_gate_ratio", 0.25))
+        ),
+        risk_budget_pct=float(
+            os.getenv("WALLET_RISK_BUDGET_PCT",
+                      wallet_yaml.get("risk_budget_pct", 0.0))
+        ),
+        kelly_cap=float(wallet_yaml.get("kelly_cap", 0.25)),
         seed_addresses=_seed,
     )
 

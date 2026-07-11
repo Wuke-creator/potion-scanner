@@ -111,7 +111,8 @@ CREATE TABLE IF NOT EXISTS copy_trades (
   status           TEXT NOT NULL DEFAULT 'proposed',
   closed_at        INTEGER,
   realized_pnl     REAL,
-  close_reason     TEXT NOT NULL DEFAULT ''
+  close_reason     TEXT NOT NULL DEFAULT '',
+  stop_price       REAL
 );
 CREATE INDEX IF NOT EXISTS idx_copy_trades_leader
   ON copy_trades(leader_address, status);
@@ -195,6 +196,7 @@ class CopyTrade:
     closed_at: int | None = None
     realized_pnl: float | None = None
     close_reason: str = ""
+    stop_price: float | None = None
 
 
 class WalletMetricsDB:
@@ -207,7 +209,18 @@ class WalletMetricsDB:
         self._db = await aiosqlite.connect(self._db_path)
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(_DDL)
+        # additive migration for dbs created before the column existed
+        await self._ensure_column("copy_trades", "stop_price", "REAL")
         await self._db.commit()
+
+    async def _ensure_column(self, table: str, column: str, decl: str) -> None:
+        assert self._db is not None
+        cur = await self._db.execute(f"PRAGMA table_info({table})")
+        cols = {r["name"] for r in await cur.fetchall()}
+        if column not in cols:
+            await self._db.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {decl}",
+            )
 
     async def close(self) -> None:
         if self._db is not None:
@@ -414,15 +427,17 @@ class WalletMetricsDB:
         self, *, leader_address: str, coin: str, inst_id: str,
         telegram_user_id: int, side: str, proposal_id: int,
         proposal_price: float | None, atr_at_proposal: float | None,
+        stop_price: float | None = None,
     ) -> int:
         cur = await self._conn.execute(
             "INSERT INTO copy_trades (leader_address, coin, inst_id, "
             "telegram_user_id, side, proposal_id, proposed_at, "
-            "proposal_price, atr_at_proposal) VALUES (?,?,?,?,?,?,?,?,?)",
+            "proposal_price, atr_at_proposal, stop_price) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (
                 leader_address.lower(), coin, inst_id, telegram_user_id,
                 side, proposal_id, int(time.time()), proposal_price,
-                atr_at_proposal,
+                atr_at_proposal, stop_price,
             ),
         )
         await self._conn.commit()
@@ -492,6 +507,70 @@ class WalletMetricsDB:
             (status, int(time.time()), realized_pnl, close_reason, trade_id),
         )
         await self._conn.commit()
+
+    async def realized_pnl_since(self, since_ts: int) -> float:
+        """Sleeve-wide recorded realized pnl since a timestamp (daily
+        circuit breaker input). Unreconciled NULL-pnl rows excluded."""
+        cur = await self._conn.execute(
+            "SELECT COALESCE(SUM(realized_pnl), 0) AS s FROM copy_trades "
+            "WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL",
+            (since_ts,),
+        )
+        row = await cur.fetchone()
+        return float(row["s"] if row else 0.0)
+
+    async def open_copy_heat_usd(self) -> float:
+        """Total open entry-to-stop risk across ALL filled copies, $."""
+        cur = await self._conn.execute(
+            "SELECT entry_price, proposal_price, stop_price, size_base "
+            "FROM copy_trades WHERE status='filled'",
+        )
+        heat = 0.0
+        for r in await cur.fetchall():
+            entry = r["entry_price"] or r["proposal_price"]
+            stop = r["stop_price"]
+            size = r["size_base"]
+            if entry and stop and size:
+                heat += abs(float(entry) - float(stop)) * float(size)
+        return heat
+
+    async def open_same_direction_count(self, side: str) -> int:
+        cur = await self._conn.execute(
+            "SELECT COUNT(*) AS n FROM copy_trades WHERE status='filled' "
+            "AND side=?",
+            (side,),
+        )
+        row = await cur.fetchone()
+        return int(row["n"] if row else 0)
+
+    async def recent_proposal_sizes(
+        self, leader_address: str, limit: int = 10,
+    ) -> list[float]:
+        """size_pct of the leader's last N proposals (volume clamp input)."""
+        cur = await self._conn.execute(
+            "SELECT detail FROM watcher_events WHERE address=? AND "
+            "kind='proposed' ORDER BY id DESC LIMIT ?",
+            (leader_address, limit),
+        )
+        out: list[float] = []
+        for r in await cur.fetchall():
+            try:
+                d = json.loads(r["detail"])
+                v = float(d.get("size_pct", 0.0))
+                if v > 0:
+                    out.append(v)
+            except (ValueError, TypeError):
+                continue
+        return out
+
+    async def leaders_with_open_copies(self) -> list[str]:
+        """Leaders we still hold filled copies of (wind-down mirroring
+        continues for these even after demotion)."""
+        cur = await self._conn.execute(
+            "SELECT DISTINCT leader_address FROM copy_trades "
+            "WHERE status='filled'",
+        )
+        return [r["leader_address"] for r in await cur.fetchall()]
 
     async def leader_realized_pnl(
         self, leader_address: str, *, since_ts: int = 0,
