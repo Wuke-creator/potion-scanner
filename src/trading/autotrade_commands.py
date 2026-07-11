@@ -219,6 +219,17 @@ class AutotradeCommands:
             await self._fire(uid, args, ctx, reply)
         elif sub == "tps":
             await self._tps(uid, args, ctx, reply)
+        elif sub == "copy":
+            if self._engine is None:
+                await reply("Copying is not available on this bot.")
+            elif len(args) >= 2 and args[1] == "confirm":
+                await self._engine.confirm_copy(uid)
+            else:
+                await reply(
+                    "When a tracked caller posts an entry, you get a DM "
+                    "preview. Reply /autotrade copy confirm within 15 min "
+                    "to place it."
+                )
         elif sub == "size":
             await self._set_size(uid, args, reply)
         elif sub == "disconnect":
@@ -239,6 +250,7 @@ class AutotradeCommands:
                 "/autotrade size <pct> - set percent of balance per trade\n"
                 "/autotrade fire <coin> <long|short> [lev] [sl] - manually place one trade\n"
                 "/autotrade tps <coin> [px1 px2 px3] - ladder TPs onto an open position\n"
+                "/autotrade copy confirm - place the call from your latest copy DM\n"
                 "/autotrade off - stop\n"
                 "/autotrade disconnect - wipe key + stop"
             )

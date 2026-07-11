@@ -320,6 +320,14 @@ class AutotradeConfig:
     # default so the bulk is banked at the nearest target). AUTOTRADE_TP_SPLIT
     # accepts "50/30/20" or "0.5,0.3,0.2".
     tp_split_weights: tuple[float, ...] = (0.5, 0.3, 0.2)
+    # Confirm-gated copying of discretionary human calls (cabal-chat).
+    # Unlike source_channel_key (machine format, auto-fires), the copy
+    # channel's posts parse tolerantly and NEVER fire without the user's
+    # /autotrade copy confirm. Authors filter matches Discord user id OR
+    # username; empty = any non-bot author.
+    copy_channel_key: str = "cabal"
+    copy_authors: frozenset[str] = field(default_factory=frozenset)
+    copy_default_leverage: int = 5   # when the call says "low lev" w/o a number
     # Account-level risk guard (passivbot-derived; src/trading/autotrade_risk.py).
     # Only runs when risk_enabled AND the venue can supply an account snapshot
     # (Hyperliquid yes, Blofin not yet). Wallet exposure = notional / account
@@ -842,6 +850,18 @@ def load_config(
             int(autotrade_yaml.get("slippage_bps", 100)),
         ),
         tp_split_weights=_tp_weights,
+        copy_channel_key=os.getenv(
+            "AUTOTRADE_COPY_CHANNEL_KEY",
+            autotrade_yaml.get("copy_channel_key", "cabal"),
+        ).strip(),
+        copy_authors=frozenset(
+            a.strip() for a in os.getenv("AUTOTRADE_COPY_AUTHORS", "").split(",")
+            if a.strip()
+        ),
+        copy_default_leverage=_env_int(
+            "AUTOTRADE_COPY_DEFAULT_LEVERAGE",
+            int(autotrade_yaml.get("copy_default_leverage", 5)),
+        ),
         risk_enabled=os.getenv(
             "AUTOTRADE_RISK_ENABLED",
             str(autotrade_yaml.get("risk_enabled", "true")),

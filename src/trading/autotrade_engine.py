@@ -37,6 +37,10 @@ _MANAGE_URL = {
     "blofin": "blofin.com",
 }
 
+# How long a parsed cabal call stays confirmable. Discretionary swing calls
+# are actionable for a while; stale ones must not fire hours later.
+_COPY_TTL_SEC = 15 * 60
+
 
 def _fmt_num(value: float) -> str:
     return f"{value:g}"
@@ -66,6 +70,10 @@ class AutotradeEngine:
             and getattr(venue, "supports_risk_guard", False)
         )
         self._risk = AutotradeRiskGuard(config=config, venue=venue, prefs_db=prefs_db)
+        # uid -> (synthetic signal, expires_at). Confirm-gated copy proposals
+        # from discretionary channels (cabal). In-memory by design: a restart
+        # drops pending proposals rather than firing stale ones.
+        self._pending_copies: dict[int, tuple[object, float]] = {}
 
     async def on_new_signal(self, signal) -> None:
         """Entry point from the router. Never raises into the caller."""
@@ -114,6 +122,110 @@ class AutotradeEngine:
         except Exception:  # noqa: BLE001
             logger.exception("manual_fire crashed for user=%s", uid)
             await self._dm(uid, "Manual fire hit an unexpected error.")
+
+    async def propose_copy(self, sig, *, source: str = "cabal") -> None:
+        """Confirm-gated copy for discretionary calls (cabal-chat).
+
+        Human-typed calls parse tolerantly, so nothing fires by itself: each
+        eligible user gets a DM preview and must reply /autotrade copy
+        confirm within the TTL. Never raises into the router.
+        """
+        import time
+
+        if not self._config.enabled or not self._config.allowlist:
+            return
+        side = (getattr(sig, "side", "") or "").strip().upper()
+        if side not in ("LONG", "SHORT"):
+            return
+        leverage = getattr(sig, "leverage", None) or self._config.copy_default_leverage
+        tps = list(getattr(sig, "take_profits", None) or [])
+        from types import SimpleNamespace
+
+        synthetic = SimpleNamespace(
+            id=int(time.time() * 1000),
+            pair=getattr(sig, "pair", ""),
+            side=side,
+            leverage=int(leverage),
+            tp1=tps[0] if len(tps) > 0 else None,
+            tp2=tps[1] if len(tps) > 1 else None,
+            tp3=tps[2] if len(tps) > 2 else None,
+            stop_loss=getattr(sig, "stop_loss", None),
+        )
+        for uid in self._config.allowlist:
+            try:
+                prefs = await self._copy_eligible(uid)
+                if prefs is None:
+                    continue
+                self._pending_copies[uid] = (synthetic, time.time() + _COPY_TTL_SEC)
+                await self._dm(
+                    uid, self._fmt_copy_preview(sig, leverage, source, prefs.size_pct),
+                )
+            except Exception:  # noqa: BLE001 - isolate per user
+                logger.exception("propose_copy failed for user=%s", uid)
+
+    async def confirm_copy(self, uid: int) -> bool:
+        """Fire the pending copy proposal for this user. True if placed."""
+        import time
+
+        pend = self._pending_copies.get(uid)
+        if pend is None:
+            await self._dm(uid, "No pending call to copy (or it expired).")
+            return False
+        synthetic, expires = pend
+        if time.time() > expires:
+            self._pending_copies.pop(uid, None)
+            await self._dm(uid, "That call expired (15 min limit). Not placed.")
+            return False
+        self._pending_copies.pop(uid, None)
+        try:
+            await self._maybe_fire(uid, synthetic, int(synthetic.id), synthetic.side)
+            return True
+        except Exception:  # noqa: BLE001
+            logger.exception("confirm_copy crashed for user=%s", uid)
+            await self._dm(uid, "Copy hit an unexpected error.")
+            return False
+
+    async def _copy_eligible(self, uid: int):
+        """Prefs for an eligible user, else None."""
+        verified = await self._verification_db.get_verified(uid)
+        if verified is None or not verified.is_active:
+            return None
+        conn = await self._venue.get_connection(uid)
+        if conn is None or not conn.is_active:
+            return None
+        prefs = await self._prefs_db.get_or_default(
+            uid, default_pct=self._config.default_size_pct,
+        )
+        return prefs if prefs.ready else None
+
+    def _fmt_copy_preview(
+        self, sig, leverage: int, source: str, size_pct: float,
+    ) -> str:
+        entry = getattr(sig, "entry", None)
+        tps = list(getattr(sig, "take_profits", None) or [])
+        lines = [
+            f"Call detected in {source}:",
+            f"{getattr(sig, 'pair', '?')} {getattr(sig, 'side', '?')} {leverage}x"
+            + (" (their leverage)" if getattr(sig, "leverage", None) else
+               " (default; caller said low lev)"),
+            f"Entry: {'market' if entry is None else _fmt_num(entry)}",
+        ]
+        sl = getattr(sig, "stop_loss", None)
+        if sl is not None:
+            cond = " (conditional in the call - our stop is a hard price)" if getattr(
+                sig, "stop_is_conditional", False) else ""
+            lines.append(f"SL {_fmt_num(sl)}{cond}")
+        if tps:
+            lines.append("TPs: " + " / ".join(_fmt_num(t) for t in tps))
+        else:
+            lines.append("TPs: none stated - entry + stop only")
+        if getattr(sig, "side_inferred", False):
+            lines.append("(direction inferred from the stop vs entry)")
+        lines.append(
+            "\nReply /autotrade copy confirm within 15 min to place it "
+            f"at your {size_pct:g}% size."
+        )
+        return "\n".join(lines)
 
     async def apply_tps(
         self, uid: int, *, pair: str, take_profits: list[float],

@@ -279,6 +279,73 @@ class TestApplyTps:
         send_dm.assert_not_called()
 
 
+class TestCopyProposals:
+    def _cabal_sig(self, **kw):
+        from src.parser.cabal_parser import CabalSignal
+        base = dict(
+            pair="RUNE/USDT", side="LONG", entry=0.3895, stop_loss=0.3650,
+            stop_is_conditional=True, take_profits=[0.4030, 0.4650],
+            leverage=None,
+        )
+        base.update(kw)
+        return CabalSignal(**base)
+
+    @pytest.mark.asyncio
+    async def test_propose_dms_and_confirm_places(self, prefs_db):
+        engine, venue, send_dm = _make_engine(prefs_db, dry_run=False)
+        await _opt_in(prefs_db)
+        await engine.propose_copy(self._cabal_sig(), source="Cabal Chat")
+        assert send_dm.await_count == 1
+        preview = send_dm.await_args.args[1]
+        assert "RUNE/USDT LONG 5x" in preview          # default leverage
+        assert "conditional" in preview                 # SL caveat surfaced
+        venue.place.assert_not_called()                 # nothing fired yet
+
+        ok = await engine.confirm_copy(UID)
+        assert ok is True
+        venue.place.assert_awaited_once()
+        kw = venue.place.await_args.kwargs
+        assert kw["take_profits"] == [0.4030, 0.4650]
+        assert kw["stop_loss"] == 0.3650
+
+    @pytest.mark.asyncio
+    async def test_stated_leverage_copied(self, prefs_db):
+        engine, venue, send_dm = _make_engine(prefs_db, dry_run=False)
+        await _opt_in(prefs_db)
+        await engine.propose_copy(self._cabal_sig(leverage=20))
+        assert "20x" in send_dm.await_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_confirm_without_proposal(self, prefs_db):
+        engine, venue, send_dm = _make_engine(prefs_db, dry_run=False)
+        await _opt_in(prefs_db)
+        ok = await engine.confirm_copy(UID)
+        assert ok is False
+        venue.place.assert_not_called()
+        assert "no pending" in send_dm.await_args.args[1].lower()
+
+    @pytest.mark.asyncio
+    async def test_expired_proposal_does_not_fire(self, prefs_db):
+        import time as _time
+        engine, venue, send_dm = _make_engine(prefs_db, dry_run=False)
+        await _opt_in(prefs_db)
+        await engine.propose_copy(self._cabal_sig())
+        sig, _ = engine._pending_copies[UID]
+        engine._pending_copies[UID] = (sig, _time.time() - 1)  # force expiry
+        ok = await engine.confirm_copy(UID)
+        assert ok is False
+        venue.place.assert_not_called()
+        assert "expired" in send_dm.await_args.args[1].lower()
+
+    @pytest.mark.asyncio
+    async def test_not_connected_gets_no_proposal(self, prefs_db):
+        engine, venue, send_dm = _make_engine(prefs_db, dry_run=False, connected=False)
+        await _opt_in(prefs_db)
+        await engine.propose_copy(self._cabal_sig())
+        send_dm.assert_not_called()
+        assert UID not in engine._pending_copies
+
+
 class TestManualFire:
     @pytest.mark.asyncio
     async def test_manual_fire_places_for_invoker(self, prefs_db):

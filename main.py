@@ -496,6 +496,8 @@ async def run(config: Config) -> None:
         track_record_poster=track_record_poster,
         autotrade_engine=autotrade_engine,
         autotrade_source_key=config.autotrade.source_channel_key,
+        autotrade_copy_key=config.autotrade.copy_channel_key,
+        autotrade_copy_authors=config.autotrade.copy_authors,
     )
 
     # --- Email bot DB + sender (construction only; registration later) ---

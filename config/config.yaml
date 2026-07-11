@@ -58,6 +58,18 @@ discord:
       id_env: BONDS_CHANNEL_ID
       ref_link_env: REF_LINK_PERPS
 
+    - key: cabal
+      name: "Cabal Chat"
+      display_name: "Cabal Chat"
+      # Discretionary human traders' channel. Mirror-forwarded verbatim
+      # (entries AND their trade-management updates reach subscribers), and
+      # the autotrade layer runs a tolerant entry parser over tracked
+      # authors' posts, DMing allowlisted users a confirm-gated copy
+      # proposal. Nothing auto-fires from this channel.
+      source_type: mirror
+      id_env: CABAL_CHANNEL_ID
+      ref_link_env: REF_LINK_PERPS
+
     - key: wallet_tracker
       name: "Wallet Tracker"
       display_name: "Wallet Tracker"

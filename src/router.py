@@ -132,6 +132,8 @@ class Router:
         track_record_poster: TrackRecordPoster | None = None,
         autotrade_engine=None,
         autotrade_source_key: str = "perp_bot",
+        autotrade_copy_key: str = "",
+        autotrade_copy_authors: frozenset = frozenset(),
     ):
         self._discord_cfg = discord_cfg
         self._dispatcher = dispatcher
@@ -165,6 +167,11 @@ class Router:
         # or live). None disables the hook entirely.
         self._autotrade_engine = autotrade_engine
         self._autotrade_source_key = autotrade_source_key
+        # Confirm-gated copy channel (cabal): discretionary human calls are
+        # parsed tolerantly and PROPOSED to allowlisted users by DM; nothing
+        # fires without /autotrade copy confirm. Empty key disables.
+        self._autotrade_copy_key = autotrade_copy_key
+        self._autotrade_copy_authors = autotrade_copy_authors
         # Debouncer for rapid same-trader same-token same-action buys on
         # the Wallet Tracker channel. Instantiated here (needs a stable
         # emit callback bound to this router instance).
@@ -300,6 +307,7 @@ class Router:
                 image_file_id=image_file_id,
                 image_url_fallback=image_url_fallback,
             )
+            await self._maybe_propose_copy(message, route)
             return
 
         # Wallet Tracker channel uses a dedicated parser+formatter that
@@ -658,6 +666,37 @@ class Router:
                 "track-record poster crashed for signal_id=%s pair=%s",
                 prior_signal.id, prior_signal.pair,
             )
+
+    async def _maybe_propose_copy(self, message: IncomingMessage, route) -> None:
+        """If a tracked author posted an entry in the copy channel, parse it
+        and hand a confirm-gated proposal to the autotrade engine. Any
+        failure here must never break the mirror forward."""
+        if (
+            self._autotrade_engine is None
+            or not self._autotrade_copy_key
+            or route.key != self._autotrade_copy_key
+            or message.author_is_bot
+        ):
+            return
+        authors = self._autotrade_copy_authors
+        if authors and (
+            message.author_id not in authors
+            and message.author_name not in authors
+        ):
+            return
+        try:
+            from src.parser.cabal_parser import parse_cabal_entry
+
+            parsed = parse_cabal_entry(message.content)
+            if parsed is None:
+                return
+            logger.info(
+                "Cabal entry parsed from %s: %s %s (SL %s) -> proposing copy",
+                message.author_name, parsed.pair, parsed.side, parsed.stop_loss,
+            )
+            await self._autotrade_engine.propose_copy(parsed, source=route.name)
+        except Exception:  # noqa: BLE001
+            logger.exception("cabal copy proposal crashed")
 
     @staticmethod
     def _build_mirror_keyboard(
