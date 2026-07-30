@@ -219,6 +219,7 @@ async def run(config: Config) -> None:
     wallet_blofin_client = None
     backtest_store = None
     snapshot_job = None
+    backtest_refresh_job = None
     if config.trading.enabled:
         from src.trading.commands import TradingCommands
         from src.trading.delegates_db import DelegatesDB
@@ -566,7 +567,7 @@ async def run(config: Config) -> None:
             blofin_client=wallet_blofin_client,
             metrics_db=wallet_metrics_db,
         )
-        BacktestCommands(
+        backtest_commands = BacktestCommands(
             config=config,
             runner=backtest_runner,
             metrics_db=wallet_metrics_db,
@@ -576,8 +577,27 @@ async def run(config: Config) -> None:
                 wallet_cfg=config.wallet_copy,
                 backtest_cfg=config.backtest,
             ),
-        ).register(verification.application)
+        )
+        backtest_commands.register(verification.application)
         logger.info("Backtest /backtest command registered")
+
+        if config.backtest.refresh_enabled:
+            from src.trading.backtest.refresh_job import BacktestRefreshJob
+
+            backtest_refresh_job = BacktestRefreshJob(
+                runner=backtest_runner,
+                metrics_db=wallet_metrics_db,
+                backtest_cfg=config.backtest,
+                busy=lambda: backtest_commands.busy,
+            )
+            logger.info(
+                "Backtest refresh job enabled: hour=%02d:00 UTC window=%dd "
+                "max_age=%dd candidates=%s",
+                config.backtest.refresh_hour_utc,
+                config.backtest.refresh_days,
+                config.backtest.refresh_max_age_days,
+                config.backtest.refresh_include_candidates,
+            )
 
         if config.wallet_copy.scout_enabled:
             from src.trading.wallet_scout import WalletScout
@@ -1100,6 +1120,7 @@ async def run(config: Config) -> None:
     wallet_scout_task = None
     wallet_watcher_task = None
     snapshot_job_task = None
+    backtest_refresh_task = None
     if wallet_scout is not None:
         wallet_scout_task = asyncio.create_task(
             wallet_scout.run_forever(), name="wallet_scout",
@@ -1111,6 +1132,10 @@ async def run(config: Config) -> None:
     if snapshot_job is not None:
         snapshot_job_task = asyncio.create_task(
             snapshot_job.run_forever(), name="backtest_snapshot_job",
+        )
+    if backtest_refresh_job is not None:
+        backtest_refresh_task = asyncio.create_task(
+            backtest_refresh_job.run_forever(), name="backtest_refresh_job",
         )
 
     # --- Track-record backfill: one-off walk of recent closes at startup ---
@@ -1162,7 +1187,10 @@ async def run(config: Config) -> None:
         await shutdown.wait()
     finally:
         logger.info("Shutdown requested")
-        for wtask in (wallet_scout_task, wallet_watcher_task, snapshot_job_task):
+        for wtask in (
+            wallet_scout_task, wallet_watcher_task, snapshot_job_task,
+            backtest_refresh_task,
+        ):
             if wtask is not None:
                 wtask.cancel()
                 try:

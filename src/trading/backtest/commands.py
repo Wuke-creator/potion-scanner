@@ -102,6 +102,12 @@ class BacktestCommands:
         self._walkforward = walkforward
         self._manager = BacktestJobManager()
 
+    @property
+    def busy(self) -> bool:
+        """True while a manual /backtest job is in flight. The scheduled
+        refresh job reads this to skip a night rather than run alongside."""
+        return self._manager.running
+
     def register(self, application: Application) -> None:
         application.add_handler(CommandHandler("backtest", self._cmd))
 

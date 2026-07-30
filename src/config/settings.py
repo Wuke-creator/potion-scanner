@@ -429,6 +429,11 @@ class BacktestConfig:
     Data-only: no DMs, no trades. Meant to be flipped ON immediately, since
     Hyperliquid keeps only 5000 candles per interval and no leaderboard
     history: whatever isn't archived nightly is permanently gone.
+
+    BACKTEST_REFRESH_ENABLED starts the nightly copier-backtest refresh,
+    which keeps the scout's 30-day latency gate from lapsing. Also
+    data-only (replay, no orders). Dark by default: without it the only
+    way to produce a verdict is the manual /backtest command.
     """
 
     snapshot_enabled: bool = False
@@ -441,6 +446,12 @@ class BacktestConfig:
     fills_keep_days: int = 180
     # /backtest job surface (Phase 2)
     job_timeout_min: int = 30
+    # nightly verdict refresh (dark by default)
+    refresh_enabled: bool = False
+    refresh_hour_utc: int = 4           # after the 03:00 snapshot archiver
+    refresh_days: int = 60              # matches the /backtest default window
+    refresh_max_age_days: int = 21      # inside the scout's 30-day expiry
+    refresh_include_candidates: bool = False   # tracked set only
     # simulation defaults (Phase 1/2): confirm-delay grid incl. a 15s
     # bot-speed rung for the hop-mode experiment; costs per side.
     delay_grid_sec: tuple[int, ...] = (15, 0, 120, 300, 900)
@@ -1120,6 +1131,23 @@ def load_config(
         ),
         taker_fee_bps=float(backtest_yaml.get("taker_fee_bps", 6.0)),
         slippage_bps=float(backtest_yaml.get("slippage_bps", 10.0)),
+        refresh_enabled=os.getenv("BACKTEST_REFRESH_ENABLED", "").strip().lower()
+        in ("1", "true", "yes"),
+        refresh_hour_utc=_env_int(
+            "BACKTEST_REFRESH_HOUR_UTC",
+            int(backtest_yaml.get("refresh_hour_utc", 4)),
+        ),
+        refresh_days=_env_int(
+            "BACKTEST_REFRESH_DAYS",
+            int(backtest_yaml.get("refresh_days", 60)),
+        ),
+        refresh_max_age_days=_env_int(
+            "BACKTEST_REFRESH_MAX_AGE_DAYS",
+            int(backtest_yaml.get("refresh_max_age_days", 21)),
+        ),
+        refresh_include_candidates=os.getenv(
+            "BACKTEST_REFRESH_INCLUDE_CANDIDATES", "",
+        ).strip().lower() in ("1", "true", "yes"),
     )
 
     image_archive_cfg = ImageArchiveConfig(
