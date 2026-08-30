@@ -205,6 +205,28 @@ class TestWatcherPoll:
         assert "wallet 0xadd1..5e0d" == kw["source"]
 
     @pytest.mark.asyncio
+    async def test_proposal_carries_the_raw_atr_risk_distance(self, db):
+        """The levels are anchored to the LEADER's entry, so the fire path has
+        to re-derive them from our own fill. That needs the raw ATR distance,
+        not just the levels it produced. Without it the stop stays pinned to a
+        price we never paid."""
+        watcher, engine, _, _ = _make_watcher(
+            db,
+            states=[
+                _state(account=10_000.0),
+                _state(_pos(margin=1000.0), account=10_000.0),
+            ],
+        )
+        await watcher.poll_once()
+        await watcher.poll_once()
+        sig = engine.propose_copy.await_args.args[0]
+        assert sig.risk_per_unit is not None and sig.risk_per_unit > 0
+        # it IS the entry-to-stop distance, so re-anchoring reproduces the
+        # same risk from a different entry
+        assert abs(sig.entry - sig.stop_loss) == pytest.approx(sig.risk_per_unit)
+        assert sig.take_profits[0] - sig.entry == pytest.approx(sig.risk_per_unit)
+
+    @pytest.mark.asyncio
     async def test_short_open_derives_short_levels(self, db):
         watcher, engine, _, _ = _make_watcher(
             db,

@@ -170,6 +170,10 @@ class AutotradeEngine:
             # wallet's equity fraction); the fire path caps it at the user's
             # own size prefs, so it can only ever shrink a trade.
             size_pct_override=getattr(sig, "size_pct_override", None),
+            # ATR risk distance for wallet copies (None for channel calls, whose
+            # levels come from the caller and must pass through untouched). Its
+            # presence is what tells the fire path to re-anchor.
+            copy_risk_per_unit=getattr(sig, "risk_per_unit", None),
         )
         # Channel-call auto-fire: when enabled, cabal entries place straight
         # away (the fire path DMs the fill or failure). Wallet proposals
@@ -335,6 +339,13 @@ class AutotradeEngine:
                 size_base=float(getattr(result, "size", 0.0) or 0.0),
                 leverage=None,
                 entry_price=entry_price if entry_price > 0 else None,
+                # the re-anchored stop, not the proposal-time one: the heat cap
+                # measures risk as abs(entry - stop) and would otherwise compute
+                # it against a level that was never placed. When the venue
+                # REJECTED the stop there is no protection on the position, so
+                # record no stop rather than book it as bounded risk.
+                stop_price=(getattr(synthetic, "stop_loss", None)
+                            if getattr(result, "sl_ok", True) else None),
             )
         except Exception:  # noqa: BLE001
             logger.warning("copy_trades fill update failed", exc_info=True)
@@ -529,6 +540,86 @@ class AutotradeEngine:
                 f"or the size falls below the venue minimum.",
             )
             return
+
+        # --- copy proposals: re-anchor the protective levels to OUR entry ---
+        # The wallet watcher derives the stop and the TP ladder from the LEADER's
+        # Hyperliquid entry price, but we fill at market, on a different venue,
+        # up to 15 minutes later. Passing those levels straight through puts the
+        # stop a fixed distance from a price we never paid. A move in our FAVOUR
+        # is the dangerous one and nothing caught it: the deviation gate only
+        # cancels adverse moves, so a favourable drift silently compressed the
+        # stop below the intended ATR multiple, and past 1x atr_mult it landed on
+        # the wrong side of the fill, where Blofin either triggers it immediately
+        # or rejects it and leaves the position with no stop at all.
+        # plan.price is the price the venue just sized against and reports the
+        # fill at, so re-deriving from it keeps the risk at exactly
+        # atr_mult x ATR from where we actually get in.
+        risk_per_unit = getattr(signal, "copy_risk_per_unit", None)
+        if risk_per_unit and float(risk_per_unit) > 0 and plan.price > 0:
+            risk = float(risk_per_unit)
+            if plan.is_long:
+                stop_loss = plan.price - risk
+                take_profits = [plan.price + k * risk for k in (1, 2, 3)]
+            else:
+                stop_loss = plan.price + risk
+                take_profits = [plan.price - k * risk for k in (1, 2, 3)]
+            wanted_legs = 3
+            take_profits = [t for t in take_profits if t > 0]
+            if stop_loss <= 0 or risk >= plan.price:
+                # ATR at or wider than the price itself. On a long that gives a
+                # non-positive stop; on a SHORT the stop stays positive but sits
+                # above 2x the price, which is unreachable, and every TP prices
+                # below zero and is filtered away, leaving a live position with
+                # an unreachable stop and no ladder. Both are the same defect,
+                # so refuse on the risk distance rather than on the sign.
+                await self._prefs_db.release_fire(uid, signal_id)
+                await self._dm(
+                    uid,
+                    f"Autotrade skipped {plan.coin}: recent volatility "
+                    f"({_fmt_num(risk)}) is as wide as the price "
+                    f"({_fmt_num(plan.price)}), so no reachable stop or take-profit "
+                    f"ladder can be placed.",
+                )
+                return
+            if len(take_profits) < wanted_legs:
+                # the venue re-normalises the scale-out weights over whatever legs
+                # survive, so a silently dropped leg puts an outsized share of the
+                # position on TP1 instead of laddering out of it.
+                logger.info(
+                    "re-anchor dropped %d TP leg(s) for %s (price=%s risk=%s)",
+                    wanted_legs - len(take_profits), plan.coin, plan.price, risk,
+                )
+            # keep the proposal object honest: confirm_copy reads stop_loss back
+            # off it to record what was actually placed.
+            signal.stop_loss = stop_loss
+            padded = (take_profits + [None, None, None])[:3]
+            signal.tp1, signal.tp2, signal.tp3 = padded
+
+        # --- a stop on the wrong side of the entry is never placeable ---
+        # cabal_parser validates stop side at parse time, but price moves between
+        # the call and the fill, and the wallet path had no equivalent check at
+        # all. Refusing costs one missed trade; placing costs an instant stop-out
+        # (two taker fees) or an unprotected position.
+        if stop_loss is not None and plan.price > 0:
+            wrong_side = (
+                stop_loss >= plan.price if plan.is_long
+                else stop_loss <= plan.price
+            )
+            if wrong_side:
+                await self._prefs_db.release_fire(uid, signal_id)
+                await self._dm(
+                    uid,
+                    f"Autotrade skipped {plan.coin}: the stop "
+                    f"({_fmt_num(stop_loss)}) is on the wrong side of the "
+                    f"current price ({_fmt_num(plan.price)}). Placing this "
+                    f"would stop out instantly or leave the position with no "
+                    f"stop.",
+                )
+                logger.info(
+                    "wrong-side stop blocked %s for user=%s (stop=%s price=%s)",
+                    plan.coin, uid, stop_loss, plan.price,
+                )
+                return
 
         # --- account-level risk guard (only when enabled AND venue-supported) ---
         # Fail-closed: an unreadable account state blocks the trade. Runs before

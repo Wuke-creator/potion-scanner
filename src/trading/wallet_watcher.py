@@ -429,7 +429,10 @@ class WalletWatcher:
             f"Their size: ~${d.notional:,.0f} "
             f"({conviction * 100:.1f}% of their ${state.account_value:,.0f} equity).",
             "SL/TPs are OURS, derived from recent volatility (ATR); the "
-            "wallet's real exits are invisible.",
+            "wallet's real exits are invisible. The levels below are "
+            "indicative: they are re-anchored to OUR fill price at confirm "
+            "time, so the stop is always the same ATR distance from where we "
+            "actually get in, not from where they got in.",
         ]
         if stop is None:
             note_lines.append(
@@ -518,6 +521,11 @@ class WalletWatcher:
             take_profits=tps,
             stop_loss=stop,
             size_pct_override=size_pct,
+            # The ATR distance itself, not just the levels it produced. Those are
+            # anchored to the LEADER's entry, but we fill at market on another
+            # venue up to 15 minutes later, so the fire path re-derives them from
+            # OUR entry and needs the raw risk distance to do it.
+            risk_per_unit=(atr * self._cfg.atr_mult) if atr is not None else None,
             note="\n".join(note_lines),
         )
         # meta arms the engine's confirm-time deviation gate and writes the

@@ -174,6 +174,31 @@ class TestDeviationGate:
         assert row.status == "filled" and row.order_ref == "ord-77"
 
     @pytest.mark.asyncio
+    async def test_fill_persists_the_reanchored_stop(self, dbs):
+        """The DB half of the stop re-anchor, through real SQL rather than a mock.
+        The leader stopped at 22.0 off a 25.0 entry; we fill at 24.0, so the row
+        must end up holding 21.0 (24.0 - 1.5 x ATR 2.0). open_copy_heat_usd reads
+        this column, so a stale value would size the heat cap off a level that was
+        never sent."""
+        prefs, metrics = dbs
+        engine, venue, _ = _engine(prefs, metrics, current_price=24.0)
+        venue.plan = AsyncMock(return_value=VenuePlan(
+            coin="HYPE", is_long=True, price=24.0, size=40.0,
+            leverage=10, notional_usd=1000.0,
+        ))
+        await _opt_in(prefs)
+        pid = await engine.propose_copy(
+            _wallet_sig(risk_per_unit=3.0), source="wallet x", meta=_meta(),
+        )
+        row = await metrics.get_copy_trade(pid, UID)
+        assert row.stop_price == pytest.approx(22.0), "proposal records the leader level"
+        assert await engine.confirm_copy(UID) is True
+        assert venue.place.await_args.kwargs["stop_loss"] == pytest.approx(21.0)
+        row = await metrics.get_copy_trade(pid, UID)
+        assert row.status == "filled"
+        assert row.stop_price == pytest.approx(21.0),             "the filled row must hold the stop that was actually placed"
+
+    @pytest.mark.asyncio
     async def test_adverse_move_cancels(self, dbs):
         prefs, metrics = dbs
         # long proposed at 25.0, ATR 2.0, limit 0.6 ATR = 1.2 -> 26.5 is out

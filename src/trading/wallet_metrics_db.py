@@ -30,6 +30,10 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
+# "argument not supplied", so a caller that says nothing about the stop is not confused with
+# one saying the stop is gone. See mark_copy_trade_filled.
+_KEEP = object()
+
 _DDL = """
 CREATE TABLE IF NOT EXISTS wallet_metrics (
   address           TEXT NOT NULL,
@@ -501,16 +505,30 @@ class WalletMetricsDB:
         self, proposal_id: int, telegram_user_id: int, *,
         order_ref: str, size_base: float | None, leverage: int | None,
         entry_price: float | None = None,
+        stop_price: float | None | object = _KEEP,
     ) -> None:
-        await self._conn.execute(
-            "UPDATE copy_trades SET status='filled', confirmed_at=?, "
-            "order_ref=?, size_base=?, leverage=?, entry_price=? "
-            "WHERE proposal_id=? AND telegram_user_id=? AND status='proposed'",
-            (
-                int(time.time()), order_ref, size_base, leverage,
-                entry_price, proposal_id, telegram_user_id,
-            ),
-        )
+        """Mark a proposal filled.
+
+        `stop_price` is the stop that reached the venue. For a wallet copy that
+        is re-anchored to our fill and so differs from the proposal-time level,
+        and it is None when the venue REJECTED the stop: open_copy_heat_usd
+        measures risk as abs(entry - stop), so booking a rejected stop as if it
+        were live would count an unprotected position as bounded risk.
+
+        Omitting the argument leaves the column untouched (the proposal-time
+        value stands). Passing None clears it on purpose. Those are different
+        instructions and must not collapse into one.
+        """
+        set_stop = stop_price is not _KEEP
+        sql = ("UPDATE copy_trades SET status='filled', confirmed_at=?, "
+               "order_ref=?, size_base=?, leverage=?, entry_price=?"
+               + (", stop_price=? " if set_stop else " ")
+               + "WHERE proposal_id=? AND telegram_user_id=? AND status='proposed'")
+        params = [int(time.time()), order_ref, size_base, leverage, entry_price]
+        if set_stop:
+            params.append(stop_price)
+        params += [proposal_id, telegram_user_id]
+        await self._conn.execute(sql, tuple(params))
         await self._conn.commit()
 
     async def open_copy_trades(
