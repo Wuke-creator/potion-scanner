@@ -660,8 +660,8 @@ async def run(config: Config) -> None:
                     interval_hours=24,
                     rejoin_url=config.automations.launch_cta_url,
                 )
-                # Pre-renewal (3 days before billing). Dormant until
-                # Whop sync starts populating current_period_end.
+                # Pre-renewal (3 days before billing). Fed by the Whop
+                # sync, which writes current_period_end for valid paid rows.
                 pre_renewal_email = PreRenewalEmail(
                     whop_members_db=whop_members_db,
                     email_db=email_db,

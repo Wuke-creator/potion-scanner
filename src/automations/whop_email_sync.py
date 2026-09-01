@@ -129,6 +129,17 @@ class WhopEmailSync:
                             valid=member.valid,
                             membership_id=member.membership_id,
                         )
+                        # Next billing date, for the pre-renewal email cron
+                        # (dormant until this populates). Write only positive
+                        # values from valid rows: a user's free membership row
+                        # carries null and must not wipe the paid row's date.
+                        # A lapsed member keeps a stale date, which is safe:
+                        # list_pre_renewal_due requires valid = 1.
+                        if member.valid and member.renewal_period_end > 0:
+                            await self._members_db.set_current_period_end(
+                                member.user_id,
+                                period_end=member.renewal_period_end,
+                            )
                         if member.valid:
                             roster_seen += 1
                             if member.email:

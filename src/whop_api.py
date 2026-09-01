@@ -178,6 +178,7 @@ class WhopMember:
     membership_id: str           # Whop membership id (one user may have many)
     product: str = ""            # prod_... id; the tier (free vs paid) lives here
     created_at: int = 0          # membership creation epoch seconds (join time)
+    renewal_period_end: int = 0  # next billing epoch seconds; 0 = free/lifetime/unknown
 
 
 @dataclass
@@ -533,6 +534,15 @@ def _parse_member(row: dict) -> WhopMember | None:
     except (TypeError, ValueError):
         created_at = 0
 
+    # Next billing date (epoch seconds in v2). Free / lifetime / cancelled
+    # rows carry null here, which we normalize to 0 so downstream code can
+    # treat "0" as "no known renewal". Feeds the pre-renewal email cron.
+    renewal_raw = row.get("renewal_period_end")
+    try:
+        renewal_period_end = int(renewal_raw) if renewal_raw is not None else 0
+    except (TypeError, ValueError):
+        renewal_period_end = 0
+
     return WhopMember(
         user_id=user_id,
         discord_user_id=discord_user_id,
@@ -541,6 +551,7 @@ def _parse_member(row: dict) -> WhopMember | None:
         membership_id=membership_id,
         product=product,
         created_at=created_at,
+        renewal_period_end=renewal_period_end,
     )
 
 
